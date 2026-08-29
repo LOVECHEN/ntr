@@ -26,7 +26,8 @@ run_case(){ # $1=label $2=srv-kind
   ntr_cli "$srv"
   docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v $D/_utls_c.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
   wait_log ${PFX}c "监听于" 15
-  R=$(docker run --rm --network $NET $CURL -s --max-time 12 -x socks5h://${PFX}c:1080 http://${PFX}target/ 2>&1)
+  # 重试至就绪:CI 冷 runner 上 xray 服务端起得慢,单次探测常早于就绪;成功即早退。
+  for _i in 1 2 3 4 5 6; do R=$(docker run --rm --network $NET $CURL -s --max-time 12 -x socks5h://${PFX}c:1080 http://${PFX}target/ 2>&1); echo "$R"|grep -q 'Name: UTLS-TARGET' && break; sleep 1.5; done
   echo "  [$1]  $(echo "$R"|grep -q 'Name: UTLS-TARGET' && echo PASS || echo FAIL)"
   docker rm -f ${PFX}c $srv >/dev/null 2>&1
 }

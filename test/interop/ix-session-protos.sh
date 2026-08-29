@@ -7,6 +7,8 @@ NET=ix-se; PFX=ixe-; D=/tmp/ntr-interop
 SB=ghcr.io/sagernet/sing-box:latest
 MH=metacubex/mihomo:latest
 CURL=curlimages/curl:latest
+# 探测重试至就绪:CI 冷 runner 上对端服务端起得慢,固定 sleep 常不够;成功(拿 Hostname)即早退。
+dial(){ local i out; for i in 1 2 3 4 5 6; do out=$(docker run --rm --network $NET $CURL -s --max-time 12 "$@" 2>&1); echo "$out" | grep -q Hostname && { echo "$out"; return; }; sleep 1.5; done; echo "$out"; }
 PA="--platform linux/amd64"   # ntr=amd64;对端/靶机用本机原生 arch
 U=u; PW=sesspw123
 
@@ -33,7 +35,7 @@ docker run -d --name ${PFX}sb-at-srv --network $NET -v $D/ix-sb-at-srv.json:/c.j
 printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: at}\noutbounds:\n  - {name: at, type: anytls, server: "%ssb-at-srv:8443", secret: "%s", sni: example.com, insecure: true}\n' "$PFX" "$PW" > $D/ix-ntr-at-cli.yaml
 docker run -d --name ${PFX}ntr-at-cli --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-at-cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 5
-hit "$(docker run --rm --network $NET $CURL -s --max-time 12 -x socks5h://${PFX}ntr-at-cli:1080 http://${PFX}target/ 2>&1)" AT_SB_A "1A anytls NTR客户端→sing-box服务端" || { dbg ${PFX}sb-at-srv; dbg ${PFX}ntr-at-cli; }
+hit "$(dial -x socks5h://${PFX}ntr-at-cli:1080 http://${PFX}target/)" AT_SB_A "1A anytls NTR客户端→sing-box服务端" || { dbg ${PFX}sb-at-srv; dbg ${PFX}ntr-at-cli; }
 
 # --- 1B: sing-box anytls 客户端 → NTR anytls 服务端 ---
 printf 'inbounds:\n  - listen: 0.0.0.0:8443\n    type: anytls\n    users: [{password: "%s"}]\n    tls: {cert-file: /cert.pem, key-file: /key.pem}\n    outbound: direct\noutbounds: [{name: direct, type: direct}]\n' "$PW" > $D/ix-ntr-at-srv.yaml
@@ -41,7 +43,7 @@ docker run -d --name ${PFX}ntr-at-srv --network $NET $PA -e NTR_DEBUG=1 -v $D/nt
 printf '{"log":{"level":"warn"},"inbounds":[{"type":"mixed","listen":"::","listen_port":1080}],"outbounds":[{"type":"anytls","server":"%sntr-at-srv","server_port":8443,"password":"%s","tls":{"enabled":true,"server_name":"example.com","insecure":true}}]}\n' "$PFX" "$PW" > $D/ix-sb-at-cli.json
 docker run -d --name ${PFX}sb-at-cli --network $NET -v $D/ix-sb-at-cli.json:/c.json:ro $SB -c /c.json run >/dev/null 2>&1
 sleep 5
-hit "$(docker run --rm --network $NET $CURL -s --max-time 12 -x http://${PFX}sb-at-cli:1080 http://${PFX}target/ 2>&1)" AT_SB_B "1B anytls sing-box客户端→NTR服务端" || { dbg ${PFX}ntr-at-srv; dbg ${PFX}sb-at-cli; }
+hit "$(dial -x http://${PFX}sb-at-cli:1080 http://${PFX}target/)" AT_SB_B "1B anytls sing-box客户端→NTR服务端" || { dbg ${PFX}ntr-at-srv; dbg ${PFX}sb-at-cli; }
 
 ########################################################################
 echo "════════ 2. AnyTLS ⇄ mihomo ════════"
@@ -68,7 +70,7 @@ docker run -d --name ${PFX}mh-at-srv --network $NET -v $D/ix-mh-at-srv.yaml:/roo
 printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: at}\noutbounds:\n  - {name: at, type: anytls, server: "%smh-at-srv:8443", secret: "%s", sni: example.com, insecure: true}\n' "$PFX" "$PW" > $D/ix-ntr-at-cli2.yaml
 docker run -d --name ${PFX}ntr-at-cli2 --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-at-cli2.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 5
-hit "$(docker run --rm --network $NET $CURL -s --max-time 12 -x socks5h://${PFX}ntr-at-cli2:1080 http://${PFX}target/ 2>&1)" AT_MH_A "2A anytls NTR客户端→mihomo服务端" || { dbg ${PFX}mh-at-srv; dbg ${PFX}ntr-at-cli2; }
+hit "$(dial -x socks5h://${PFX}ntr-at-cli2:1080 http://${PFX}target/)" AT_MH_A "2A anytls NTR客户端→mihomo服务端" || { dbg ${PFX}mh-at-srv; dbg ${PFX}ntr-at-cli2; }
 
 # --- 2B: mihomo anytls 客户端 → NTR anytls 服务端(复用 1B 的 NTR srv) ---
 cat > $D/ix-mh-at-cli.yaml <<EOF
@@ -90,7 +92,7 @@ rules:
 EOF
 docker run -d --name ${PFX}mh-at-cli --network $NET -v $D/ix-mh-at-cli.yaml:/root/.config/mihomo/config.yaml:ro $MH >/dev/null 2>&1
 sleep 5
-hit "$(docker run --rm --network $NET $CURL -s --max-time 12 -x http://${PFX}mh-at-cli:1080 http://${PFX}target/ 2>&1)" AT_MH_B "2B anytls mihomo客户端→NTR服务端" || { dbg ${PFX}ntr-at-srv; dbg ${PFX}mh-at-cli; }
+hit "$(dial -x http://${PFX}mh-at-cli:1080 http://${PFX}target/)" AT_MH_B "2B anytls mihomo客户端→NTR服务端" || { dbg ${PFX}ntr-at-srv; dbg ${PFX}mh-at-cli; }
 
 ########################################################################
 echo "════════ 3. NaiveProxy ⇄ sing-box(cronet)════════"
@@ -100,7 +102,7 @@ docker run -d --name ${PFX}sb-nv-srv --network $NET -v $D/ix-sb-nv-srv.json:/c.j
 printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: naive, server: "%ssb-nv-srv:8443", user: %s, secret: "%s", sni: example.com, insecure: true}\n' "$PFX" "$U" "$PW" > $D/ix-ntr-nv-cli.yaml
 docker run -d --name ${PFX}ntr-nv-cli --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-nv-cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 5
-hit "$(docker run --rm --network $NET $CURL -s --max-time 12 -x socks5h://${PFX}ntr-nv-cli:1080 http://${PFX}target/ 2>&1)" NV_A "3A naive NTR客户端→sing-box服务端" || { dbg ${PFX}sb-nv-srv; dbg ${PFX}ntr-nv-cli; }
+hit "$(dial -x socks5h://${PFX}ntr-nv-cli:1080 http://${PFX}target/)" NV_A "3A naive NTR客户端→sing-box服务端" || { dbg ${PFX}sb-nv-srv; dbg ${PFX}ntr-nv-cli; }
 
 # --- 3B: sing-box naive(cronet)客户端 → NTR naive 服务端 ---
 # cronet 不支持 insecure,须信任 CA;NTR 服务端出示 leaf(cert.pem 已是 CA 签的短期叶子)
@@ -109,7 +111,7 @@ docker run -d --name ${PFX}ntr-nv-srv --network $NET $PA -e NTR_DEBUG=1 -v $D/nt
 printf '{"log":{"level":"warn"},"inbounds":[{"type":"mixed","listen":"::","listen_port":1080}],"outbounds":[{"type":"naive","server":"%sntr-nv-srv","server_port":8443,"username":"%s","password":"%s","tls":{"enabled":true,"server_name":"example.com","certificate_path":"/ca.pem"}}]}\n' "$PFX" "$U" "$PW" > $D/ix-sb-nv-cli.json
 docker run -d --name ${PFX}sb-nv-cli --network $NET -v $D/ix-sb-nv-cli.json:/c.json:ro -v $D/ca.pem:/ca.pem:ro $SB -c /c.json run >/dev/null 2>&1
 sleep 6
-hit "$(docker run --rm --network $NET $CURL -s --max-time 12 -x http://${PFX}sb-nv-cli:1080 http://${PFX}target/ 2>&1)" NV_B "3B naive sing-box(cronet)客户端→NTR服务端" || { dbg ${PFX}ntr-nv-srv; dbg ${PFX}sb-nv-cli 15; }
+hit "$(dial -x http://${PFX}sb-nv-cli:1080 http://${PFX}target/)" NV_B "3B naive sing-box(cronet)客户端→NTR服务端" || { dbg ${PFX}ntr-nv-srv; dbg ${PFX}sb-nv-cli 15; }
 
 ########################################################################
 echo "════════ 4. TrustTunnel ⇄ mihomo ════════"
@@ -137,7 +139,7 @@ docker run -d --name ${PFX}mh-tt-srv --network $NET -v $D/ix-mh-tt-srv.yaml:/roo
 printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: trusttunnel, server: "%smh-tt-srv:8443", user: %s, secret: "%s", sni: example.com, insecure: true}\n' "$PFX" "$U" "$PW" > $D/ix-ntr-tt-cli.yaml
 docker run -d --name ${PFX}ntr-tt-cli --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-tt-cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 5
-hit "$(docker run --rm --network $NET $CURL -s --max-time 12 -x socks5h://${PFX}ntr-tt-cli:1080 http://${PFX}target/ 2>&1)" TT_A "4A trusttunnel NTR客户端→mihomo服务端" || { dbg ${PFX}mh-tt-srv; dbg ${PFX}ntr-tt-cli; }
+hit "$(dial -x socks5h://${PFX}ntr-tt-cli:1080 http://${PFX}target/)" TT_A "4A trusttunnel NTR客户端→mihomo服务端" || { dbg ${PFX}mh-tt-srv; dbg ${PFX}ntr-tt-cli; }
 
 # --- 4B: mihomo trusttunnel 客户端 → NTR trusttunnel 服务端 ---
 printf 'inbounds:\n  - listen: 0.0.0.0:8443\n    type: trusttunnel\n    tls: {cert-file: /cert.pem, key-file: /key.pem}\n    users: [{name: %s, password: "%s"}]\noutbounds: [{name: direct, type: direct}]\n' "$U" "$PW" > $D/ix-ntr-tt-srv.yaml
@@ -162,7 +164,7 @@ rules:
 EOF
 docker run -d --name ${PFX}mh-tt-cli --network $NET -v $D/ix-mh-tt-cli.yaml:/root/.config/mihomo/config.yaml:ro $MH >/dev/null 2>&1
 sleep 5
-hit "$(docker run --rm --network $NET $CURL -s --max-time 12 -x http://${PFX}mh-tt-cli:1080 http://${PFX}target/ 2>&1)" TT_B "4B trusttunnel mihomo客户端→NTR服务端" || { dbg ${PFX}ntr-tt-srv; dbg ${PFX}mh-tt-cli 15; }
+hit "$(dial -x http://${PFX}mh-tt-cli:1080 http://${PFX}target/)" TT_B "4B trusttunnel mihomo客户端→NTR服务端" || { dbg ${PFX}ntr-tt-srv; dbg ${PFX}mh-tt-cli 15; }
 
 ########################################################################
 echo "════════ 5. uTLS 指纹回归:naive/trusttunnel 出站加 client-fingerprint: chrome ════════"
@@ -170,13 +172,13 @@ echo "════════ 5. uTLS 指纹回归:naive/trusttunnel 出站加 
 printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: naive, server: "%ssb-nv-srv:8443", user: %s, secret: "%s", sni: example.com, insecure: true, client-fingerprint: chrome}\n' "$PFX" "$U" "$PW" > $D/ix-ntr-nv-cli-fp.yaml
 docker run -d --name ${PFX}ntr-nv-cli-fp --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-nv-cli-fp.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 4
-hit "$(docker run --rm --network $NET $CURL -s --max-time 12 -x socks5h://${PFX}ntr-nv-cli-fp:1080 http://${PFX}target/ 2>&1)" NV_FP "5A naive(chrome指纹)NTR客户端→sing-box服务端" || { dbg ${PFX}ntr-nv-cli-fp; }
+hit "$(dial -x socks5h://${PFX}ntr-nv-cli-fp:1080 http://${PFX}target/)" NV_FP "5A naive(chrome指纹)NTR客户端→sing-box服务端" || { dbg ${PFX}ntr-nv-cli-fp; }
 
 # 5B trusttunnel chrome fp → mihomo trusttunnel srv(复用 4A 的 mh-tt-srv)
 printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: trusttunnel, server: "%smh-tt-srv:8443", user: %s, secret: "%s", sni: example.com, insecure: true, client-fingerprint: chrome}\n' "$PFX" "$U" "$PW" > $D/ix-ntr-tt-cli-fp.yaml
 docker run -d --name ${PFX}ntr-tt-cli-fp --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-tt-cli-fp.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 4
-hit "$(docker run --rm --network $NET $CURL -s --max-time 12 -x socks5h://${PFX}ntr-tt-cli-fp:1080 http://${PFX}target/ 2>&1)" TT_FP "5B trusttunnel(chrome指纹)NTR客户端→mihomo服务端" || { dbg ${PFX}ntr-tt-cli-fp; }
+hit "$(dial -x socks5h://${PFX}ntr-tt-cli-fp:1080 http://${PFX}target/)" TT_FP "5B trusttunnel(chrome指纹)NTR客户端→mihomo服务端" || { dbg ${PFX}ntr-tt-cli-fp; }
 
 ########################################################################
 echo ""

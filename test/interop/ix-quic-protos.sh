@@ -20,7 +20,8 @@ sb(){   docker run -d --name $pfx$1 --network $NET -v $D/$2:/c.json:ro -v $D/cer
 sbc(){  docker run -d --name $pfx$1 --network $NET -v $D/$2:/c.json:ro $SB -c /c.json run >/dev/null 2>&1; }
 mh(){   docker run -d --name $pfx$1 --network $NET -v $D/$2:/root/.config/mihomo/config.yaml:ro -v $D/cert.pem:/root/.config/mihomo/cert.pem:ro -v $D/key.pem:/root/.config/mihomo/key.pem:ro $MH >/dev/null 2>&1; }
 mhc(){  docker run -d --name $pfx$1 --network $NET -v $D/$2:/root/.config/mihomo/config.yaml:ro $MH >/dev/null 2>&1; }
-probe(){ docker run --rm --network $NET $CURL -s --max-time 15 -x socks5h://$pfx$1:1080 http://${pfx}target/ 2>&1; }
+# 探测重试至就绪:CI 冷 runner 上对端 QUIC 服务端起得慢,固定 sleep 常不够;成功即早退。
+probe(){ local i out; for i in 1 2 3 4 5 6; do out=$(docker run --rm --network $NET $CURL -s --max-time 12 -x socks5h://$pfx$1:1080 http://${pfx}target/ 2>&1); echo "$out" | grep -q Hostname && { echo "$out"; return; }; sleep 1.5; done; echo "$out"; }
 
 docker network create $NET >/dev/null 2>&1
 rmall

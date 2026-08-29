@@ -21,7 +21,7 @@ srv(){ local extra="$1" cd="$D/cfg${SEQ}"; SEQ=$((SEQ+1)); mkdir -p "$cd"; cat >
   done; return 1; }
 # probe:重负载下 curl 的 --retry 不覆盖 empty-reply(exit 52),伪装站中继偶发空回 → shell 级重跑取非空。
 # 用法:probe <期望匹配正则> <curl 参数...> ;打印命中输出(或最后一次输出)。
-probe(){ local want="$1"; shift; local r="" i; for i in 1 2 3 4; do
+probe(){ local want="$1"; shift; local r="" i; for i in 1 2 3 4 5 6; do
     r=$(docker run --rm --network $NET curlimages/curl:latest -sk --retry 3 --retry-connrefused --retry-delay 1 --max-time 15 "$@" 2>&1)
     echo "$r"|grep -qE "$want" && { echo "$r"; return; }; sleep 1
   done; echo "$r"; }

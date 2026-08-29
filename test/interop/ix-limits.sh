@@ -33,10 +33,10 @@ start_cli(){ docker rm -f ${PFX}c >/dev/null 2>&1; docker run -d --name ${PFX}c 
 S(){ docker inspect ${PFX}s --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null; }
 
 echo "=== A. max-conns=2 ==="
-start_srv "max-conns: 2"; start_cli; sleep 4
+start_srv "max-conns: 2"; start_cli; sleep 8
 # 2 条慢下载(占 2 连接)
 for i in 1 2; do docker run -d --name ${PFX}dl$i --network $NET curlimages/curl:latest -s --max-time 60 --limit-rate 150k -x socks5h://${PFX}c:1080 http://${PFX}big/f -o /dev/null >/dev/null 2>&1; done
-sleep 5
+sleep 8
 # 第 3 条:应被拒
 r3=$(docker run --rm --network $NET curlimages/curl:latest -s --max-time 6 -x socks5h://${PFX}c:1080 http://${PFX}who/ 2>/dev/null | grep -c Hostname)
 stats=$(docker run --rm --network $NET curlimages/curl:latest -s --max-time 5 http://$(S):9091/stats 2>/dev/null)
