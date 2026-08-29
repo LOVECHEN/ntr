@@ -16,8 +16,8 @@ for s in "$DIR"/ix-*.sh; do
   [ -f "$s" ] || continue
   name=$(basename "$s" .sh); total=$((total+1)); log="$D/$name.log"
   timeout 1200 bash "$s" > "$log" 2>&1 || true
-  p=$(grep -icE '\bPASS\b|✅|\[OK\]|通\]|通 ' "$log" || true)
-  f=$(grep -icE '\bFAIL\b|❌|✗ ' "$log" || true)
+  p=$(grep -cE '(^|\] +|==> *|\| )PASS|✅|\[OK\]|✓通|通\]' "$log" || true)
+  f=$(grep -cE '(^|\] +|==> *|\| )FAIL|❌|✗ ' "$log" || true)
   if [ "$f" -gt 0 ]; then st=FAIL; failed=$((failed+1))
   elif [ "$p" -gt 0 ]; then st=PASS
   else st=UNKNOWN; unknown=$((unknown+1)); fi

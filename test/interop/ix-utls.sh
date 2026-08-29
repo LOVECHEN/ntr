@@ -18,9 +18,9 @@ ntr_cli(){ # $1=server host
 run_case(){ # $1=label $2=srv-kind
   local srv=${PFX}$2s
   case $2 in
-    xray) printf '{"log":{"loglevel":"warning"},"inbounds":[{"port":10000,"protocol":"vless","settings":{"clients":[{"id":"%s"}],"decryption":"none"},"streamSettings":{"security":"tls","tlsSettings":{"certificates":[{"certificateFile":"/cert.pem","keyFile":"/key.pem"}]}}}],"outbounds":[{"protocol":"freedom"}]}\n' "$UUID" > $D/_utls_s.json
+    xray) printf '{"log":{"loglevel":"warning"},"inbounds":[{"port":10000,"protocol":"vless","settings":{"clients":[{"id":"%s"}],"decryption":"none"},"streamSettings":{"security":"tls","tlsSettings":{"alpn":["http/1.1"],"certificates":[{"certificateFile":"/cert.pem","keyFile":"/key.pem"}]}}}],"outbounds":[{"protocol":"freedom"}]}\n' "$UUID" > $D/_utls_s.json
           docker run -d --name $srv --network $NET -v $D/_utls_s.json:/c.json:ro -v $D/ucert.pem:/cert.pem:ro -v $D/ukey.pem:/key.pem:ro ghcr.io/xtls/xray-core:latest -c /c.json >/dev/null 2>&1; sleep 3;;
-    singbox) printf '{"log":{"level":"warn"},"inbounds":[{"type":"vless","listen":"::","listen_port":10000,"users":[{"uuid":"%s"}],"tls":{"enabled":true,"certificate_path":"/cert.pem","key_path":"/key.pem"}}],"outbounds":[{"type":"direct"}]}\n' "$UUID" > $D/_utls_s.json
+    singbox) printf '{"log":{"level":"warn"},"inbounds":[{"type":"vless","listen":"::","listen_port":10000,"users":[{"uuid":"%s"}],"tls":{"enabled":true,"alpn":["http/1.1"],"certificate_path":"/cert.pem","key_path":"/key.pem"}}],"outbounds":[{"type":"direct"}]}\n' "$UUID" > $D/_utls_s.json
           docker run -d --name $srv --network $NET -v $D/_utls_s.json:/c.json:ro -v $D/ucert.pem:/cert.pem:ro -v $D/ukey.pem:/key.pem:ro ghcr.io/sagernet/sing-box:latest -c /c.json run >/dev/null 2>&1; sleep 3;;
   esac
   ntr_cli "$srv"
