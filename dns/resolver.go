@@ -36,6 +36,7 @@ const (
 type plan struct {
 	nameservers []*upstream
 	strategy    strat
+	hosts       *hostsMap // 静态 host→IP,命中不走上游
 }
 
 // Resolver 实现 route.Resolver。
@@ -56,7 +57,7 @@ type Nameserver struct {
 }
 
 // buildPlan 把 Nameserver 配置解析成运行时 plan(解析承载 + 地址)。
-func buildPlan(nss []Nameserver, strategy string) (*plan, error) {
+func buildPlan(nss []Nameserver, strategy string, hosts map[string][]netip.Addr) (*plan, error) {
 	if len(nss) == 0 {
 		return nil, errors.New("dns: 至少需一个 nameserver")
 	}
@@ -82,12 +83,12 @@ func buildPlan(nss []Nameserver, strategy string) (*plan, error) {
 		u.detour = ns.Detour
 		ups = append(ups, &u)
 	}
-	return &plan{nameservers: ups, strategy: st}, nil
+	return &plan{nameservers: ups, strategy: st, hosts: newHosts(hosts)}, nil
 }
 
 // New 建解析器。
-func New(nameservers []Nameserver, strategy string) (*Resolver, error) {
-	pl, err := buildPlan(nameservers, strategy)
+func New(nameservers []Nameserver, strategy string, hosts map[string][]netip.Addr) (*Resolver, error) {
+	pl, err := buildPlan(nameservers, strategy, hosts)
 	if err != nil {
 		return nil, err
 	}
@@ -97,8 +98,8 @@ func New(nameservers []Nameserver, strategy string) (*Resolver, error) {
 }
 
 // Reload 原子换代(全热:in-flight 查询跑完旧代,缓存跨代存活)。
-func (r *Resolver) Reload(nameservers []Nameserver, strategy string) error {
-	pl, err := buildPlan(nameservers, strategy)
+func (r *Resolver) Reload(nameservers []Nameserver, strategy string, hosts map[string][]netip.Addr) error {
+	pl, err := buildPlan(nameservers, strategy, hosts)
 	if err != nil {
 		return err
 	}
@@ -113,6 +114,13 @@ func (r *Resolver) Exchange(ctx context.Context, q *route.Message) (*route.Messa
 		return nil, ErrDisabled
 	}
 	key, id, ok := parseQuery(q.Raw)
+	if ok && p.hosts != nil {
+		if addrs, hit := p.hosts.lookup(key.name, key.qtype); hit {
+			if raw := buildHostsResponse(id, key.name, key.qtype, addrs); raw != nil {
+				return &route.Message{Raw: raw}, nil
+			}
+		}
+	}
 	if ok {
 		if cached, hit := r.cache.get(key); hit {
 			setTxID(cached, id)

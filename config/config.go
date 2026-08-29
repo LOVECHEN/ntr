@@ -106,10 +106,11 @@ type MetricsSpec struct {
 
 // DNSSpec 是 dns: 配置块(承设计 §10.1.8)。MVP:明文 UDP/TCP 上游 + 缓存 + race/sequential。
 type DNSSpec struct {
-	Enabled     bool             `yaml:"enabled"`
-	Detour      string           `yaml:"detour"`   // 未写 detour 的 nameserver 默认出站(必具名)
-	Strategy    string           `yaml:"strategy"` // race(默认)| sequential
-	Nameservers []NameserverSpec `yaml:"nameservers"`
+	Enabled     bool                `yaml:"enabled"`
+	Detour      string              `yaml:"detour"`   // 未写 detour 的 nameserver 默认出站(必具名)
+	Strategy    string              `yaml:"strategy"` // race(默认)| sequential
+	Nameservers []NameserverSpec    `yaml:"nameservers"`
+	Hosts       map[string][]string `yaml:"hosts"` // 静态 host→IP,命中不走上游(也防这些域名 DNS 泄漏)
 }
 
 // NameserverSpec 是一台上游:tag + address(udp/tcp/tls(DoT)/https(DoH))+ 绑定的具名出站(防泄漏)。
@@ -261,7 +262,29 @@ func buildResolver(spec *DNSSpec, outs map[string]endpoint.Outbound) (route.Reso
 		}
 		nss = append(nss, dns.Nameserver{Tag: ns.Tag, Address: ns.Address, SNI: ns.SNI, Insecure: ns.Insecure, Detour: det})
 	}
-	return dns.New(nss, spec.Strategy)
+	hosts, err := parseHosts(spec.Hosts)
+	if err != nil {
+		return nil, err
+	}
+	return dns.New(nss, spec.Strategy, hosts)
+}
+
+// parseHosts 把 config 的 hosts(域名→IP 字符串列表)解析成 netip.Addr(非法 IP 大声报)。
+func parseHosts(in map[string][]string) (map[string][]netip.Addr, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make(map[string][]netip.Addr, len(in))
+	for name, ips := range in {
+		for _, s := range ips {
+			ip, err := netip.ParseAddr(s)
+			if err != nil {
+				return nil, fmt.Errorf("config: dns.hosts[%q] 非法 IP %q:%w", name, s, err)
+			}
+			out[name] = append(out[name], ip)
+		}
+	}
+	return out, nil
 }
 
 // buildRouter 把 routing: 块编译成 rule.Engine:转换规则、校验 default 与每条 to 均为已定义出站

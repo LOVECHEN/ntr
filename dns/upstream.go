@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	mtls "github.com/metacubex/tls"
 	mquic "github.com/metacubex/quic-go"
+	mtls "github.com/metacubex/tls"
 
 	"github.com/LOVECHEN/ntr/addr"
 	"github.com/LOVECHEN/ntr/buf"
@@ -27,11 +27,12 @@ import (
 type upstreamKind uint8
 
 const (
-	kindUDP upstreamKind = iota // udp://IP:53   明文 UDP
-	kindTCP                     // tcp://IP:53   明文 TCP
-	kindDoT                     // tls://IP:853  DNS-over-TLS
-	kindDoH                     // https://IP/dns-query  DNS-over-HTTPS
-	kindDoQ                     // quic://IP:853  DNS-over-QUIC(RFC 9250)
+	kindUDP  upstreamKind = iota // udp://IP:53   明文 UDP
+	kindTCP                      // tcp://IP:53   明文 TCP
+	kindDoT                      // tls://IP:853  DNS-over-TLS
+	kindDoH                      // https://IP/dns-query  DNS-over-HTTPS
+	kindDoQ                      // quic://IP:853  DNS-over-QUIC(RFC 9250)
+	kindDoH3                     // h3://IP/dns-query  DNS-over-HTTP/3(RFC 8484 的 DoH wire 跑在 HTTP/3 上)
 )
 
 // upstream 是一台上游 nameserver:承载 + 地址 + 绑定的具名出站(detour,防 DNS 泄漏)。
@@ -68,13 +69,15 @@ func parseNameserver(address, sniOverride string, insecure bool) (u upstream, er
 		u.kind = kindDoT
 	case "https", "doh", "h2":
 		u.kind = kindDoH
-	case "quic", "doq", "h3":
+	case "h3", "doh3", "http3":
+		u.kind = kindDoH3
+	case "quic", "doq":
 		u.kind = kindDoQ
 	default:
 		return u, fmt.Errorf("dns: 未知 nameserver 承载 %q", scheme)
 	}
 
-	if u.kind == kindDoH {
+	if u.kind == kindDoH || u.kind == kindDoH3 {
 		full := address
 		if !strings.Contains(full, "://") {
 			full = "https://" + full
@@ -98,6 +101,7 @@ func parseNameserver(address, sniOverride string, insecure bool) (u upstream, er
 		if u.sni == "" {
 			u.sni = host
 		}
+		pu.Scheme = "https" // DoH3 写成 h3://,URL 仍是 https(只换 HTTP/3 承载);DoH 已是 https,无害
 		pu.Host = net.JoinHostPort(host, port)
 		u.dohURL = pu.String()
 		return u, nil
@@ -152,6 +156,8 @@ func (u *upstream) query(ctx context.Context, raw []byte) ([]byte, error) {
 		return u.queryDoH(ctx, raw)
 	case kindDoQ:
 		return u.queryDoQ(ctx, raw)
+	case kindDoH3:
+		return u.queryDoH3(ctx, raw)
 	default:
 		return u.queryUDP(ctx, raw)
 	}
