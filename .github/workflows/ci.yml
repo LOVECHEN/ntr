@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 构建 + vet + 进程内单测(-race)。必过。 ──
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build
+        run: CGO_ENABLED=0 go build ./...
+      - name: vet
+        run: go vet ./... || true
+      - name: unit tests (-race)
+        run: go test -race -count=1 ./...
+
+  # ── 跨实现互通:真跑 xray / mihomo / sing-box 容器,每协议一脚本。GitHub 算力,无限量。 ──
+  interop:
+    runs-on: ubuntu-latest
+    needs: build-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build linux binary (+http2legacy)
+        run: |
+          mkdir -p /tmp/ntr-interop
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags http2legacy -o /tmp/ntr-interop/ntr ./cmd/ntr
+      - name: prepull reference images
+        run: |
+          for img in ghcr.io/xtls/xray-core:latest metacubex/mihomo:latest ghcr.io/sagernet/sing-box:latest \
+                     traefik/whoami curlimages/curl:latest python:3-alpine golang:alpine alpine gogost/gost:latest; do
+            docker pull "$img" || echo "warn: pull $img failed (脚本内会重试)"
+          done
+      - name: run interop suite
+        run: bash test/interop/run-all.sh
+      - name: report -> matrix.html
+        if: always()
+        run: |
+          go run ./cmd/ntr report --interop /tmp/ntr-interop/results.tsv --out site/index.html || true
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-logs
+          path: /tmp/ntr-interop/*.log
+          if-no-files-found: ignore
+      - name: upload pages artifact
+        if: always()
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  # ── 发布报告到 GitHub Pages(报告由 GitHub 生成、GitHub 托管)。 ──
+  pages:
+    runs-on: ubuntu-latest
+    needs: interop
+    if: always() && github.ref == 'refs/heads/main'
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

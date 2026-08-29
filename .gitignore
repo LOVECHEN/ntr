@@ -1,0 +1,7 @@
+/ntr
+/ntr-*
+*.exe
+*.test
+dist/
+build/
+.DS_Store

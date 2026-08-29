@@ -1,0 +1,1278 @@
+// Package config 是配置层:把 YAML 解码填充成哑的 spec.Node 层树,再交给 service 装配
+// (承设计第 4 章:Decode 阶段哑、无逻辑;真正的 YAML 解码在此)。
+//
+// 它对协议/传输零特判 —— 层的 type 即注册表名,层内键原样转成 spec.Node 交插件自解析。
+// 通用约定:任何 `xxx-file` 键会被读文件、以 `xxx` 键注入文件内容(证书/私钥等)。
+package config
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"net/netip"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	yaml "gopkg.in/yaml.v3"
+
+	"github.com/LOVECHEN/ntr/addr"
+	"github.com/LOVECHEN/ntr/core/cred"
+	"github.com/LOVECHEN/ntr/core/endpoint"
+	"github.com/LOVECHEN/ntr/core/link"
+	"github.com/LOVECHEN/ntr/core/proxy"
+	"github.com/LOVECHEN/ntr/core/route"
+	"github.com/LOVECHEN/ntr/core/spec"
+	"github.com/LOVECHEN/ntr/core/transport"
+	"github.com/LOVECHEN/ntr/dns"
+	"github.com/LOVECHEN/ntr/inbound/transparent"
+	"github.com/LOVECHEN/ntr/inbound/tun"
+	"github.com/LOVECHEN/ntr/inbound/tunnel"
+	"github.com/LOVECHEN/ntr/meter"
+	"github.com/LOVECHEN/ntr/outbound/anytls"
+	"github.com/LOVECHEN/ntr/outbound/block"
+	"github.com/LOVECHEN/ntr/outbound/connectip"
+	"github.com/LOVECHEN/ntr/outbound/direct"
+	dnsout "github.com/LOVECHEN/ntr/outbound/dns"
+	"github.com/LOVECHEN/ntr/outbound/hysteria1"
+	"github.com/LOVECHEN/ntr/outbound/hysteria2"
+	"github.com/LOVECHEN/ntr/outbound/masque"
+	"github.com/LOVECHEN/ntr/outbound/mieru"
+	"github.com/LOVECHEN/ntr/outbound/mux"
+	muxcool "github.com/LOVECHEN/ntr/outbound/muxcool"
+	"github.com/LOVECHEN/ntr/outbound/naive"
+	"github.com/LOVECHEN/ntr/outbound/shadowquic"
+	sshproto "github.com/LOVECHEN/ntr/outbound/ssh"
+	"github.com/LOVECHEN/ntr/outbound/trusttunnel"
+	"github.com/LOVECHEN/ntr/outbound/tuic"
+	"github.com/LOVECHEN/ntr/outbound/wireguard"
+	"github.com/LOVECHEN/ntr/reverse"
+	"github.com/LOVECHEN/ntr/rule"
+	"github.com/LOVECHEN/ntr/service"
+)
+
+// File 是配置根。
+type File struct {
+	Inbounds  []Inbound    `yaml:"inbounds"`
+	Outbounds []Outbound   `yaml:"outbounds"`
+	Bridges   []Bridge     `yaml:"bridges"` // 反向代理:主动拨 Portal 建反连隧道(内网侧)
+	DNS       *DNSSpec     `yaml:"dns"`     // DNS 解析子系统(承设计 §10.1;内置 dns 出站 + 未来 admission)
+	Metrics   *MetricsSpec `yaml:"metrics"` // 计量与可观测(承设计 §5;按用户流量 + 连接数,HTTP 快照)
+	Limits    *LimitsSpec  `yaml:"limits"`  // 全局限制(承设计 §6.2 层1:护机器 fd/带宽)
+	Routing   *RoutingSpec `yaml:"routing"` // 规则分流引擎(承设计 §8.3;按目标域名/IP/端口选出站,首个命中)
+
+	// Reg 是运行时注入的计量注册表(非 YAML)。热重载:调用方设它以跨代复用同一 Registry;Build 会写回。
+	Reg *meter.Registry `yaml:"-"`
+}
+
+// LimitsSpec 是一层限制(全局 limits: 或每口 inbounds[].limits:;承设计 §6.2 层1/2)。
+type LimitsSpec struct {
+	Rate     string `yaml:"rate"`      // 吞吐上限(500mbps/50kbps/…);空=不限
+	MaxConns int64  `yaml:"max-conns"` // 连接数上限;0=不限
+}
+
+// RoutingSpec 是规则分流配置(承设计 §8.3):有序规则表 + default 兜底。有 routing: 块时,所有代理
+// 入站按规则选出站(首个命中);无则退回每口 outbound: 静态绑定。
+type RoutingSpec struct {
+	Default string     `yaml:"default"` // 未命中兜底出站名(须在 outbounds 定义,或内置 direct/block)
+	Rules   []RuleSpec `yaml:"rules"`   // 有序,首个命中生效
+}
+
+// RuleSpec 是一条分流规则:恰好一个维度谓词 + to(目标出站/链名)。v1 维度:域名(精确/后缀/关键字)、
+// ip-cidr、端口。network/geoip/geosite/rule-set/and-or-not 为后续增量(承 §8.3.2 全集)。
+type RuleSpec struct {
+	Domain        []string `yaml:"domain"`         // 精确域名
+	DomainSuffix  []string `yaml:"domain-suffix"`  // 域名后缀(标签边界)
+	DomainKeyword []string `yaml:"domain-keyword"` // 域名子串
+	IPCIDR        []string `yaml:"ip-cidr"`        // CIDR(仅对 IP 目标)
+	Port          []uint16 `yaml:"port"`           // 目标端口
+	To            string   `yaml:"to"`             // 命中派发到的出站名
+}
+
+// MetricsSpec 是 metrics: 配置块(承设计 §5,MVP)。listen 非空 → 开启按用户计量 + HTTP 快照/控制端点。
+//
+// ★安全:该端点含 Disable/Enable/Kill 等【运维控制】权力,故默认【仅本机】可访问。access 显式放开:
+//   - 缺省 / 空:仅 127.0.0.0/8 + ::1(本机)—— 哪怕 listen 绑 0.0.0.0 也只放本机
+//   - 单 IP:["203.0.113.7"]   多 IP / 网段:["10.0.0.0/8", "192.168.1.5"]   全开(慎):["0.0.0.0/0","::/0"]
+type MetricsSpec struct {
+	Listen string   `yaml:"listen"` // 统计/控制端点监听地址(建议 127.0.0.1:9091)
+	Access []string `yaml:"access"` // 允许访问的 IP / CIDR 白名单;空 = 仅本机
+}
+
+// DNSSpec 是 dns: 配置块(承设计 §10.1.8)。MVP:明文 UDP/TCP 上游 + 缓存 + race/sequential。
+type DNSSpec struct {
+	Enabled     bool             `yaml:"enabled"`
+	Detour      string           `yaml:"detour"`   // 未写 detour 的 nameserver 默认出站(必具名)
+	Strategy    string           `yaml:"strategy"` // race(默认)| sequential
+	Nameservers []NameserverSpec `yaml:"nameservers"`
+}
+
+// NameserverSpec 是一台上游:tag + address(udp/tcp/tls(DoT)/https(DoH))+ 绑定的具名出站(防泄漏)。
+type NameserverSpec struct {
+	Tag      string `yaml:"tag"`
+	Address  string `yaml:"address"`
+	SNI      string `yaml:"sni"`      // DoT/DoH:TLS ServerName(可空→取地址 host)
+	Insecure bool   `yaml:"insecure"` // DoT/DoH:跳过证书校验
+	Detour   string `yaml:"detour"`
+}
+
+// Bridge 是一个反连隧道:经 Portal 出站(任意代理)拨到公网 Portal,把用户流量反向复用
+// 回来、由本机直连落地到内网。协议无关(隧道用哪个代理由 Portal 出站决定)。
+type Bridge struct {
+	Portal        string `yaml:"portal"`         // 引用一个 outbound 名(拨 Portal 的代理出站)
+	ControlDomain string `yaml:"control-domain"` // 隧道注册域(默认 reverse.ntr,须与 Portal 一致)
+	Pool          int    `yaml:"pool"`           // 维持的隧道数(默认 1)
+}
+
+// Inbound 是一个入站:监听地址 + 底→顶层栈 + 用户 + 路由到哪个出站。
+// Type 空/"proxy" = 流式栈模型;"anytls" 等 = 会话式协议(不走栈)。
+type Inbound struct {
+	Listen        string           `yaml:"listen"`
+	Type          string           `yaml:"type"`
+	Layers        []map[string]any `yaml:"layers"`
+	Users         []map[string]any `yaml:"users"`
+	TLS           map[string]any   `yaml:"tls"`
+	Obfs          string           `yaml:"obfs"` // hysteria1 salamander 混淆口令(可空)
+	Outbound      string           `yaml:"outbound"`
+	ControlDomain string           `yaml:"control-domain"` // type=portal:Bridge 连接的注册域(默认 reverse.ntr)
+	AssignAddress string           `yaml:"assign-address"` // type=connect-ip:下发给客户端的隧道内地址(CIDR)
+	MTU           int              `yaml:"mtu"`            // type=connect-ip / type=tun
+	Transport     string           `yaml:"transport"`      // type=mieru:mieru 传输协议 TCP/UDP(默认 TCP)
+	Address       []string         `yaml:"address"`        // type=tun:TUN 网卡地址 CIDR(至少一个)
+	IfName        string           `yaml:"if-name"`        // type=tun:接口名(空=平台默认)
+	Target        string           `yaml:"target"`         // type=tunnel:固定目标 host:port
+	Network       []string         `yaml:"network"`        // type=tunnel/tproxy:tcp/udp(空=两者)
+	Limits        *LimitsSpec      `yaml:"limits"`         // 每口限制(承设计 §6.2 层2:单口隔离)
+	Fallback      string           `yaml:"fallback"`       // 回落伪装站 host:port:协议握手失败时把连接中继到该真站(抗探测)
+	Fallbacks     []FallbackSpec   `yaml:"fallbacks"`      // 多站回落:按 ALPN + HTTP path 前缀选伪装站(对齐 xray fallbacks;非空优先于 fallback)
+}
+
+// FallbackSpec 是一条多站回落规则(对齐 xray fallbacks 的 name/alpn/path/dest)。
+type FallbackSpec struct {
+	SNI  []string `yaml:"sni"`  // 空=任意 ClientHello ServerName(对齐 xray name 维)
+	ALPN []string `yaml:"alpn"` // 空=任意协商 ALPN
+	Path string   `yaml:"path"` // 空=任意;非空=HTTP 请求首行 path 前缀匹配
+	Dest string   `yaml:"dest"` // 伪装站 host:port
+	Xver int      `yaml:"xver"` // 0=不发、1=PROXY protocol v1、2=v2:向伪装站先发 PROXY 头带真实客户端 IP
+}
+
+// Outbound 是一个出站:direct / proxy(拨上游,含层栈 + 凭据)/ anytls 等会话式。
+type Outbound struct {
+	Name        string           `yaml:"name"`
+	Type        string           `yaml:"type"`
+	Server      string           `yaml:"server"`
+	Layers      []map[string]any `yaml:"layers"`
+	Secret      string           `yaml:"secret"`
+	UUID        string           `yaml:"uuid"`
+	SNI         string           `yaml:"sni"`
+	Obfs        string           `yaml:"obfs"` // hysteria1 salamander 混淆口令(可空)
+	Insecure    bool             `yaml:"insecure"`
+	User        string           `yaml:"user"`               // ssh 登录用户(默认 root)
+	PrivateKey  string           `yaml:"private-key"`        // ssh 出站私钥 PEM(与 secret 密码二选一)
+	HostKey     string           `yaml:"host-key"`           // ssh 出站固定服务端 host key(authorized_keys 单行,可空)
+	Fingerprint string           `yaml:"client-fingerprint"` // uTLS 客户端指纹(chrome/firefox/safari/ios/edge/random)
+	// WireGuard(type=wireguard;需 -tags with_wireguard 构建才可用)
+	PeerPublicKey string   `yaml:"peer-public-key"`
+	PresharedKey  string   `yaml:"preshared-key"`
+	LocalAddress  []string `yaml:"local-address"`
+	AllowedIPs    []string `yaml:"allowed-ips"`
+	DNS           []string `yaml:"dns"`
+	MTU           int      `yaml:"mtu"`
+	Keepalive     int      `yaml:"keepalive"`
+	// CONNECT-IP(type=connect-ip;需 -tags with_connectip 构建才可用)
+	Protocol              string `yaml:"protocol"` // :protocol 值(默认 connect-ip)
+	Preset                string `yaml:"preset"`   // cloudflare = 一键套用 WARP 的三处非标差异
+	URITemplate           string `yaml:"uri-template"`
+	IgnoreExtendedConnect bool   `yaml:"ignore-extended-connect"`
+	ClientCert            string `yaml:"client-cert"`
+	ClientKey             string `yaml:"client-key"`
+	// 多路复用(sing 家族 h2mux/smux/yamux;包在 type=proxy 之上,与 sing-box/mihomo 互通)。
+	// 出现该块即启用;base 协议由 layers 决定(mux 用它把承载连接拨到魔术目标)。
+	Mux *MuxSpec `yaml:"mux"`
+	// block(type=block;内置阻断出站)。mode: reject(默认,立拒)| drop(静默黑洞)。
+	Mode string `yaml:"mode"`
+	// mieru(type=mieru;会话式,用户名+口令走 user/secret)
+	Transport    string `yaml:"transport"`    // mieru 传输协议 TCP/UDP(默认 TCP)
+	Multiplexing string `yaml:"multiplexing"` // mieru 多路复用等级(可选:MULTIPLEXING_OFF/LOW/MIDDLE/HIGH)
+}
+
+// MuxSpec 是 mux 出站配置(对齐 sing-box multiplex 语义)。
+type MuxSpec struct {
+	Protocol       string `yaml:"protocol"` // h2mux(默认)/smux/yamux
+	MaxConnections int    `yaml:"max-connections"`
+	MinStreams     int    `yaml:"min-streams"`
+	MaxStreams     int    `yaml:"max-streams"`
+	Padding        bool   `yaml:"padding"`
+}
+
+// Instance 是一个可运行入站。TCP 流式入站给 Listen+Handler(由 runtime 建 TCP 监听 + Serve);
+// 自管监听的会话式入站(hy2/tuic 的 UDP/QUIC)给 Run(自己绑监听、阻塞至 ctx 取消)。
+type Instance struct {
+	Listen  string
+	Handler endpoint.InboundHandler
+	Run     func(ctx context.Context) error
+	Hash    string // 源配置的语义哈希(热重载 diff 用:同 Listen 但 Hash 变 = 重启该口 / Drain)
+}
+
+// Load 从路径读并解析 YAML 配置。
+func Load(path string) (*File, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var f File
+	if err := yaml.Unmarshal(b, &f); err != nil {
+		return nil, fmt.Errorf("config: 解析 YAML 失败:%w", err)
+	}
+	return &f, nil
+}
+
+// buildResolver 从 dns: 块建 route.Resolver:每 nameserver 的 detour 从 outs 解析(必具名、防泄漏)。
+func buildResolver(spec *DNSSpec, outs map[string]endpoint.Outbound) (route.Resolver, error) {
+	if spec == nil || !spec.Enabled {
+		return nil, fmt.Errorf("config: 使用了 type=dns 出站,但未启用 dns:(需 dns.enabled=true)")
+	}
+	if len(spec.Nameservers) == 0 {
+		return nil, fmt.Errorf("config: dns 至少需一个 nameserver")
+	}
+	resolveDetour := func(name string) (endpoint.Outbound, error) {
+		if name == "" {
+			name = spec.Detour // 默认 detour
+		}
+		if name == "" {
+			return nil, fmt.Errorf("config: dns nameserver 缺 detour 出站且无默认 dns.detour(绝不隐式直连)")
+		}
+		out, ok := outs[name]
+		if !ok {
+			return nil, fmt.Errorf("config: dns nameserver detour 引用未定义出站 %q", name)
+		}
+		return out, nil
+	}
+	var nss []dns.Nameserver
+	for _, ns := range spec.Nameservers {
+		det, err := resolveDetour(ns.Detour)
+		if err != nil {
+			return nil, err
+		}
+		nss = append(nss, dns.Nameserver{Tag: ns.Tag, Address: ns.Address, SNI: ns.SNI, Insecure: ns.Insecure, Detour: det})
+	}
+	return dns.New(nss, spec.Strategy)
+}
+
+// buildRouter 把 routing: 块编译成 rule.Engine:转换规则、校验 default 与每条 to 均为已定义出站
+// (编译期挡住悬空目标,守「绝不静默误路由」)。规则维度校验(须恰好一个)在 rule.Compile 内。
+func buildRouter(spec *RoutingSpec, outs map[string]endpoint.Outbound) (*rule.Engine, error) {
+	if _, ok := outs[spec.Default]; !ok {
+		return nil, fmt.Errorf("config: routing.default %q 未在 outbounds 定义", spec.Default)
+	}
+	rules := make([]rule.Rule, len(spec.Rules))
+	for i, rs := range spec.Rules {
+		if _, ok := outs[rs.To]; !ok {
+			return nil, fmt.Errorf("config: routing.rules[%d].to %q 未在 outbounds 定义", i, rs.To)
+		}
+		rules[i] = rule.Rule{
+			Domain:        rs.Domain,
+			DomainSuffix:  rs.DomainSuffix,
+			DomainKeyword: rs.DomainKeyword,
+			IPCIDR:        rs.IPCIDR,
+			Port:          rs.Port,
+			To:            rs.To,
+		}
+	}
+	return rule.Compile(rules, spec.Default)
+}
+
+// Build 把配置装配成可运行入站列表(解析出站表 → 逐入站建栈 + 注册用户 + 绑定出站)。
+// 热重载路径:调用前设 f.Reg(注入既有计量注册表,跨代复用保累计流量 + 保 metrics 端点);Build 会把
+// 实际使用的 Registry 写回 f.Reg 供调用方读取。reg=nil 且开启 metrics 时新建。
+func (f *File) Build(ctx context.Context) ([]Instance, error) {
+	outs := map[string]endpoint.Outbound{"direct": direct.Outbound{}} // 恒有 direct
+	var dnsOutboundNames []string                                     // type=dns 出站延迟到 resolver 建好再填
+	metricReg := f.Reg                                                // 计量注册表(开启时);nil = 关闭、零成本
+	if metricReg == nil && f.Metrics != nil && f.Metrics.Listen != "" {
+		metricReg = meter.NewRegistry()
+	}
+	f.Reg = metricReg                      // 写回供热重载复用
+	globalGate, err := buildGate(f.Limits) // 全局连接闸/限速(§6.2 层1;nil=不限)
+	if err != nil {
+		return nil, fmt.Errorf("config: limits:%w", err)
+	}
+	for _, o := range f.Outbounds {
+		if o.Name == "" {
+			return nil, fmt.Errorf("config: 出站缺 name")
+		}
+		switch o.Type {
+		case "direct", "":
+			outs[o.Name] = direct.Outbound{}
+		case "dns":
+			dnsOutboundNames = append(dnsOutboundNames, o.Name) // 延迟(见出站 loop 后)
+		case "block":
+			switch o.Mode {
+			case "", "reject", "rst":
+				outs[o.Name] = block.Outbound{Drop: false}
+			case "drop", "silent", "blackhole":
+				outs[o.Name] = block.Outbound{Drop: true}
+			default:
+				return nil, fmt.Errorf("config: 出站 %q(block)未知 mode %q(仅 reject/drop)", o.Name, o.Mode)
+			}
+		case "proxy":
+			layers, err := toLayerSpecs(o.Layers)
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q:%w", o.Name, err)
+			}
+			up, err := service.BuildOutbound(ctx, o.Server, layers, o.Secret)
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q:%w", o.Name, err)
+			}
+			if o.Mux != nil { // mux 包在 base 协议之上:承载连接经 base 拨魔术目标,其上复用子流
+				switch o.Mux.Protocol {
+				case "cool", "mux.cool", "xray":
+					// Xray Mux.cool:自研 muxcool 客户端,承载拨 v1.mux.cool:9527。
+					mo, err := muxcool.NewOutbound(up, o.Mux.MaxStreams)
+					if err != nil {
+						return nil, fmt.Errorf("config: 出站 %q(mux.cool):%w", o.Name, err)
+					}
+					outs[o.Name] = mo
+				default: // sing 家族 h2mux/smux/yamux
+					mo, err := mux.NewOutbound(up, mux.Options{
+						Protocol:       o.Mux.Protocol,
+						MaxConnections: o.Mux.MaxConnections,
+						MinStreams:     o.Mux.MinStreams,
+						MaxStreams:     o.Mux.MaxStreams,
+						Padding:        o.Mux.Padding,
+					})
+					if err != nil {
+						return nil, fmt.Errorf("config: 出站 %q(mux):%w", o.Name, err)
+					}
+					outs[o.Name] = mo
+				}
+			} else {
+				outs[o.Name] = up
+			}
+		case "anytls":
+			up, err := anytls.NewOutbound(anytls.Options{Server: o.Server, Password: o.Secret, SNI: o.SNI, Insecure: o.Insecure})
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q(anytls):%w", o.Name, err)
+			}
+			outs[o.Name] = up
+		case "hysteria1":
+			up, err := hysteria1.NewOutbound(hysteria1.Options{Server: o.Server, Password: o.Secret, Obfs: o.Obfs, SNI: o.SNI, Insecure: o.Insecure})
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q(hysteria1):%w", o.Name, err)
+			}
+			outs[o.Name] = up
+		case "hysteria2":
+			up, err := hysteria2.NewOutbound(hysteria2.Options{Server: o.Server, Password: o.Secret, SNI: o.SNI, Insecure: o.Insecure, Obfs: o.Obfs})
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q(hysteria2):%w", o.Name, err)
+			}
+			outs[o.Name] = up
+		case "tuic":
+			up, err := tuic.NewOutbound(tuic.Options{Server: o.Server, UUID: o.UUID, Password: o.Secret, SNI: o.SNI, Insecure: o.Insecure})
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q(tuic):%w", o.Name, err)
+			}
+			outs[o.Name] = up
+		case "shadowquic":
+			up, err := shadowquic.NewOutbound(shadowquic.Options{Server: o.Server, Username: o.User, Password: o.Secret, SNI: o.SNI})
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q(shadowquic):%w", o.Name, err)
+			}
+			outs[o.Name] = up
+		case "ssh":
+			up, err := sshproto.NewOutbound(sshproto.Options{Server: o.Server, User: o.User, Password: o.Secret, PrivateKey: o.PrivateKey, HostKey: o.HostKey})
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q(ssh):%w", o.Name, err)
+			}
+			outs[o.Name] = up
+		case "trusttunnel":
+			up, err := trusttunnel.NewOutbound(trusttunnel.Options{Server: o.Server, User: o.User, Password: o.Secret, SNI: o.SNI, Insecure: o.Insecure, Fingerprint: o.Fingerprint})
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q(trusttunnel):%w", o.Name, err)
+			}
+			outs[o.Name] = up
+		case "naive":
+			up, err := naive.NewOutbound(naive.Options{Server: o.Server, User: o.User, Password: o.Secret, SNI: o.SNI, Insecure: o.Insecure, Fingerprint: o.Fingerprint})
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q(naive):%w", o.Name, err)
+			}
+			outs[o.Name] = up
+		case "mieru":
+			up, err := mieru.NewOutbound(mieru.Options{Server: o.Server, Transport: o.Transport, Username: o.User, Password: o.Secret, Multiplexing: o.Multiplexing})
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q(mieru):%w", o.Name, err)
+			}
+			outs[o.Name] = up
+		case "connect-ip":
+			opts := connectip.Options{
+				Server: o.Server, SNI: o.SNI, Insecure: o.Insecure,
+				Protocol: o.Protocol, URITemplate: o.URITemplate,
+				IgnoreExtendedConnect: o.IgnoreExtendedConnect,
+				LocalAddress:          o.LocalAddress, DNS: o.DNS, MTU: o.MTU,
+				ClientCert: o.ClientCert, ClientKey: o.ClientKey,
+			}
+			// preset=cloudflare:套用 WARP 的三处非标差异(仍可被显式字段覆盖)。
+			// 依据:mihomo transport/masque/masque.go —— :protocol 用 cf-connect-ip、
+			// 发已废弃的 SETTINGS_H3_DATAGRAM_00(0x276)、跳过 Extended CONNECT 校验。
+			if o.Preset == "cloudflare" {
+				if opts.Protocol == "" {
+					opts.Protocol = "cf-connect-ip"
+				}
+				opts.ExtraSettings = map[uint64]uint64{0x276: 1}
+				opts.IgnoreExtendedConnect = true
+			}
+			up, err := connectip.NewOutbound(opts)
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q(connect-ip):%w", o.Name, err)
+			}
+			outs[o.Name] = up
+		case "wireguard":
+			up, err := wireguard.NewOutbound(wireguard.Options{
+				PrivateKey: o.PrivateKey, PeerPublicKey: o.PeerPublicKey, PresharedKey: o.PresharedKey,
+				Endpoint: o.Server, LocalAddress: o.LocalAddress, AllowedIPs: o.AllowedIPs,
+				DNS: o.DNS, MTU: o.MTU, Keepalive: o.Keepalive,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q(wireguard):%w", o.Name, err)
+			}
+			outs[o.Name] = up
+		case "masque":
+			up, err := masque.NewOutbound(masque.Options{Server: o.Server, User: o.User, Password: o.Secret, SNI: o.SNI, Insecure: o.Insecure})
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q(masque):%w", o.Name, err)
+			}
+			outs[o.Name] = up
+		default:
+			return nil, fmt.Errorf("config: 出站 %q 未知 type %q", o.Name, o.Type)
+		}
+	}
+
+	// DNS 解析子系统:建 resolver(nameserver 的 detour 从 outs 解析,防泄漏),再填 type=dns 出站。
+	if len(dnsOutboundNames) > 0 || (f.DNS != nil && f.DNS.Enabled) {
+		resolver, err := buildResolver(f.DNS, outs)
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range dnsOutboundNames {
+			outs[name] = dnsout.New(resolver)
+		}
+	}
+
+	// 规则分流引擎(承 §8.3):有 routing: 块 → 编译规则表,所有代理入站按目标(域名/IP/端口)分流,
+	// 首个命中生效、末尾 default 兜底。无则退回每口 outbound: 静态绑定。
+	var router *service.RuleRouter
+	if f.Routing != nil {
+		eng, err := buildRouter(f.Routing, outs)
+		if err != nil {
+			return nil, err
+		}
+		router = &service.RuleRouter{Engine: eng, Outs: outs}
+	}
+
+	var insts []Instance
+	for i, in := range f.Inbounds {
+		if in.Listen == "" && in.Type != "tun" { // tun 无监听端口,靠接口名
+			return nil, fmt.Errorf("config: 入站 #%d 缺 listen", i)
+		}
+		outName := in.Outbound
+		if outName == "" {
+			outName = "direct"
+		}
+		out, ok := outs[outName]
+		if !ok {
+			return nil, fmt.Errorf("config: 入站 %s 引用了未定义的出站 %q", in.Listen, outName)
+		}
+		// 出站解析器:有 routing: 块 → 规则引擎按目标分流(首个命中);否则退回每口静态绑定。
+		var resolver service.OutboundResolver = service.StaticOutbound{Out: out}
+		if router != nil {
+			resolver = router
+		}
+
+		var handler endpoint.InboundHandler
+		switch in.Type {
+		case "", "proxy":
+			h, base, err := f.buildProxyInbound(ctx, in, resolver)
+			if err != nil {
+				return nil, err
+			}
+			if base != nil { // UDP-base(mkcp):自管 UDP 监听 + KCP accept,accept 出的流交 HandleStream
+				listen := in.Listen
+				insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error {
+					ln, err := base.ListenBase(ctx, listen)
+					if err != nil {
+						return err
+					}
+					return service.ServeBase(ctx, ln, h)
+				}})
+				continue
+			}
+			handler = h
+		case "portal":
+			// 反向代理 Portal:复用普通代理入站建栈 + 注册用户,再包成 reverse.Portal
+			// (control-domain 区分 Bridge 控制连接与用户连接)。out 未用(Portal 覆盖 HandleStream)。
+			pin, _, err := f.buildProxyInbound(ctx, in, resolver)
+			if err != nil {
+				return nil, err
+			}
+			handler = &reverse.Portal{HS: pin, Control: in.ControlDomain}
+		case "anytls":
+			h, err := buildAnytlsInbound(in, out)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(anytls):%w", in.Listen, err)
+			}
+			handler = h
+		case "ssh":
+			h, err := buildSshInbound(in, out)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(ssh):%w", in.Listen, err)
+			}
+			handler = h
+		case "trusttunnel":
+			h, err := buildTrusttunnelInbound(in, out)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(trusttunnel):%w", in.Listen, err)
+			}
+			handler = h
+		case "naive":
+			h, err := buildNaiveInbound(in, out)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(naive):%w", in.Listen, err)
+			}
+			handler = h
+		case "hysteria1":
+			inb, err := buildHy1Inbound(in, out)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(hysteria1):%w", in.Listen, err)
+			}
+			listen := in.Listen
+			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
+			continue
+		case "hysteria2":
+			inb, err := buildHy2Inbound(in, out)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(hysteria2):%w", in.Listen, err)
+			}
+			listen := in.Listen
+			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
+			continue
+		case "tuic":
+			inb, err := buildTuicInbound(in, out)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(tuic):%w", in.Listen, err)
+			}
+			listen := in.Listen
+			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
+			continue
+		case "shadowquic":
+			inb, err := buildShadowquicInbound(in, out)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(shadowquic):%w", in.Listen, err)
+			}
+			listen := in.Listen
+			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
+			continue
+		case "mieru":
+			inb, err := buildMieruInbound(in, out)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(mieru):%w", in.Listen, err)
+			}
+			listen := in.Listen
+			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
+			continue
+		case "connect-ip":
+			inb, err := buildConnectIPInbound(in, out)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(connect-ip):%w", in.Listen, err)
+			}
+			listen := in.Listen
+			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
+			continue
+		case "tun":
+			inb, err := tun.NewInbound(tun.Options{Name: in.IfName, Address: in.Address, MTU: in.MTU}, out)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 tun:%w", err)
+			}
+			insts = append(insts, Instance{Listen: "tun:" + in.IfName, Run: func(ctx context.Context) error { return inb.Run(ctx, "") }})
+			continue
+		case "tunnel":
+			inb, err := tunnel.NewInbound(tunnel.Options{Target: in.Target, Network: in.Network}, out)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(tunnel):%w", in.Listen, err)
+			}
+			listen := in.Listen
+			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
+			continue
+		case "redirect", "tproxy":
+			inb, err := transparent.NewInbound(transparent.Options{Mode: in.Type, Network: in.Network}, out)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(%s):%w", in.Listen, in.Type, err)
+			}
+			listen := in.Listen
+			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
+			continue
+		case "masque":
+			inb, err := buildMasqueInbound(in, out)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(masque):%w", in.Listen, err)
+			}
+			listen := in.Listen
+			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
+			continue
+		default:
+			return nil, fmt.Errorf("config: 入站 %s 未知 type %q", in.Listen, in.Type)
+		}
+		// 全局 + 每口连接闸(§6.2 层1/2):建每口闸,叠成 [全局, 口] 挂到 ProxyInbound。
+		inboundGate, err := buildGate(in.Limits)
+		if err != nil {
+			return nil, fmt.Errorf("config: 入站 %s(limits):%w", in.Listen, err)
+		}
+		gates := nonNilGates(globalGate, inboundGate)
+		if pi := asProxyInbound(handler); pi != nil {
+			pi.Gates = gates
+			if metricReg != nil { // 按用户计量 + 每用户限额
+				pi.Meter = metricReg
+				for j, u := range in.Users {
+					if lim, ok := parseUserLimits(u); ok {
+						metricReg.SetLimits(cred.UserBase+cred.ID(j)+1, lim)
+					}
+				}
+			}
+		}
+		insts = append(insts, Instance{Listen: in.Listen, Handler: handler})
+	}
+
+	// 给源自 inbound 的 Instance 打源配置语义哈希(热重载 diff:同 Listen 但 Hash 变 = 重启该口)。
+	inboundHash := make(map[string]string, len(f.Inbounds))
+	for _, in := range f.Inbounds {
+		key := in.Listen
+		if in.Type == "tun" {
+			key = "tun:" + in.IfName
+		}
+		inboundHash[key] = hashOf(in)
+	}
+	for i := range insts {
+		if h, ok := inboundHash[insts[i].Listen]; ok {
+			insts[i].Hash = h
+		}
+	}
+
+	// 反向代理 Bridge:主动拨 Portal 建隧道(无监听,自跑 Run 直到 ctx 取消)。
+	for i, b := range f.Bridges {
+		if b.Portal == "" {
+			return nil, fmt.Errorf("config: bridge #%d 缺 portal(拨 Portal 的出站名)", i)
+		}
+		out, ok := outs[b.Portal]
+		if !ok {
+			return nil, fmt.Errorf("config: bridge #%d 引用未定义出站 %q", i, b.Portal)
+		}
+		control := b.ControlDomain
+		if control == "" {
+			control = reverse.DefaultControlDomain
+		}
+		br := &reverse.Bridge{
+			Dial:    out, // endpoint.Outbound 满足 reverse.StreamDialer
+			Control: addr.FromFqdn(control, 0),
+			Dialer:  net.Dialer{Timeout: 10 * time.Second}, // 落地拨号超时,防黑洞目标挂死 land goroutine
+			Pool:    b.Pool,
+		}
+		label := fmt.Sprintf("reverse-bridge#%d→%s", i, b.Portal)
+		insts = append(insts, Instance{Listen: label, Hash: hashOf(b), Run: br.Run})
+	}
+
+	// 计量/控制 HTTP 端点(开启时):默认仅本机可访问,access 白名单显式放开。
+	if metricReg != nil {
+		listen := f.Metrics.Listen
+		allow, err := parseAccess(f.Metrics.Access)
+		if err != nil {
+			return nil, fmt.Errorf("config: metrics.access:%w", err)
+		}
+		insts = append(insts, Instance{Listen: "metrics:" + listen, Hash: hashOf(f.Metrics), Run: func(ctx context.Context) error {
+			return serveMetrics(ctx, listen, metricReg, allow)
+		}})
+	}
+
+	if len(insts) == 0 {
+		return nil, fmt.Errorf("config: 无 inbounds / bridges")
+	}
+	return insts, nil
+}
+
+// serveMetrics 起计量 + 热开关 HTTP 端点。阻塞至 ctx 取消。
+//
+//	GET  /stats               每用户 up/down/连接数/停用态 JSON
+//	POST /disable?id=<credID> 停用凭据(拒新 + 断老,承 §6.5);回执 {"killed":N}
+//	POST /enable?id=<credID>  恢复凭据
+//	POST /kill?conn=<connID>  断单条连接;回执 {"killed":0|1}
+func serveMetrics(ctx context.Context, listen string, reg *meter.Registry, allow []netip.Prefix) error {
+	// gate:按客户端源 IP 过白名单;不在则 403(即便 listen 绑 0.0.0.0 也只放白名单)。
+	gate := func(h http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if !accessAllowed(r.RemoteAddr, allow) {
+				http.Error(w, "forbidden (metrics.access)", http.StatusForbidden)
+				return
+			}
+			h(w, r)
+		}
+	}
+	writeKilled := func(w http.ResponseWriter, killed int) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]int{"killed": killed})
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stats", gate(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(reg.Snapshot())
+	}))
+	mux.HandleFunc("/disable", gate(func(w http.ResponseWriter, req *http.Request) {
+		id, err := parseUint(req.URL.Query().Get("id"))
+		if err != nil {
+			http.Error(w, "bad id", http.StatusBadRequest)
+			return
+		}
+		killed, ok := reg.Disable(cred.ID(id))
+		if !ok {
+			http.Error(w, "no such cred", http.StatusNotFound)
+			return
+		}
+		writeKilled(w, killed)
+	}))
+	mux.HandleFunc("/enable", gate(func(w http.ResponseWriter, req *http.Request) {
+		id, err := parseUint(req.URL.Query().Get("id"))
+		if err != nil {
+			http.Error(w, "bad id", http.StatusBadRequest)
+			return
+		}
+		if !reg.Enable(cred.ID(id)) {
+			http.Error(w, "no such cred", http.StatusNotFound)
+			return
+		}
+		writeKilled(w, 0)
+	}))
+	mux.HandleFunc("/kill", gate(func(w http.ResponseWriter, req *http.Request) {
+		connID, err := parseUint(req.URL.Query().Get("conn"))
+		if err != nil {
+			http.Error(w, "bad conn", http.StatusBadRequest)
+			return
+		}
+		writeKilled(w, reg.KillConn(connID))
+	}))
+	srv := &http.Server{Addr: listen, Handler: mux}
+	context.AfterFunc(ctx, func() { _ = srv.Close() })
+	err := srv.ListenAndServe()
+	if err == http.ErrServerClosed {
+		return ctx.Err()
+	}
+	return err
+}
+
+// parseUint 解析十进制无符号整数(计量控制端点的 id/conn 参数)。
+func parseUint(s string) (uint64, error) { return strconv.ParseUint(s, 10, 64) }
+
+// nonNilGates 把若干闸滤掉 nil,叠成有序切片(全局在前、口在后)。
+func nonNilGates(gs ...*meter.Gate) []*meter.Gate {
+	var out []*meter.Gate
+	for _, g := range gs {
+		if g != nil {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// asProxyInbound 从 handler 取出底层 ProxyInbound(直接 或 reverse.Portal 包裹的);否则 nil。
+func asProxyInbound(handler endpoint.InboundHandler) *service.ProxyInbound {
+	if pi, ok := handler.(*service.ProxyInbound); ok {
+		return pi
+	}
+	if pt, ok := handler.(*reverse.Portal); ok {
+		if pi, ok := pt.HS.(*service.ProxyInbound); ok {
+			return pi
+		}
+	}
+	return nil
+}
+
+// buildGate 从一层 LimitsSpec 建 meter.Gate(全局/每口;无限制返回 nil)。
+func buildGate(l *LimitsSpec) (*meter.Gate, error) {
+	if l == nil {
+		return nil, nil
+	}
+	var rate float64
+	if l.Rate != "" {
+		r, err := parseRate(l.Rate)
+		if err != nil {
+			return nil, err
+		}
+		rate = r
+	}
+	return meter.NewGate(l.MaxConns, rate), nil
+}
+
+// parseUserLimits 从用户配置 map 解出 max-conns / rate / max-ips(承 §6.2)。ok=false 表示无任何限额。
+func parseUserLimits(u map[string]any) (meter.Limits, bool) {
+	var l meter.Limits
+	has := false
+	if v, ok := toInt(u["max-conns"]); ok && v > 0 {
+		l.MaxConns = int64(v)
+		has = true
+	}
+	if v, ok := toInt(u["max-ips"]); ok && v > 0 {
+		l.MaxIPs = v
+		has = true
+	}
+	if s, ok := u["rate"].(string); ok && s != "" {
+		if bps, err := parseRate(s); err == nil && bps > 0 {
+			l.Rate = bps
+			has = true
+		}
+	}
+	return l, has
+}
+
+// toInt 把 YAML 解出的数值(int/int64/float64)归一成 int。
+func toInt(v any) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case float64:
+		return int(n), true
+	}
+	return 0, false
+}
+
+// parseRate 解析速率("500mbps"/"50kbps"/"2gbps"/"1000bps"/裸数字=bps)→ 字节/秒。
+func parseRate(s string) (float64, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	mult := 1.0 // bits per unit
+	switch {
+	case strings.HasSuffix(s, "gbps"):
+		mult, s = 1e9, strings.TrimSuffix(s, "gbps")
+	case strings.HasSuffix(s, "mbps"):
+		mult, s = 1e6, strings.TrimSuffix(s, "mbps")
+	case strings.HasSuffix(s, "kbps"):
+		mult, s = 1e3, strings.TrimSuffix(s, "kbps")
+	case strings.HasSuffix(s, "bps"):
+		mult, s = 1, strings.TrimSuffix(s, "bps")
+	}
+	n, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: 速率非法 %q", s)
+	}
+	return n * mult / 8, nil // bits/s → bytes/s
+}
+
+// hashOf 取任意配置值的语义哈希(YAML 规范序列化 + SHA256),供热重载 diff。
+func hashOf(v any) string {
+	b, _ := yaml.Marshal(v)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// parseAccess 把 access 白名单解析成前缀集。空 → 仅本机(127.0.0.0/8 + ::1/128)。
+// 每项可为 CIDR("10.0.0.0/8")或单 IP("192.168.1.5" → /32 或 /128)。
+func parseAccess(access []string) ([]netip.Prefix, error) {
+	if len(access) == 0 {
+		return []netip.Prefix{
+			netip.MustParsePrefix("127.0.0.0/8"),
+			netip.MustParsePrefix("::1/128"),
+		}, nil
+	}
+	var out []netip.Prefix
+	for _, a := range access {
+		a = strings.TrimSpace(a)
+		if p, err := netip.ParsePrefix(a); err == nil {
+			out = append(out, p)
+			continue
+		}
+		ip, err := netip.ParseAddr(a)
+		if err != nil {
+			return nil, fmt.Errorf("非法条目 %q(需 IP 或 CIDR)", a)
+		}
+		out = append(out, netip.PrefixFrom(ip, ip.BitLen()))
+	}
+	return out, nil
+}
+
+// accessAllowed 判 remoteAddr(host:port)的源 IP 是否命中白名单前缀。
+func accessAllowed(remoteAddr string, allow []netip.Prefix) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	ip = ip.Unmap()
+	for _, p := range allow {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildProxyInbound 建流式栈入站(BuildInbound + 经 CredentialCodec 注册用户)。
+func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver service.OutboundResolver) (*service.ProxyInbound, transport.BaseTransport, error) {
+	layers, err := toLayerSpecs(in.Layers)
+	if err != nil {
+		return nil, nil, fmt.Errorf("config: 入站 %s:%w", in.Listen, err)
+	}
+	auth := service.NewStaticAuth()
+	handler, base, err := service.BuildInbound(ctx, layers, auth, resolver)
+	if err != nil {
+		return nil, nil, fmt.Errorf("config: 入站 %s:%w", in.Listen, err)
+	}
+	handler.Fallback = in.Fallback // 回落伪装站(空=不开)
+	for _, r := range in.Fallbacks {
+		handler.Fallbacks = append(handler.Fallbacks, service.FallbackRule{SNI: r.SNI, ALPN: r.ALPN, Path: r.Path, Dest: r.Dest, Xver: r.Xver})
+	}
+	scheme := layers[len(layers)-1].Name
+	if cc, ok := handler.Proxy.(proxy.CredentialCodec); ok {
+		for j, u := range in.Users {
+			secret := userSecret(u)
+			if secret == "" {
+				continue
+			}
+			key, err := cc.AuthKey(secret)
+			if err != nil {
+				return nil, nil, fmt.Errorf("config: 入站 %s 用户 #%d:%w", in.Listen, j, err)
+			}
+			auth.Add(scheme, key, cred.Ref{ID: cred.UserBase + cred.ID(j) + 1})
+		}
+	}
+	return handler, base, nil
+}
+
+// buildAnytlsInbound 建 AnyTLS 会话入站(TLS 证书 + 用户 + 绑定出站)。
+func buildAnytlsInbound(in Inbound, out endpoint.Outbound) (endpoint.InboundHandler, error) {
+	certPEM := fileOrStr(in.TLS, "cert")
+	keyPEM := fileOrStr(in.TLS, "key")
+	tlsConfig, err := anytls.ServerTLSConfig(certPEM, keyPEM)
+	if err != nil {
+		return nil, err
+	}
+	var users []anytls.User
+	for _, u := range in.Users {
+		pw, _ := u["password"].(string)
+		if pw == "" {
+			continue
+		}
+		name, _ := u["name"].(string)
+		users = append(users, anytls.User{Name: name, Password: pw})
+	}
+	if len(users) == 0 {
+		return nil, fmt.Errorf("anytls 入站需至少一个 user{password}")
+	}
+	return anytls.NewInbound(users, tlsConfig, out, sessionPortalDispatch(in))
+}
+
+// buildSshInbound 建 SSH 会话入站(host 私钥 = tls.key + 用户{password/public-key} + 绑定出站)。
+func buildSshInbound(in Inbound, out endpoint.Outbound) (*sshproto.Inbound, error) {
+	hostKey := fileOrStr(in.TLS, "key")
+	if hostKey == "" {
+		return nil, fmt.Errorf("ssh 入站需 tls.key(host 私钥 PEM)")
+	}
+	var users []sshproto.User
+	for _, u := range in.Users {
+		name, _ := u["name"].(string)
+		pw, _ := u["password"].(string)
+		pk, _ := u["public-key"].(string)
+		if pw == "" && pk == "" {
+			continue
+		}
+		users = append(users, sshproto.User{Name: name, Password: pw, PublicKey: pk})
+	}
+	if len(users) == 0 {
+		return nil, fmt.Errorf("ssh 入站需至少一个 user{password 或 public-key}")
+	}
+	return sshproto.NewInbound(users, hostKey, out, sessionPortalDispatch(in))
+}
+
+// buildTrusttunnelInbound 建 TrustTunnel 会话入站(服务端证书 = tls.cert/key + Basic 用户 + 绑定出站)。
+func buildTrusttunnelInbound(in Inbound, out endpoint.Outbound) (*trusttunnel.Inbound, error) {
+	tlsConfig, err := anytls.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
+	if err != nil {
+		return nil, err
+	}
+	var users []trusttunnel.User
+	for _, u := range in.Users {
+		name, _ := u["name"].(string)
+		pw, _ := u["password"].(string)
+		if name == "" {
+			continue
+		}
+		users = append(users, trusttunnel.User{Name: name, Password: pw})
+	}
+	if len(users) == 0 {
+		return nil, fmt.Errorf("trusttunnel 入站需至少一个 user{name,password}")
+	}
+	return trusttunnel.NewInbound(users, tlsConfig, out, sessionPortalDispatch(in))
+}
+
+// buildNaiveInbound 建 NaiveProxy 会话入站(服务端证书 = tls.cert/key + Basic 用户 + 绑定出站)。
+func buildNaiveInbound(in Inbound, out endpoint.Outbound) (*naive.Inbound, error) {
+	tlsConfig, err := anytls.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
+	if err != nil {
+		return nil, err
+	}
+	var users []naive.User
+	for _, u := range in.Users {
+		name, _ := u["name"].(string)
+		pw, _ := u["password"].(string)
+		if name == "" {
+			continue
+		}
+		users = append(users, naive.User{Name: name, Password: pw})
+	}
+	if len(users) == 0 {
+		return nil, fmt.Errorf("naive 入站需至少一个 user{name,password}")
+	}
+	return naive.NewInbound(users, tlsConfig, out, sessionPortalDispatch(in))
+}
+
+// buildConnectIPInbound 建 CONNECT-IP 入站(QUIC/h3 证书 + 下发地址 + 绑定出站)。
+func buildConnectIPInbound(in Inbound, out endpoint.Outbound) (*connectip.Inbound, error) {
+	tlsConfig, err := hysteria2.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
+	if err != nil {
+		return nil, err
+	}
+	return connectip.NewInbound(connectip.InboundOptions{
+		AssignAddress: in.AssignAddress,
+		MTU:           in.MTU,
+	}, tlsConfig, out)
+}
+
+// buildMasqueInbound 建 MASQUE 会话入站(QUIC/h3 证书 + 可选 Basic 用户 + 绑定出站)。
+// 用户可为空 = 不鉴权(MASQUE 本身无标准认证层)。
+func buildMasqueInbound(in Inbound, out endpoint.Outbound) (*masque.Inbound, error) {
+	tlsConfig, err := hysteria2.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
+	if err != nil {
+		return nil, err
+	}
+	var users []masque.User
+	for _, u := range in.Users {
+		name, _ := u["name"].(string)
+		pw, _ := u["password"].(string)
+		if name == "" {
+			continue
+		}
+		users = append(users, masque.User{Name: name, Password: pw})
+	}
+	return masque.NewInbound(users, tlsConfig, out, sessionPortalDispatch(in))
+}
+
+// buildHy2Inbound 建 Hysteria2 会话入站(metacubex-tls 证书 + 用户 + 绑定出站)。
+func buildHy1Inbound(in Inbound, out endpoint.Outbound) (*hysteria1.Inbound, error) {
+	tlsConfig, err := anytls.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
+	if err != nil {
+		return nil, err
+	}
+	var users []hysteria1.User
+	for _, u := range in.Users {
+		pw, _ := u["password"].(string)
+		if pw == "" {
+			continue
+		}
+		users = append(users, hysteria1.User{Password: pw})
+	}
+	if len(users) == 0 {
+		return nil, fmt.Errorf("hysteria1 入站需至少一个 user{password}")
+	}
+	return hysteria1.NewInbound(users, in.Obfs, 0, 0, tlsConfig, out, sessionPortalDispatch(in))
+}
+
+func buildHy2Inbound(in Inbound, out endpoint.Outbound) (*hysteria2.Inbound, error) {
+	tlsConfig, err := hysteria2.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
+	if err != nil {
+		return nil, err
+	}
+	var users []hysteria2.User
+	for _, u := range in.Users {
+		pw, _ := u["password"].(string)
+		if pw == "" {
+			continue
+		}
+		name, _ := u["name"].(string)
+		users = append(users, hysteria2.User{Name: name, Password: pw})
+	}
+	if len(users) == 0 {
+		return nil, fmt.Errorf("hysteria2 入站需至少一个 user{password}")
+	}
+	return hysteria2.NewInbound(users, tlsConfig, in.Obfs, out, sessionPortalDispatch(in))
+}
+
+// buildMieruInbound 建 mieru 会话入站(官方库自绑端口,用户名+口令,TCP/UDP 传输)。
+func buildMieruInbound(in Inbound, out endpoint.Outbound) (*mieru.Inbound, error) {
+	var users []mieru.User
+	for _, u := range in.Users {
+		name, _ := u["name"].(string)
+		pw, _ := u["password"].(string)
+		if name == "" || pw == "" {
+			continue
+		}
+		users = append(users, mieru.User{Name: name, Password: pw})
+	}
+	if len(users) == 0 {
+		return nil, fmt.Errorf("mieru 入站需至少一个 user{name,password}")
+	}
+	return mieru.NewInbound(users, in.Transport, out, sessionPortalDispatch(in))
+}
+
+// buildTuicInbound 建 TUIC 会话入站(证书 + UUID/password 用户 + 绑定出站)。
+func buildTuicInbound(in Inbound, out endpoint.Outbound) (*tuic.Inbound, error) {
+	tlsConfig, err := anytls.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
+	if err != nil {
+		return nil, err
+	}
+	var users []tuic.User
+	for _, u := range in.Users {
+		uuid, _ := u["uuid"].(string)
+		pw, _ := u["password"].(string)
+		if uuid == "" {
+			continue
+		}
+		users = append(users, tuic.User{UUID: uuid, Password: pw})
+	}
+	if len(users) == 0 {
+		return nil, fmt.Errorf("tuic 入站需至少一个 user{uuid,password}")
+	}
+	return tuic.NewInbound(users, tlsConfig, out, sessionPortalDispatch(in))
+}
+
+// buildShadowquicInbound 建 ShadowQUIC 入站(JLS PSK 用户 + sni)。sni 从 tls.sni 取(JLS ServerName,
+// 须与客户端 servername 一致);dest 兜底 sni(v1 无回落 relay,dest 仅供 sni 推导)。
+func buildShadowquicInbound(in Inbound, out endpoint.Outbound) (*shadowquic.Inbound, error) {
+	var users []shadowquic.User
+	for _, u := range in.Users {
+		un, _ := u["username"].(string)
+		pw, _ := u["password"].(string)
+		if un == "" {
+			continue
+		}
+		users = append(users, shadowquic.User{Username: un, Password: pw})
+	}
+	if len(users) == 0 {
+		return nil, fmt.Errorf("shadowquic 入站需至少一个 user{username,password}")
+	}
+	return shadowquic.NewInbound(users, fileOrStr(in.TLS, "sni"), in.Target, nil, out, sessionPortalDispatch(in))
+}
+
+// sessionPortalDispatch:会话式协议(anytls/hy1/hy2/tuic —— 自管监听、每流已握手)作 reverse portal
+// 时的每流派发。in.ControlDomain 非空 → 建一个 Portal(隧道池)并返回其 Dispatch 适配(会话式反连
+// UDP 后置,传 nil);否则 nil(走默认 relay 到出站)。★协议本身一行不改,只在此接线注入。
+func sessionPortalDispatch(in Inbound) endpoint.StreamDispatch {
+	if in.ControlDomain == "" {
+		return nil
+	}
+	portal := &reverse.Portal{Control: in.ControlDomain}
+	return func(ctx context.Context, s link.Stream, dst addr.Socksaddr, network endpoint.Network) error {
+		return portal.Dispatch(ctx, s, dst, network, nil)
+	}
+}
+
+// fileOrStr 从 tls 子映射取 key 的内容:支持 `key`(内联 PEM)或 `key-file`(读文件)。
+func fileOrStr(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	if s, ok := m[key].(string); ok && s != "" {
+		return s
+	}
+	if p, ok := m[key+"-file"].(string); ok && p != "" {
+		if b, err := os.ReadFile(p); err == nil {
+			return string(b)
+		}
+	}
+	return ""
+}
+
+// toLayerSpecs 把 YAML 层列表转成 service.LayerSpec(type→注册表名,其余键→spec.Node)。
+func toLayerSpecs(layers []map[string]any) ([]service.LayerSpec, error) {
+	if len(layers) == 0 {
+		return nil, fmt.Errorf("layers 为空")
+	}
+	specs := make([]service.LayerSpec, 0, len(layers))
+	for _, l := range layers {
+		typ, _ := l["type"].(string)
+		if typ == "" {
+			return nil, fmt.Errorf("某层缺 type")
+		}
+		node, err := mapToNode(l, "type")
+		if err != nil {
+			return nil, fmt.Errorf("层 %q:%w", typ, err)
+		}
+		specs = append(specs, service.LayerSpec{Name: typ, Node: node})
+	}
+	return specs, nil
+}
+
+// mapToNode 把配置 map 转成 spec 映射节点(排除 skip 键;`xxx-file` 键读文件注入到 `xxx`)。
+func mapToNode(m map[string]any, skip string) (*spec.Node, error) {
+	out := make(map[string]*spec.Node, len(m))
+	for k, v := range m {
+		if k == skip {
+			continue
+		}
+		if name, ok := strings.CutSuffix(k, "-file"); ok {
+			path, _ := v.(string)
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return nil, fmt.Errorf("读取 %s(键 %s)失败:%w", path, k, err)
+			}
+			out[name] = spec.Scalar(string(b))
+			continue
+		}
+		out[k] = valueToNode(v)
+	}
+	return &spec.Node{Kind: spec.KindMap, Map: out}, nil
+}
+
+// valueToNode 把任意 YAML 值递归转成 spec.Node(标量统一转字符串)。
+func valueToNode(v any) *spec.Node {
+	switch t := v.(type) {
+	case nil:
+		return &spec.Node{Kind: spec.KindNull}
+	case map[string]any:
+		m := make(map[string]*spec.Node, len(t))
+		for k, val := range t {
+			m[k] = valueToNode(val)
+		}
+		return &spec.Node{Kind: spec.KindMap, Map: m}
+	case []any:
+		seq := make([]*spec.Node, len(t))
+		for i, val := range t {
+			seq[i] = valueToNode(val)
+		}
+		return &spec.Node{Kind: spec.KindSeq, Seq: seq}
+	case string:
+		return spec.Scalar(t)
+	case bool:
+		return spec.Scalar(strconv.FormatBool(t))
+	case int:
+		return spec.Scalar(strconv.Itoa(t))
+	case int64:
+		return spec.Scalar(strconv.FormatInt(t, 10))
+	case float64:
+		return spec.Scalar(strconv.FormatFloat(t, 'g', -1, 64))
+	default:
+		return spec.Scalar(fmt.Sprint(t))
+	}
+}
+
+// userSecret 从用户项取口令(uuid/password/psk 任一)。
+func userSecret(u map[string]any) string {
+	for _, k := range []string{"uuid", "password", "psk"} {
+		if s, ok := u[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
