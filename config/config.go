@@ -39,6 +39,7 @@ import (
 	"github.com/LOVECHEN/ntr/outbound/connectip"
 	"github.com/LOVECHEN/ntr/outbound/direct"
 	dnsout "github.com/LOVECHEN/ntr/outbound/dns"
+	"github.com/LOVECHEN/ntr/outbound/group"
 	"github.com/LOVECHEN/ntr/outbound/hysteria1"
 	"github.com/LOVECHEN/ntr/outbound/hysteria2"
 	"github.com/LOVECHEN/ntr/outbound/masque"
@@ -200,6 +201,14 @@ type Outbound struct {
 	// mieru(type=mieru;会话式,用户名+口令走 user/secret)
 	Transport    string `yaml:"transport"`    // mieru 传输协议 TCP/UDP(默认 TCP)
 	Multiplexing string `yaml:"multiplexing"` // mieru 多路复用等级(可选:MULTIPLEXING_OFF/LOW/MIDDLE/HIGH)
+
+	// 策略组(type=select/urltest/fallback/load-balance):在多个子出站间选路。
+	Outbounds []string `yaml:"outbounds"` // 组成员出站名(可含其它组,禁成环)
+	Default   string   `yaml:"default"`   // select/初始选中成员名(空=第一个)
+	URL       string   `yaml:"url"`       // urltest/fallback 探测 URL(默认 http://www.gstatic.com/generate_204)
+	Interval  string   `yaml:"interval"`  // 探测周期(如 5m,默认 5m)
+	Tolerance int      `yaml:"tolerance"` // urltest 抖动容差 ms
+	LB        string   `yaml:"lb"`        // load-balance 模式:round-robin(默认)| consistent-hashing
 }
 
 // MuxSpec 是 mux 出站配置(对齐 sing-box multiplex 语义)。
@@ -287,6 +296,89 @@ func parseHosts(in map[string][]string) (map[string][]netip.Addr, error) {
 	return out, nil
 }
 
+// buildGroups 第二趟建策略组:迭代地把成员名从 outs 解析成真出站(组成员可前向引用/是别的组);
+// 一整趟无进展 = 成环或成员悬空 → 大声报(守 NTR「非法组合装配期判死」纪律,不静默退化)。
+// 返回需要后台探测的组(urltest/fallback/load-balance),供调用方挂成 health-loop Instance。
+func buildGroups(pending []Outbound, outs map[string]endpoint.Outbound) ([]*group.Group, error) {
+	if len(pending) == 0 {
+		return nil, nil
+	}
+	isGroup := make(map[string]bool, len(pending))
+	for _, o := range pending {
+		isGroup[o.Name] = true
+	}
+	var loops []*group.Group
+	remaining := pending
+	for len(remaining) > 0 {
+		var next []Outbound
+		progress := false
+		for _, o := range remaining {
+			ready := true
+			var members []group.Member
+			for _, mn := range o.Outbounds {
+				out, ok := outs[mn]
+				if !ok {
+					if isGroup[mn] { // 是组但还没建 → 等下一轮
+						ready = false
+						break
+					}
+					return nil, fmt.Errorf("config: 策略组 %q 成员 %q 未定义出站", o.Name, mn)
+				}
+				members = append(members, group.Member{Name: mn, Out: out})
+			}
+			if !ready {
+				next = append(next, o)
+				continue
+			}
+			g, err := buildOneGroup(o, members)
+			if err != nil {
+				return nil, err
+			}
+			outs[o.Name] = g
+			if g.NeedsHealth() {
+				loops = append(loops, g)
+			}
+			progress = true
+		}
+		if !progress {
+			var stuck []string
+			for _, o := range next {
+				stuck = append(stuck, o.Name)
+			}
+			return nil, fmt.Errorf("config: 策略组成环或成员悬空(无法拓扑建成):%v", stuck)
+		}
+		remaining = next
+	}
+	return loops, nil
+}
+
+func buildOneGroup(o Outbound, members []group.Member) (*group.Group, error) {
+	var strat group.Strategy
+	switch o.Type {
+	case "select":
+		strat = group.Select
+	case "urltest":
+		strat = group.URLTest
+	case "fallback":
+		strat = group.Fallback
+	case "load-balance":
+		strat = group.LoadBalance
+	}
+	interval := 5 * time.Minute
+	if o.Interval != "" {
+		if d, err := time.ParseDuration(o.Interval); err == nil {
+			interval = d
+		} else {
+			return nil, fmt.Errorf("config: 策略组 %q interval %q:%w", o.Name, o.Interval, err)
+		}
+	}
+	return group.New(group.Options{
+		Name: o.Name, Members: members, Strategy: strat, Default: o.Default,
+		TestURL: o.URL, Interval: interval, Tolerance: o.Tolerance,
+		LBHash: o.LB == "consistent-hashing" || o.LB == "hash",
+	})
+}
+
 // buildRouter 把 routing: 块编译成 rule.Engine:转换规则、校验 default 与每条 to 均为已定义出站
 // (编译期挡住悬空目标,守「绝不静默误路由」)。规则维度校验(须恰好一个)在 rule.Compile 内。
 func buildRouter(spec *RoutingSpec, outs map[string]endpoint.Outbound) (*rule.Engine, error) {
@@ -325,11 +417,14 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 	if err != nil {
 		return nil, fmt.Errorf("config: limits:%w", err)
 	}
+	var pendingGroups []Outbound // 策略组延迟到第二趟建(成员可前向引用/是别的组)
 	for _, o := range f.Outbounds {
 		if o.Name == "" {
 			return nil, fmt.Errorf("config: 出站缺 name")
 		}
 		switch o.Type {
+		case "select", "urltest", "fallback", "load-balance":
+			pendingGroups = append(pendingGroups, o) // 见出站 loop 后的第二趟
 		case "direct", "":
 			outs[o.Name] = direct.Outbound{}
 		case "dns":
@@ -475,6 +570,12 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		}
 	}
 
+	// 第二趟:建策略组(成员此时已在 outs;组间前向引用靠迭代,成环/悬空大声报)。
+	groupLoops, err := buildGroups(pendingGroups, outs)
+	if err != nil {
+		return nil, err
+	}
+
 	// DNS 解析子系统:建 resolver(nameserver 的 detour 从 outs 解析,防泄漏),再填 type=dns 出站。
 	if len(dnsOutboundNames) > 0 || (f.DNS != nil && f.DNS.Enabled) {
 		resolver, err := buildResolver(f.DNS, outs)
@@ -498,6 +599,11 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 	}
 
 	var insts []Instance
+	// 策略组的后台健康探测循环(urltest/fallback/load-balance)挂成无监听 Instance(同 bridge/metrics)。
+	for _, g := range groupLoops {
+		g := g
+		insts = append(insts, Instance{Listen: "group:" + g.Name(), Run: g.HealthLoop})
+	}
 	for i, in := range f.Inbounds {
 		if in.Listen == "" && in.Type != "tun" { // tun 无监听端口,靠接口名
 			return nil, fmt.Errorf("config: 入站 #%d 缺 listen", i)
