@@ -41,6 +41,99 @@ udpB(){ # $1=combo $2=peerver $3=ntr_srv_cfg $4=peer_cli_tpl $5=run_peer $6=peer
   docker rm -f ixt-echo ixt-srv ixt-cli >/dev/null 2>&1
 }
 
+# ===== 自包含:生成 python 助手 + NTR/peer 模板 =====
+# 隔离 CI job 无前序脚本产物,故不再复用 ix-vmess-trojan.sh 的 n-*/p-*-srv,全部本脚本自生成。
+cat > udpecho.py <<'PY'
+import socket
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('0.0.0.0',9999))
+while True:
+    d,a=s.recvfrom(4096); s.sendto(d,a)
+PY
+cat > ixt-socksudp.py <<'PY'
+import socket,struct,sys
+proxy=('ixt-cli',1080); target=('ixt-echo',9999); msg=b'PINGUDP-trojan-42'
+tcp=socket.create_connection(proxy,timeout=6)
+tcp.sendall(b'\x05\x01\x00')
+if tcp.recv(2)!=b'\x05\x00': print('greet fail'); sys.exit(2)
+tcp.sendall(b'\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00')
+r=tcp.recv(10)
+if r[1]!=0: print('associate fail',r); sys.exit(3)
+bnd_ip=socket.inet_ntoa(r[4:8]); bnd_port=struct.unpack('>H',r[8:10])[0]
+if bnd_ip in ('0.0.0.0','127.0.0.1'): bnd_ip=proxy[0]
+udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); udp.settimeout(6)
+th=target[0].encode()
+pkt=b'\x00\x00\x00\x03'+bytes([len(th)])+th+struct.pack('>H',target[1])+msg
+udp.sendto(pkt,(bnd_ip,bnd_port))
+data,_=udp.recvfrom(4096)
+atyp=data[3]
+off=10 if atyp==1 else (22 if atyp==4 else 4+1+data[4]+2)
+payload=data[off:]
+print('GOT',payload)
+sys.exit(0 if payload==msg else 1)
+PY
+# ---- NTR 客户端(A方向,socks 入站默认支持 UDP-ASSOCIATE)----
+cat > n-vm-cli.yaml.tpl <<EOF
+inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+outbounds:
+  - {name: up, type: proxy, server: "@SRV@:10000", layers: [{type: tls, sni: example.com, insecure: true}, {type: vmess, uuid: "$UUID"}]}
+EOF
+cat > n-tj-cli.yaml.tpl <<EOF
+inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+outbounds:
+  - {name: up, type: proxy, server: "@SRV@:10000", secret: "$PW", layers: [{type: tls, sni: example.com, insecure: true}, {type: trojan}]}
+EOF
+# ---- NTR 服务端(B方向)----
+cat > n-vm-srv.yaml <<EOF
+inbounds:
+  - listen: 0.0.0.0:10000
+    layers: [{type: tls, cert-file: /cert.pem, key-file: /key.pem}, {type: vmess, uuid: "$UUID"}]
+    outbound: direct
+outbounds: [{name: direct, type: direct}]
+EOF
+cat > n-tj-srv.yaml <<EOF
+inbounds:
+  - listen: 0.0.0.0:10000
+    layers: [{type: tls, cert-file: /cert.pem, key-file: /key.pem}, {type: trojan}]
+    users: [{password: "$PW"}]
+    outbound: direct
+outbounds: [{name: direct, type: direct}]
+EOF
+# ---- peer 服务端(xray/sing-box/mihomo vmess/trojan;freedom/direct 出站带 UDP)----
+cat > p-xvm-srv.json <<EOF
+{"log":{"loglevel":"warning"},"inbounds":[{"listen":"0.0.0.0","port":10000,"protocol":"vmess","settings":{"clients":[{"id":"$UUID","alterId":0}]},"streamSettings":{"security":"tls","tlsSettings":{"certificates":[{"certificateFile":"/cert.pem","keyFile":"/key.pem"}]}}}],"outbounds":[{"protocol":"freedom"}]}
+EOF
+cat > p-xtj-srv.json <<EOF
+{"log":{"loglevel":"warning"},"inbounds":[{"listen":"0.0.0.0","port":10000,"protocol":"trojan","settings":{"clients":[{"password":"$PW"}]},"streamSettings":{"security":"tls","tlsSettings":{"certificates":[{"certificateFile":"/cert.pem","keyFile":"/key.pem"}]}}}],"outbounds":[{"protocol":"freedom"}]}
+EOF
+cat > p-svm-srv.json <<EOF
+{"log":{"level":"warn"},"inbounds":[{"type":"vmess","listen":"::","listen_port":10000,"users":[{"uuid":"$UUID"}],"tls":{"enabled":true,"certificate_path":"/cert.pem","key_path":"/key.pem"}}],"outbounds":[{"type":"direct"}]}
+EOF
+cat > p-stj-srv.json <<EOF
+{"log":{"level":"warn"},"inbounds":[{"type":"trojan","listen":"::","listen_port":10000,"users":[{"password":"$PW"}],"tls":{"enabled":true,"certificate_path":"/cert.pem","key_path":"/key.pem"}}],"outbounds":[{"type":"direct"}]}
+EOF
+cat > p-mvm-srv.yaml <<EOF
+log-level: warning
+listeners:
+  - name: in
+    type: vmess
+    listen: 0.0.0.0
+    port: 10000
+    users: [{username: u, uuid: $UUID, alterId: 0}]
+    certificate: /root/.config/mihomo/cert.pem
+    private-key: /root/.config/mihomo/key.pem
+EOF
+cat > p-mtj-srv.yaml <<EOF
+log-level: warning
+listeners:
+  - name: in
+    type: trojan
+    listen: 0.0.0.0
+    port: 10000
+    users: [{username: u, password: $PW}]
+    certificate: /root/.config/mihomo/cert.pem
+    private-key: /root/.config/mihomo/key.pem
+EOF
+
 # ===== 对端 UDP 配置 =====
 # xray vmess/trojan server 已支持 UDP(freedom 出站);socks 入站 udp:true
 cat > u-xvm-cli.json.tpl <<EOF
