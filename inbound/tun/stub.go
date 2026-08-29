@@ -6,8 +6,10 @@ package tun
 import (
 	"context"
 	"errors"
+	"net/netip"
 
 	"github.com/LOVECHEN/ntr/core/endpoint"
+	"github.com/LOVECHEN/ntr/core/route"
 )
 
 // ErrNotBuilt 表示本二进制未编入 TUN 支持。
@@ -15,9 +17,11 @@ var ErrNotBuilt = errors.New("tun: 本二进制未编入 TUN 支持(需 -tags wi
 
 // Options 与真实现同名同字段。
 type Options struct {
-	Name    string
-	Address []string
-	MTU     int
+	Name      string
+	Address   []string
+	MTU       int
+	Resolver  route.Resolver
+	HijackDNS []netip.AddrPort
 }
 
 // Inbound 占位。

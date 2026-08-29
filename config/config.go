@@ -147,6 +147,7 @@ type Inbound struct {
 	Transport     string           `yaml:"transport"`      // type=mieru:mieru 传输协议 TCP/UDP(默认 TCP)
 	Address       []string         `yaml:"address"`        // type=tun:TUN 网卡地址 CIDR(至少一个)
 	IfName        string           `yaml:"if-name"`        // type=tun:接口名(空=平台默认)
+	DNSHijack     []string         `yaml:"dns-hijack"`     // type=tun:劫持的 DNS 目标(如 ["any:53"] 或 "10.0.0.1:53"),就地由内置 resolver 应答
 	Target        string           `yaml:"target"`         // type=tunnel:固定目标 host:port
 	Network       []string         `yaml:"network"`        // type=tunnel/tproxy:tcp/udp(空=两者)
 	Limits        *LimitsSpec      `yaml:"limits"`         // 每口限制(承设计 §6.2 层2:单口隔离)
@@ -292,6 +293,33 @@ func parseHosts(in map[string][]string) (map[string][]netip.Addr, error) {
 			}
 			out[name] = append(out[name], ip)
 		}
+	}
+	return out, nil
+}
+
+// parseHijack 把 tun 的 dns-hijack 目标(["any:53","10.0.0.1:53"])解析成 []netip.AddrPort。
+// "any"/"*" → 0.0.0.0(unspecified,匹配任意该端口目标);缺端口默认 53。
+func parseHijack(in []string) ([]netip.AddrPort, error) {
+	var out []netip.AddrPort
+	for _, s := range in {
+		host, port := s, "53"
+		if h, p, err := net.SplitHostPort(s); err == nil {
+			host, port = h, p
+		}
+		pn, err := strconv.Atoi(port)
+		if err != nil || pn <= 0 || pn > 65535 {
+			return nil, fmt.Errorf("dns-hijack 端口非法 %q", s)
+		}
+		var ip netip.Addr
+		if host == "any" || host == "*" || host == "" {
+			ip = netip.IPv4Unspecified()
+		} else {
+			ip, err = netip.ParseAddr(host)
+			if err != nil {
+				return nil, fmt.Errorf("dns-hijack 地址非法 %q:%w", s, err)
+			}
+		}
+		out = append(out, netip.AddrPortFrom(ip, uint16(pn)))
 	}
 	return out, nil
 }
@@ -577,11 +605,14 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 	}
 
 	// DNS 解析子系统:建 resolver(nameserver 的 detour 从 outs 解析,防泄漏),再填 type=dns 出站。
+	// dnsResolver 提升到此作用域,供 type=tun 入站的 DNS-hijack 复用(:53 就地应答、不外泄)。
+	var dnsResolver route.Resolver
 	if len(dnsOutboundNames) > 0 || (f.DNS != nil && f.DNS.Enabled) {
 		resolver, err := buildResolver(f.DNS, outs)
 		if err != nil {
 			return nil, err
 		}
+		dnsResolver = resolver
 		for _, name := range dnsOutboundNames {
 			outs[name] = dnsout.New(resolver)
 		}
@@ -722,7 +753,14 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
 			continue
 		case "tun":
-			inb, err := tun.NewInbound(tun.Options{Name: in.IfName, Address: in.Address, MTU: in.MTU}, out)
+			hijack, herr := parseHijack(in.DNSHijack)
+			if herr != nil {
+				return nil, fmt.Errorf("config: 入站 tun dns-hijack:%w", herr)
+			}
+			if len(hijack) > 0 && dnsResolver == nil {
+				return nil, fmt.Errorf("config: 入站 tun 用了 dns-hijack,但未启用 dns:(需 dns.enabled=true 提供 resolver)")
+			}
+			inb, err := tun.NewInbound(tun.Options{Name: in.IfName, Address: in.Address, MTU: in.MTU, Resolver: dnsResolver, HijackDNS: hijack}, out)
 			if err != nil {
 				return nil, fmt.Errorf("config: 入站 tun:%w", err)
 			}

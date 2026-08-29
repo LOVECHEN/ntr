@@ -19,21 +19,26 @@ import (
 	"github.com/LOVECHEN/ntr/core/endpoint"
 	"github.com/LOVECHEN/ntr/core/link"
 	"github.com/LOVECHEN/ntr/core/relay"
+	"github.com/LOVECHEN/ntr/core/route"
 	"github.com/LOVECHEN/ntr/netstack"
 )
 
 // Options 是 TUN 入站配置(与 stub.go 同名同字段,两态可链接)。
 type Options struct {
-	Name    string   // 接口名;空 = 平台默认(linux ntr-tun0)
-	Address []string // TUN 网卡地址 CIDR(如 10.9.9.1/24);至少一个
-	MTU     int      // 默认 1500
+	Name      string           // 接口名;空 = 平台默认(linux ntr-tun0)
+	Address   []string         // TUN 网卡地址 CIDR(如 10.9.9.1/24);至少一个
+	MTU       int              // 默认 1500
+	Resolver  route.Resolver   // 非 nil 且 HijackDNS 命中 → DNS 就地应答(不走出站),防 DNS 泄漏
+	HijackDNS []netip.AddrPort // 劫持的 DNS 目标;含 unspecified:53 = 任意 :53(空=不劫持)
 }
 
 // Inbound 是 TUN 入站,自身即 netstack.Handler。
 type Inbound struct {
-	opts Options
-	out  endpoint.Outbound
-	st   *netstack.Stack
+	opts     Options
+	out      endpoint.Outbound
+	st       *netstack.Stack
+	resolver route.Resolver
+	hijack   []netip.AddrPort
 }
 
 var _ netstack.Handler = (*Inbound)(nil)
@@ -46,7 +51,7 @@ func NewInbound(o Options, out endpoint.Outbound) (*Inbound, error) {
 	if out == nil {
 		return nil, errors.New("tun: 需绑定一个出站")
 	}
-	return &Inbound{opts: o, out: out}, nil
+	return &Inbound{opts: o, out: out, resolver: o.Resolver, hijack: o.HijackDNS}, nil
 }
 
 // Run 打开 TUN 设备、建栈、启动,阻塞至 ctx 取消。listen 仅作日志标签(TUN 无监听端口)。
@@ -88,6 +93,10 @@ func (h *Inbound) Run(ctx context.Context, _ string) error {
 
 // HandleTCP:合成的 TCP 流 → 拨出站 + 双向中继。
 func (h *Inbound) HandleTCP(conn net.Conn, dst netip.AddrPort) {
+	if h.shouldHijack(dst) { // DNS-hijack::53 就地由 resolver 应答(TCP DNS,2 字节长度前缀)
+		h.serveDNSTCP(conn)
+		return
+	}
 	up, err := h.out.DialStream(context.Background(), toSocksaddr(dst))
 	if err != nil {
 		_ = conn.Close()
@@ -98,6 +107,10 @@ func (h *Inbound) HandleTCP(conn net.Conn, dst netip.AddrPort) {
 
 // HandleUDP:合成的 UDP 连接(单目标)→ 拨出站 UDP + 双向中继。
 func (h *Inbound) HandleUDP(conn net.Conn, dst netip.AddrPort) {
+	if h.shouldHijack(dst) { // DNS-hijack::53 就地由 resolver 应答(UDP 每包一次)
+		h.serveDNSUDP(conn)
+		return
+	}
 	d := toSocksaddr(dst)
 	pc, err := h.out.DialPacket(context.Background(), d)
 	if err != nil {

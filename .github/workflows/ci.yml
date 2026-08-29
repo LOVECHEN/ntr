@@ -28,7 +28,7 @@ jobs:
       - run: go vet ./... || true
       - run: go test -race -count=1 ./...
       - name: build linux binary (+http2legacy)
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags http2legacy -o ntr-linux ./cmd/ntr
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags "http2legacy with_tun" -o ntr-linux ./cmd/ntr
       - uses: actions/upload-artifact@v4
         with: { name: ntr-linux, path: ntr-linux, retention-days: 1 }
 
