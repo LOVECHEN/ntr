@@ -164,11 +164,34 @@ type Provider struct {
 	Detour   endpoint.Outbound
 }
 
-// LoadDomain 加载并解析成 DomainSet(behavior=domain/classical)。
+// 格式按魔数自动识别:zstd(28 b5 2f fd)=mihomo .mrs;"SRS"=sing-box .srs;否则文本。
+const (
+	fmtText = iota
+	fmtMRS
+	fmtSRS
+)
+
+func detectFormat(b []byte) int {
+	if len(b) >= 4 && b[0] == 0x28 && b[1] == 0xb5 && b[2] == 0x2f && b[3] == 0xfd {
+		return fmtMRS
+	}
+	if len(b) >= 3 && b[0] == 'S' && b[1] == 'R' && b[2] == 'S' {
+		return fmtSRS
+	}
+	return fmtText
+}
+
+// LoadDomain 加载并解析成 DomainSet(behavior=domain/classical)。格式自动识别:文本 / .mrs / .srs。
 func (p *Provider) LoadDomain(ctx context.Context) (rule.DomainSet, error) {
 	data, err := p.load(ctx)
 	if err != nil {
 		return nil, err
+	}
+	switch detectFormat(data) {
+	case fmtMRS:
+		return ParseMRSDomain(data)
+	case fmtSRS:
+		return ParseSRSDomain(data)
 	}
 	if p.Behavior == "classical" {
 		return ParseClassical(data), nil
@@ -176,11 +199,17 @@ func (p *Provider) LoadDomain(ctx context.Context) (rule.DomainSet, error) {
 	return ParseDomainList(data), nil
 }
 
-// LoadIP 加载并解析成 IPSet(behavior=ipcidr)。
+// LoadIP 加载并解析成 IPSet(behavior=ipcidr)。格式自动识别:文本 / .mrs / .srs。
 func (p *Provider) LoadIP(ctx context.Context) (rule.IPSet, error) {
 	data, err := p.load(ctx)
 	if err != nil {
 		return nil, err
+	}
+	switch detectFormat(data) {
+	case fmtMRS:
+		return ParseMRSIP(data)
+	case fmtSRS:
+		return ParseSRSIP(data)
 	}
 	return ParseIPList(data), nil
 }

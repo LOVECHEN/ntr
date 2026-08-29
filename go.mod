@@ -6,6 +6,7 @@ require (
 	github.com/anytls/sing-anytls v0.0.13
 	github.com/enfein/mieru/v3 v3.36.0
 	github.com/golang/snappy v1.0.0
+	github.com/klauspost/compress v1.17.9
 	github.com/metacubex/blake3 v0.1.0
 	github.com/metacubex/chacha v0.1.5
 	github.com/metacubex/http v0.1.7
@@ -51,7 +52,6 @@ require (
 	github.com/gofrs/uuid/v5 v5.3.2 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/juju/ratelimit v1.0.2 // indirect
-	github.com/klauspost/compress v1.17.9 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.6 // indirect
 	github.com/klauspost/reedsolomon v1.12.3 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
