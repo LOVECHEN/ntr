@@ -84,7 +84,7 @@ type LimitsSpec struct {
 type RoutingSpec struct {
 	Default       string             `yaml:"default"`        // 未命中兜底出站名(须在 outbounds 定义,或内置 direct/block)
 	Rules         []RuleSpec         `yaml:"rules"`          // 有序,首个命中生效
-	GeoIPPath     string             `yaml:"geoip-path"`     // geoip mmdb 路径(MaxMind GeoLite2-Country 格式;有 geoip 规则时必给)
+	GeoIPPath     string             `yaml:"geoip-path"`     // geoip 库路径:.dat=V2Ray/Xray geoip.dat,其余=MaxMind mmdb(有 geoip 规则时必给)
 	GeoSitePath   string             `yaml:"geosite-path"`   // geosite.dat 路径(V2Ray/mihomo 格式;有 geosite 规则时必给)
 	RuleProviders []RuleProviderSpec `yaml:"rule-providers"` // 命名规则集(本地文件/远程 URL 经 detour 拉;Surge/Clash 文本)
 }
@@ -448,18 +448,27 @@ func buildRouter(ctx context.Context, spec *RoutingSpec, outs map[string]endpoin
 		}
 		providers[ps.Name] = &ruleset.Provider{Name: ps.Name, Behavior: ps.Behavior, Path: ps.Path, URL: ps.URL, Detour: det}
 	}
-	// 有 geoip 规则则打开 mmdb(一次,共享给所有 geoip 规则)。
-	var geoDB *geo.DB
+	// 有 geoip 规则则打开 IP 库(一次,共享给所有 geoip 规则)。geoip-path 兼容两大格式:
+	// .dat 后缀 → V2Ray/Xray geoip.dat(protobuf);其余 → MaxMind mmdb。二者都产出 rule.IPSet,引擎无感。
+	var geoSetFor func([]string) (rule.IPSet, error)
 	for _, rs := range spec.Rules {
 		if len(rs.GeoIP) > 0 {
 			if spec.GeoIPPath == "" {
-				return nil, fmt.Errorf("config: 用了 geoip 规则但缺 routing.geoip-path(mmdb 路径)")
+				return nil, fmt.Errorf("config: 用了 geoip 规则但缺 routing.geoip-path(mmdb 或 V2Ray geoip.dat 路径)")
 			}
-			db, err := geo.OpenGeoIP(spec.GeoIPPath)
-			if err != nil {
-				return nil, err
+			if strings.HasSuffix(strings.ToLower(spec.GeoIPPath), ".dat") {
+				db, err := geo.OpenGeoIPDat(spec.GeoIPPath)
+				if err != nil {
+					return nil, err
+				}
+				geoSetFor = db.CountrySet
+			} else {
+				db, err := geo.OpenGeoIP(spec.GeoIPPath)
+				if err != nil {
+					return nil, err
+				}
+				geoSetFor = func(codes []string) (rule.IPSet, error) { return db.CountrySet(codes), nil }
 			}
-			geoDB = db
 			break
 		}
 	}
@@ -485,7 +494,11 @@ func buildRouter(ctx context.Context, spec *RoutingSpec, outs map[string]endpoin
 		}
 		var geoSets []rule.IPSet
 		if len(rs.GeoIP) > 0 {
-			geoSets = append(geoSets, geoDB.CountrySet(rs.GeoIP))
+			set, err := geoSetFor(rs.GeoIP)
+			if err != nil {
+				return nil, fmt.Errorf("config: routing.rules[%d].geoip:%w", i, err)
+			}
+			geoSets = append(geoSets, set)
 		}
 		var siteSets []rule.DomainSet
 		for _, code := range rs.GeoSite {
