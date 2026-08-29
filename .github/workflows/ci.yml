@@ -59,10 +59,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: ntr-linux, path: /tmp/ntr-interop }
-      # 预热 curl 镜像:否则冷 runner 上首个 `docker run curlimages/curl` 会把 "Unable to find image…Pulling"
-      # 打进被 2>&1 捕获的 http_code,让脚本 ① 探测误判 FAIL(②③ 因镜像已缓存而过)。
-      - name: warm curl image
-        run: docker pull curlimages/curl:latest >/dev/null 2>&1 || true
+      # 预热本脚本要用的所有 docker 镜像:冷 runner 上首个 `docker run <img>` 会同步拉镜像(数秒~十几秒),
+      # 期间靶机(traefik/whoami)/探针(curl)未就绪 → 探测全 FAIL 级联;且 "Unable to find image…Pulling"
+      # 噪声会被 2>&1 卷进 http_code 捕获。故运行前把镜像全拉好(动态从脚本抽 + 恒含公共三件),再跑。
+      - name: warm docker images
+        run: |
+          script="test/interop/${{ matrix.script }}.sh"
+          imgs=$(grep -rhoE '(ghcr\.io/[a-z0-9./_-]+:[a-z0-9._-]+|[a-z0-9][a-z0-9._/-]+/[a-z0-9._-]+:[a-z0-9._-]+)' "$script" 2>/dev/null \
+                 | grep -vE '\.(pem|yaml|json|key|crt|conf|txt|dat|mrs|srs)(:|$)' | sort -u)
+          for img in alpine:latest curlimages/curl:latest traefik/whoami:latest $imgs; do
+            echo "pull $img"; docker pull "$img" >/dev/null 2>&1 || true
+          done
       - name: run ${{ matrix.script }}
         run: |
           chmod +x /tmp/ntr-interop/ntr-linux
