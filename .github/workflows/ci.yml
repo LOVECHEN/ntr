@@ -94,8 +94,8 @@ jobs:
           cp /tmp/ntr-interop/ntr-linux /tmp/ntr-interop/ntr
           log=/tmp/ntr-interop/${{ matrix.script }}.log
           NTR_BIN=/tmp/ntr-interop/ntr timeout 1200 bash "test/interop/${{ matrix.script }}.sh" 2>&1 | tee "$log" || true
-          p=$(grep -cE '(^|\] +|==> *|\| )PASS|✅|\[OK\]|✓通|通\]' "$log" || true)
-          f=$(grep -cE '(^|\] +|==> *|\| )FAIL|❌|✗ ' "$log" || true)
+          p=$(grep -cE '(^|\] +|==> *|\| )PASS|✅|\[OK\]|✓通|通\]|→ *PASS|=PASS| PASS( |$)' "$log" || true)
+          f=$(grep -cE '(^|\] +|==> *|\| )FAIL|❌|✗ |→ *FAIL|=FAIL| FAIL( |$)' "$log" || true)
           if [ "$f" -gt 0 ]; then st=FAIL; elif [ "$p" -gt 0 ]; then st=PASS; else st=UNKNOWN; fi
           mkdir -p out
           printf '%s\t%s\t%s\t%s\n' "${{ matrix.script }}" "$st" "$p" "$f" > "out/${{ matrix.script }}.tsv"
