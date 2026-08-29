@@ -7,7 +7,7 @@ NET=ixutls; PFX=ixutls-; D=/tmp/ntr-interop; NTR=${NTR_BIN:-$D/ntr}; UUID="11111
 CURL=curlimages/curl:latest
 cleanup(){ docker ps -aq --filter "name=$PFX"|xargs -r docker rm -f >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 wait_log(){ local i; for i in $(seq 1 $(( ${3:-20} * 2 ))); do docker logs "$1" 2>&1|grep -q "$2" && return 0; sleep 0.5; done; return 1; }
-[ -f "$D/ucert.pem" ] || docker run --rm -v $D:/w -w /w alpine sh -c 'apk add openssl>/dev/null 2>&1; openssl req -x509 -newkey rsa:2048 -keyout ukey.pem -out ucert.pem -days 3650 -nodes -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" >/dev/null 2>&1'
+[ -f "$D/ucert.pem" ] || docker run --rm -v $D:/w -w /w alpine sh -c 'apk add openssl>/dev/null 2>&1; openssl req -x509 -newkey rsa:2048 -keyout ukey.pem -out ucert.pem -days 3650 -nodes -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" >/dev/null 2>&1; chmod 644 ucert.pem ukey.pem'
 cleanup; docker network create $NET >/dev/null 2>&1
 docker run -d --name ${PFX}target --network $NET traefik/whoami --name UTLS-TARGET >/dev/null 2>&1
 sleep 1

@@ -81,10 +81,12 @@ jobs:
       # 共享自签证书:多数 TLS 脚本假定 $D/cert.pem·key.pem·ca.pem 已由序列跑里的前序脚本生成;CI 每脚本是
       # 独立 job、无此前序,缺证书时 docker 把 `-v $D/cert.pem:...` 的缺失源建成【目录】→ TLS 全崩(ix-transports
       # /vmess-trojan/quic-protos/session-protos/vt-udp 0/N)。故这里先备好标准自签证书(CN/SAN=example.com,ca=自身)。
+      # chmod 644:openssl 默认给 key.pem 0600(仅 root 可读),而 xray-core:latest 以非 root 用户跑,
+      # 读不了 → xray 服务端「open /key.pem: permission denied」起不来 → NTR 客户端方向空回(方向A假失败)。
       - name: prepare shared self-signed cert
         run: |
           docker run --rm -v /tmp/ntr-interop:/w -w /w alpine sh -c \
-            'apk add -q openssl >/dev/null 2>&1; openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 -nodes -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" >/dev/null 2>&1; cp cert.pem ca.pem'
+            'apk add -q openssl >/dev/null 2>&1; openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 -nodes -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" >/dev/null 2>&1; cp cert.pem ca.pem; chmod 644 cert.pem key.pem ca.pem'
       - name: run ${{ matrix.script }}
         run: |
           mkdir -p /tmp/ntr-interop

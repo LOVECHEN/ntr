@@ -104,8 +104,7 @@ echo "########## 组4:传输层 ws/grpc/httpupgrade × vless × TLS ##########"
 run_xray_case(){ # $1=transport name, $2=ntr_srv_layer, $3=ntr_cli_layer, $4=xray_stream_json_srv, $5=xray_stream_json_cli
   # A: NTR client -> xray server
   del; run_xray_srv "$4"; ntr_cli ixr-peer "$3"; run_ntr_cli; sleep 5
-  RA=$(curlp -x socks5h://ixr-ntrcli:1080 http://ixr-target/); hit "$RA" "[$1] xray-core NTR->xray (A)" v
-  echo "$RA" | grep -q Hostname || { echo "    DBG[$1] xray-srv:"; docker logs ixr-peer 2>&1|tail -4|sed 's/^/      /'; echo "    DBG[$1] ntr-cli:"; docker logs ixr-ntrcli 2>&1|tail -4|sed 's/^/      /'; }
+  hit "$(curlp -x socks5h://ixr-ntrcli:1080 http://ixr-target/)" "[$1] xray-core NTR->xray (A)" v
   # B: xray client -> NTR server
   del; ntr_srv "$2"; run_ntr_srv; sleep 2; run_xray_cli "$5" ixr-ntrsrv; sleep 4
   hit "$(curlp -x socks5h://ixr-peer:1080 http://ixr-target/)" "[$1] xray-core xray->NTR (B)" v

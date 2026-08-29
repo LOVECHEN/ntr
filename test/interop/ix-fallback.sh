@@ -26,7 +26,7 @@ probe(){ local want="$1"; shift; local r="" i; for i in 1 2 3 4 5 6; do
     echo "$r"|grep -qE "$want" && { echo "$r"; return; }; sleep 1
   done; echo "$r"; }
 # 自签证书(带 SAN,Xray 客户端按 SAN 校验;NTR tls 层自签)
-[ -f "$D/fbcert.pem" ] || docker run --rm -v $D:/w -w /w alpine sh -c 'apk add openssl>/dev/null 2>&1; openssl req -x509 -newkey rsa:2048 -keyout fbkey.pem -out fbcert.pem -days 3650 -nodes -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" >/dev/null 2>&1'
+[ -f "$D/fbcert.pem" ] || docker run --rm -v $D:/w -w /w alpine sh -c 'apk add openssl>/dev/null 2>&1; openssl req -x509 -newkey rsa:2048 -keyout fbkey.pem -out fbcert.pem -days 3650 -nodes -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" >/dev/null 2>&1; chmod 644 fbcert.pem fbkey.pem'
 cleanup; docker network create $NET >/dev/null 2>&1
 docker run -d --name ${PFX}target --network $NET traefik/whoami --name REAL-TARGET >/dev/null 2>&1
 docker run -d --name ${PFX}decoy --network $NET traefik/whoami --name DECOY-SITE >/dev/null 2>&1
