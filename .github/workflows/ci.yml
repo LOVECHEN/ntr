@@ -27,10 +27,18 @@ jobs:
       - run: CGO_ENABLED=0 go build ./...
       - run: go vet ./... || true
       - run: go test -race -count=1 ./...
-      - name: build linux binary (+http2legacy)
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags "http2legacy with_tun" -o ntr-linux ./cmd/ntr
+      # 编 linux 二进制 + UDP 辅助程序(udpecho/udpclient/udpprobe)。互通 job 无 Go 工具链(只下二进制),
+      # 故这些 `go build` 的辅助必须在此编好随产物带下去,否则 UDP 脚本(ix-tun/ix-vt-udp 等)缺文件、
+      # docker 把缺失挂载源建成目录 → UDP 测全崩。
+      - name: build linux binary + udp helpers
+        run: |
+          mkdir -p out
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags "http2legacy with_tun" -o out/ntr-linux ./cmd/ntr
+          for h in udpecho udpclient udpprobe; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "out/$h" "test/interop/helpers/$h.go"
+          done
       - uses: actions/upload-artifact@v4
-        with: { name: ntr-linux, path: ntr-linux, retention-days: 1 }
+        with: { name: ntr-linux, path: out/, retention-days: 1 }
 
   # ── ② 动态发现所有 ix-*.sh → 输出 matrix 列表(加新协议加个脚本即自动多一个 job)。 ──
   discover:
@@ -79,8 +87,8 @@ jobs:
             'apk add -q openssl >/dev/null 2>&1; openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 -nodes -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" >/dev/null 2>&1; cp cert.pem ca.pem'
       - name: run ${{ matrix.script }}
         run: |
-          chmod +x /tmp/ntr-interop/ntr-linux
           mkdir -p /tmp/ntr-interop
+          chmod +x /tmp/ntr-interop/ntr-linux /tmp/ntr-interop/udpecho /tmp/ntr-interop/udpclient /tmp/ntr-interop/udpprobe 2>/dev/null || true
           cp /tmp/ntr-interop/ntr-linux /tmp/ntr-interop/ntr
           log=/tmp/ntr-interop/${{ matrix.script }}.log
           NTR_BIN=/tmp/ntr-interop/ntr timeout 1200 bash "test/interop/${{ matrix.script }}.sh" 2>&1 | tee "$log" || true

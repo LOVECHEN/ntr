@@ -17,7 +17,9 @@ hit(){ echo "$1" | grep -q Hostname && echo "PASS | $2" || { echo "FAIL | $2"; [
 # 起靶机
 docker run -d --name ixr-target --network $NET traefik/whoami >/dev/null
 
-curlp(){ docker run --rm --network $NET curlimages/curl:latest -s --max-time 12 "$@" 2>&1; }
+# 探测重试:CI 冷 runner 上对端(xray/mihomo/sing-box)服务端起得慢,固定 sleep 常不够;
+# 重试至拿到 Hostname(成功)或耗尽——成功即早退(过的用例零额外开销),只有真失败才付满重试。
+curlp(){ local i out; for i in 1 2 3 4 5 6; do out=$(docker run --rm --network $NET curlimages/curl:latest -s --max-time 12 "$@" 2>&1); echo "$out" | grep -q Hostname && { echo "$out"; return; }; sleep 1; done; echo "$out"; }
 
 # ============================================================
 # 通用:NTR 服务端/客户端配置(TLS+transport+vless)

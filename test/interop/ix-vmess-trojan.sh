@@ -27,14 +27,14 @@ wait_port(){ # $1=host $2=port
 
 # 判据:经 socks5h 代理($1:1080)打靶机 $2,拿到 Hostname 行=通
 probe(){ local out ok=0
-  for i in 1 2 3; do
+  for i in 1 2 3 4 5 6; do
     out=$(docker run --rm --network $NET curlimages/curl:latest -s --max-time 10 -x socks5h://$1:1080 http://$2/ 2>&1)
     echo "$out" | grep -q Hostname && { ok=1; break; }; sleep 1.5
   done
   [ $ok -eq 1 ] && return 0 || { LASTERR=$(echo "$out" | head -c 200); return 1; }
 }
 probe_http(){ local out ok=0
-  for i in 1 2 3; do
+  for i in 1 2 3 4 5 6; do
     out=$(docker run --rm --network $NET curlimages/curl:latest -s --max-time 10 -x http://$1:1080 http://$2/ 2>&1)
     echo "$out" | grep -q Hostname && { ok=1; break; }; sleep 1.5
   done
