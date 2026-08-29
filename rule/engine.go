@@ -29,15 +29,21 @@ type IPSet interface {
 	MatchIP(ip netip.Addr) bool
 }
 
+// DomainSet 是「域名集合成员判定」谓词(geosite/rule-set domain 的抽象;实现在 geo/ruleset,rule 只认接口)。
+type DomainSet interface {
+	MatchDomain(host string) bool // host 已规范化(小写、无末尾点)
+}
+
 // Rule 是一条规则:恰好【一个】维度谓词非空 + 目标 To(出站/链名)。ord 由 Compile 按声明序赋。
 type Rule struct {
-	Domain        []string // 精确域名(exact)
-	DomainSuffix  []string // 域名后缀(按标签边界)
-	DomainKeyword []string // 域名子串
-	IPCIDR        []string // CIDR 前缀(仅对 IP 目标)
-	Port          []uint16 // 目标端口
-	GeoIP         []IPSet  // geoip 国码集合(仅对 IP 目标;由 config 从 mmdb 建好传入)
-	To            string   // 命中后派发到的出站/链名
+	Domain        []string    // 精确域名(exact)
+	DomainSuffix  []string    // 域名后缀(按标签边界)
+	DomainKeyword []string    // 域名子串
+	IPCIDR        []string    // CIDR 前缀(仅对 IP 目标)
+	Port          []uint16    // 目标端口
+	GeoIP         []IPSet     // geoip 国码集合(仅对 IP 目标;由 config 从 mmdb 建好传入)
+	GeoSite       []DomainSet // geosite 域名集合(仅对域名目标;由 config 从 geosite.dat 建好传入)
+	To            string      // 命中后派发到的出站/链名
 }
 
 // dimCount 返回本规则设了几个维度(须恰好 1)。
@@ -45,7 +51,7 @@ func (r *Rule) dimCount() int {
 	n := 0
 	for _, nonEmpty := range []bool{
 		len(r.Domain) > 0, len(r.DomainSuffix) > 0, len(r.DomainKeyword) > 0,
-		len(r.IPCIDR) > 0, len(r.Port) > 0, len(r.GeoIP) > 0,
+		len(r.IPCIDR) > 0, len(r.Port) > 0, len(r.GeoIP) > 0, len(r.GeoSite) > 0,
 	} {
 		if nonEmpty {
 			n++
@@ -66,6 +72,10 @@ type geoEntry struct {
 	set IPSet
 	ord uint32
 }
+type siteEntry struct {
+	set DomainSet
+	ord uint32
+}
 
 // Engine 是编译后的规则引擎:各维度索引 + default。只读、并发安全(编译后不改)。
 type Engine struct {
@@ -76,6 +86,7 @@ type Engine struct {
 	keyword []kwEntry         // 子串,逐个点查(逻辑上是残余,但常用故单列)
 	cidr    []cidrEntry       // CIDR,逐个点查取 min(路径全收集,非最长前缀)
 	geoip   []geoEntry        // geoip 集合,逐个 MatchIP 取 min(仅 IP 目标)
+	geosite []siteEntry       // geosite 集合,逐个 MatchDomain 取 min(仅域名目标)
 	ports   map[uint16]uint32 // 端口 -> min ord
 }
 
@@ -124,6 +135,9 @@ func Compile(rules []Rule, def string) (*Engine, error) {
 		for _, gs := range r.GeoIP {
 			e.geoip = append(e.geoip, geoEntry{gs, ord})
 		}
+		for _, ds := range r.GeoSite {
+			e.geosite = append(e.geosite, siteEntry{ds, ord})
+		}
 	}
 	return e, nil
 }
@@ -150,6 +164,11 @@ func (e *Engine) Route(dst addr.Socksaddr) string {
 		for j := range e.keyword {
 			if e.keyword[j].ord < best && strings.Contains(host, e.keyword[j].kw) {
 				best = e.keyword[j].ord
+			}
+		}
+		for j := range e.geosite {
+			if e.geosite[j].ord < best && e.geosite[j].set.MatchDomain(host) {
+				best = e.geosite[j].ord
 			}
 		}
 	} else if dst.IsIP() {

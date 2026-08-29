@@ -81,9 +81,10 @@ type LimitsSpec struct {
 // RoutingSpec 是规则分流配置(承设计 §8.3):有序规则表 + default 兜底。有 routing: 块时,所有代理
 // 入站按规则选出站(首个命中);无则退回每口 outbound: 静态绑定。
 type RoutingSpec struct {
-	Default   string     `yaml:"default"`    // 未命中兜底出站名(须在 outbounds 定义,或内置 direct/block)
-	Rules     []RuleSpec `yaml:"rules"`      // 有序,首个命中生效
-	GeoIPPath string     `yaml:"geoip-path"` // geoip mmdb 路径(MaxMind GeoLite2-Country 格式;有 geoip 规则时必给)
+	Default     string     `yaml:"default"`      // 未命中兜底出站名(须在 outbounds 定义,或内置 direct/block)
+	Rules       []RuleSpec `yaml:"rules"`        // 有序,首个命中生效
+	GeoIPPath   string     `yaml:"geoip-path"`   // geoip mmdb 路径(MaxMind GeoLite2-Country 格式;有 geoip 规则时必给)
+	GeoSitePath string     `yaml:"geosite-path"` // geosite.dat 路径(V2Ray/mihomo 格式;有 geosite 规则时必给)
 }
 
 // RuleSpec 是一条分流规则:恰好一个维度谓词 + to(目标出站/链名)。v1 维度:域名(精确/后缀/关键字)、
@@ -95,6 +96,7 @@ type RuleSpec struct {
 	IPCIDR        []string `yaml:"ip-cidr"`        // CIDR(仅对 IP 目标)
 	Port          []uint16 `yaml:"port"`           // 目标端口
 	GeoIP         []string `yaml:"geoip"`          // geoip 国码(如 [CN,US];仅对 IP 目标;需 routing.geoip-path)
+	GeoSite       []string `yaml:"geosite"`        // geosite 类目(如 [google,cn];仅对域名目标;需 routing.geosite-path)
 	To            string   `yaml:"to"`             // 命中派发到的出站名
 }
 
@@ -431,6 +433,21 @@ func buildRouter(spec *RoutingSpec, outs map[string]endpoint.Outbound) (*rule.En
 			break
 		}
 	}
+	// 有 geosite 规则则打开 geosite.dat(一次,共享)。
+	var siteDB *geo.GeoSiteDB
+	for _, rs := range spec.Rules {
+		if len(rs.GeoSite) > 0 {
+			if spec.GeoSitePath == "" {
+				return nil, fmt.Errorf("config: 用了 geosite 规则但缺 routing.geosite-path(geosite.dat 路径)")
+			}
+			db, err := geo.OpenGeoSite(spec.GeoSitePath)
+			if err != nil {
+				return nil, err
+			}
+			siteDB = db
+			break
+		}
+	}
 	rules := make([]rule.Rule, len(spec.Rules))
 	for i, rs := range spec.Rules {
 		if _, ok := outs[rs.To]; !ok {
@@ -440,6 +457,14 @@ func buildRouter(spec *RoutingSpec, outs map[string]endpoint.Outbound) (*rule.En
 		if len(rs.GeoIP) > 0 {
 			geoSets = append(geoSets, geoDB.CountrySet(rs.GeoIP))
 		}
+		var siteSets []rule.DomainSet
+		for _, code := range rs.GeoSite {
+			ds, err := siteDB.DomainSet(code)
+			if err != nil {
+				return nil, fmt.Errorf("config: routing.rules[%d].geosite:%w", i, err)
+			}
+			siteSets = append(siteSets, ds)
+		}
 		rules[i] = rule.Rule{
 			Domain:        rs.Domain,
 			DomainSuffix:  rs.DomainSuffix,
@@ -447,6 +472,7 @@ func buildRouter(spec *RoutingSpec, outs map[string]endpoint.Outbound) (*rule.En
 			IPCIDR:        rs.IPCIDR,
 			Port:          rs.Port,
 			GeoIP:         geoSets,
+			GeoSite:       siteSets,
 			To:            rs.To,
 		}
 	}
