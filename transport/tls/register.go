@@ -30,6 +30,8 @@ type Config struct {
 	Insecure    bool
 	ALPN        []string
 	Fingerprint string // 客户端 uTLS 指纹(chrome/firefox/safari/ios/edge/…);空=标准 crypto/tls
+	ECHConfig   string // 客户端 ECH:"ECH CONFIGS" PEM(加密 ClientHello 抗 SNI 审查);与 ech-config-file 二选一
+	ECHKey      string // 服务端 ECH:"ECH KEYS" PEM;与 ech-key-file 二选一
 }
 
 // Parse 从哑节点解出 Config。
@@ -49,6 +51,8 @@ func Parse(n *spec.Node) (Config, error) {
 		Insecure:    n.Get("insecure").Bool(),
 		ALPN:        alpn,
 		Fingerprint: n.Get("fingerprint").Str(),
+		ECHConfig:   n.Get("ech-config").Str(), // ech-config-file 会被 config 层自动读文件注入到 ech-config
+		ECHKey:      n.Get("ech-key").Str(),
 	}, nil
 }
 
@@ -83,6 +87,22 @@ func Build(_ context.Context, cfg Config, _ any) (any, error) {
 	if cfg.Fingerprint != "" { // 客户端走 uTLS 仿真真实浏览器 ClientHello(抗指纹审查)
 		t.useUTLS = true
 		t.fingerprint = fingerprintOf(cfg.Fingerprint)
+	}
+	if cfg.ECHConfig != "" { // 客户端 ECH:加密 ClientHello(SNI 藏进 HPKE,外层只露 public-name)
+		list, err := parseECHConfigs([]byte(cfg.ECHConfig))
+		if err != nil {
+			return nil, err
+		}
+		t.client.EncryptedClientHelloConfigList = list
+		t.client.MinVersion = cryptotls.VersionTLS13 // ECH 要求 TLS 1.3
+	}
+	if cfg.ECHKey != "" { // 服务端 ECH:用私钥解密 ClientHello
+		keys, err := parseECHKeys([]byte(cfg.ECHKey))
+		if err != nil {
+			return nil, err
+		}
+		t.server.EncryptedClientHelloKeys = keys
+		t.server.MinVersion = cryptotls.VersionTLS13
 	}
 	return t, nil
 }
