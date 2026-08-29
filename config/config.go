@@ -55,6 +55,7 @@ import (
 	"github.com/LOVECHEN/ntr/outbound/wireguard"
 	"github.com/LOVECHEN/ntr/reverse"
 	"github.com/LOVECHEN/ntr/rule"
+	"github.com/LOVECHEN/ntr/ruleset"
 	"github.com/LOVECHEN/ntr/service"
 )
 
@@ -81,10 +82,21 @@ type LimitsSpec struct {
 // RoutingSpec 是规则分流配置(承设计 §8.3):有序规则表 + default 兜底。有 routing: 块时,所有代理
 // 入站按规则选出站(首个命中);无则退回每口 outbound: 静态绑定。
 type RoutingSpec struct {
-	Default     string     `yaml:"default"`      // 未命中兜底出站名(须在 outbounds 定义,或内置 direct/block)
-	Rules       []RuleSpec `yaml:"rules"`        // 有序,首个命中生效
-	GeoIPPath   string     `yaml:"geoip-path"`   // geoip mmdb 路径(MaxMind GeoLite2-Country 格式;有 geoip 规则时必给)
-	GeoSitePath string     `yaml:"geosite-path"` // geosite.dat 路径(V2Ray/mihomo 格式;有 geosite 规则时必给)
+	Default       string             `yaml:"default"`        // 未命中兜底出站名(须在 outbounds 定义,或内置 direct/block)
+	Rules         []RuleSpec         `yaml:"rules"`          // 有序,首个命中生效
+	GeoIPPath     string             `yaml:"geoip-path"`     // geoip mmdb 路径(MaxMind GeoLite2-Country 格式;有 geoip 规则时必给)
+	GeoSitePath   string             `yaml:"geosite-path"`   // geosite.dat 路径(V2Ray/mihomo 格式;有 geosite 规则时必给)
+	RuleProviders []RuleProviderSpec `yaml:"rule-providers"` // 命名规则集(本地文件/远程 URL 经 detour 拉;Surge/Clash 文本)
+}
+
+// RuleProviderSpec 是一个命名规则集来源(Surge/Clash 文本 domain-list/ip-list/classical)。
+type RuleProviderSpec struct {
+	Name     string `yaml:"name"`
+	Behavior string `yaml:"behavior"` // domain | ipcidr | classical
+	Path     string `yaml:"path"`     // 本地文件(与 url 二选一)
+	URL      string `yaml:"url"`      // 远程 URL(经 detour 拉)
+	Detour   string `yaml:"detour"`   // 拉取远程用的出站名
+	Interval string `yaml:"interval"` // (预留)定时更新周期
 }
 
 // RuleSpec 是一条分流规则:恰好一个维度谓词 + to(目标出站/链名)。v1 维度:域名(精确/后缀/关键字)、
@@ -97,6 +109,7 @@ type RuleSpec struct {
 	Port          []uint16 `yaml:"port"`           // 目标端口
 	GeoIP         []string `yaml:"geoip"`          // geoip 国码(如 [CN,US];仅对 IP 目标;需 routing.geoip-path)
 	GeoSite       []string `yaml:"geosite"`        // geosite 类目(如 [google,cn];仅对域名目标;需 routing.geosite-path)
+	RuleSet       []string `yaml:"rule-set"`       // 引用 rule-providers 里的规则集名(按其 behavior 判域名/IP)
 	To            string   `yaml:"to"`             // 命中派发到的出站名
 }
 
@@ -414,9 +427,26 @@ func buildOneGroup(o Outbound, members []group.Member) (*group.Group, error) {
 
 // buildRouter 把 routing: 块编译成 rule.Engine:转换规则、校验 default 与每条 to 均为已定义出站
 // (编译期挡住悬空目标,守「绝不静默误路由」)。规则维度校验(须恰好一个)在 rule.Compile 内。
-func buildRouter(spec *RoutingSpec, outs map[string]endpoint.Outbound) (*rule.Engine, error) {
+func buildRouter(ctx context.Context, spec *RoutingSpec, outs map[string]endpoint.Outbound) (*rule.Engine, error) {
 	if _, ok := outs[spec.Default]; !ok {
 		return nil, fmt.Errorf("config: routing.default %q 未在 outbounds 定义", spec.Default)
+	}
+	// rule-providers:按名建规则集(本地文件/远程 URL 经 detour 拉)。
+	providers := make(map[string]*ruleset.Provider, len(spec.RuleProviders))
+	for _, ps := range spec.RuleProviders {
+		var det endpoint.Outbound
+		if ps.URL != "" {
+			name := ps.Detour
+			if name == "" {
+				return nil, fmt.Errorf("config: rule-provider %q 是远程 url,需 detour 出站(绝不隐式直连)", ps.Name)
+			}
+			d, ok := outs[name]
+			if !ok {
+				return nil, fmt.Errorf("config: rule-provider %q detour %q 未在 outbounds 定义", ps.Name, name)
+			}
+			det = d
+		}
+		providers[ps.Name] = &ruleset.Provider{Name: ps.Name, Behavior: ps.Behavior, Path: ps.Path, URL: ps.URL, Detour: det}
 	}
 	// 有 geoip 规则则打开 mmdb(一次,共享给所有 geoip 规则)。
 	var geoDB *geo.DB
@@ -464,6 +494,26 @@ func buildRouter(spec *RoutingSpec, outs map[string]endpoint.Outbound) (*rule.En
 				return nil, fmt.Errorf("config: routing.rules[%d].geosite:%w", i, err)
 			}
 			siteSets = append(siteSets, ds)
+		}
+		// rule-set:按 provider 的 behavior 归入域名集(domain/classical)或 IP 集(ipcidr)。
+		for _, name := range rs.RuleSet {
+			pv, ok := providers[name]
+			if !ok {
+				return nil, fmt.Errorf("config: routing.rules[%d].rule-set 引用未定义 provider %q", i, name)
+			}
+			if pv.Behavior == "ipcidr" {
+				ips, err := pv.LoadIP(ctx)
+				if err != nil {
+					return nil, err
+				}
+				geoSets = append(geoSets, ips)
+			} else {
+				ds, err := pv.LoadDomain(ctx)
+				if err != nil {
+					return nil, err
+				}
+				siteSets = append(siteSets, ds)
+			}
 		}
 		rules[i] = rule.Rule{
 			Domain:        rs.Domain,
@@ -671,7 +721,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 	// 首个命中生效、末尾 default 兜底。无则退回每口 outbound: 静态绑定。
 	var router *service.RuleRouter
 	if f.Routing != nil {
-		eng, err := buildRouter(f.Routing, outs)
+		eng, err := buildRouter(ctx, f.Routing, outs)
 		if err != nil {
 			return nil, err
 		}
