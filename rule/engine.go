@@ -24,6 +24,11 @@ import (
 // ordNone 是「无命中」哨兵(大于任何合法 ord)。
 const ordNone = ^uint32(0)
 
+// IPSet 是「IP 集合成员判定」谓词(geoip 的抽象;实现在 geo 包,rule 只认接口、不碰 mmdb I/O)。
+type IPSet interface {
+	MatchIP(ip netip.Addr) bool
+}
+
 // Rule 是一条规则:恰好【一个】维度谓词非空 + 目标 To(出站/链名)。ord 由 Compile 按声明序赋。
 type Rule struct {
 	Domain        []string // 精确域名(exact)
@@ -31,6 +36,7 @@ type Rule struct {
 	DomainKeyword []string // 域名子串
 	IPCIDR        []string // CIDR 前缀(仅对 IP 目标)
 	Port          []uint16 // 目标端口
+	GeoIP         []IPSet  // geoip 国码集合(仅对 IP 目标;由 config 从 mmdb 建好传入)
 	To            string   // 命中后派发到的出站/链名
 }
 
@@ -39,7 +45,7 @@ func (r *Rule) dimCount() int {
 	n := 0
 	for _, nonEmpty := range []bool{
 		len(r.Domain) > 0, len(r.DomainSuffix) > 0, len(r.DomainKeyword) > 0,
-		len(r.IPCIDR) > 0, len(r.Port) > 0,
+		len(r.IPCIDR) > 0, len(r.Port) > 0, len(r.GeoIP) > 0,
 	} {
 		if nonEmpty {
 			n++
@@ -56,6 +62,10 @@ type kwEntry struct {
 	kw  string
 	ord uint32
 }
+type geoEntry struct {
+	set IPSet
+	ord uint32
+}
 
 // Engine 是编译后的规则引擎:各维度索引 + default。只读、并发安全(编译后不改)。
 type Engine struct {
@@ -65,6 +75,7 @@ type Engine struct {
 	suffix  map[string]uint32 // 后缀标签串 -> min ord
 	keyword []kwEntry         // 子串,逐个点查(逻辑上是残余,但常用故单列)
 	cidr    []cidrEntry       // CIDR,逐个点查取 min(路径全收集,非最长前缀)
+	geoip   []geoEntry        // geoip 集合,逐个 MatchIP 取 min(仅 IP 目标)
 	ports   map[uint16]uint32 // 端口 -> min ord
 }
 
@@ -110,6 +121,9 @@ func Compile(rules []Rule, def string) (*Engine, error) {
 		for _, pt := range r.Port {
 			putMin(e.ports, pt, ord)
 		}
+		for _, gs := range r.GeoIP {
+			e.geoip = append(e.geoip, geoEntry{gs, ord})
+		}
 	}
 	return e, nil
 }
@@ -143,6 +157,11 @@ func (e *Engine) Route(dst addr.Socksaddr) string {
 		for j := range e.cidr {
 			if e.cidr[j].ord < best && e.cidr[j].p.Contains(ip) {
 				best = e.cidr[j].ord
+			}
+		}
+		for j := range e.geoip {
+			if e.geoip[j].ord < best && e.geoip[j].set.MatchIP(ip) {
+				best = e.geoip[j].ord
 			}
 		}
 	}

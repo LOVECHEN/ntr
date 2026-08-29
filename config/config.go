@@ -30,6 +30,7 @@ import (
 	"github.com/LOVECHEN/ntr/core/spec"
 	"github.com/LOVECHEN/ntr/core/transport"
 	"github.com/LOVECHEN/ntr/dns"
+	"github.com/LOVECHEN/ntr/geo"
 	"github.com/LOVECHEN/ntr/inbound/transparent"
 	"github.com/LOVECHEN/ntr/inbound/tun"
 	"github.com/LOVECHEN/ntr/inbound/tunnel"
@@ -80,8 +81,9 @@ type LimitsSpec struct {
 // RoutingSpec 是规则分流配置(承设计 §8.3):有序规则表 + default 兜底。有 routing: 块时,所有代理
 // 入站按规则选出站(首个命中);无则退回每口 outbound: 静态绑定。
 type RoutingSpec struct {
-	Default string     `yaml:"default"` // 未命中兜底出站名(须在 outbounds 定义,或内置 direct/block)
-	Rules   []RuleSpec `yaml:"rules"`   // 有序,首个命中生效
+	Default   string     `yaml:"default"`    // 未命中兜底出站名(须在 outbounds 定义,或内置 direct/block)
+	Rules     []RuleSpec `yaml:"rules"`      // 有序,首个命中生效
+	GeoIPPath string     `yaml:"geoip-path"` // geoip mmdb 路径(MaxMind GeoLite2-Country 格式;有 geoip 规则时必给)
 }
 
 // RuleSpec 是一条分流规则:恰好一个维度谓词 + to(目标出站/链名)。v1 维度:域名(精确/后缀/关键字)、
@@ -92,6 +94,7 @@ type RuleSpec struct {
 	DomainKeyword []string `yaml:"domain-keyword"` // 域名子串
 	IPCIDR        []string `yaml:"ip-cidr"`        // CIDR(仅对 IP 目标)
 	Port          []uint16 `yaml:"port"`           // 目标端口
+	GeoIP         []string `yaml:"geoip"`          // geoip 国码(如 [CN,US];仅对 IP 目标;需 routing.geoip-path)
 	To            string   `yaml:"to"`             // 命中派发到的出站名
 }
 
@@ -413,10 +416,29 @@ func buildRouter(spec *RoutingSpec, outs map[string]endpoint.Outbound) (*rule.En
 	if _, ok := outs[spec.Default]; !ok {
 		return nil, fmt.Errorf("config: routing.default %q 未在 outbounds 定义", spec.Default)
 	}
+	// 有 geoip 规则则打开 mmdb(一次,共享给所有 geoip 规则)。
+	var geoDB *geo.DB
+	for _, rs := range spec.Rules {
+		if len(rs.GeoIP) > 0 {
+			if spec.GeoIPPath == "" {
+				return nil, fmt.Errorf("config: 用了 geoip 规则但缺 routing.geoip-path(mmdb 路径)")
+			}
+			db, err := geo.OpenGeoIP(spec.GeoIPPath)
+			if err != nil {
+				return nil, err
+			}
+			geoDB = db
+			break
+		}
+	}
 	rules := make([]rule.Rule, len(spec.Rules))
 	for i, rs := range spec.Rules {
 		if _, ok := outs[rs.To]; !ok {
 			return nil, fmt.Errorf("config: routing.rules[%d].to %q 未在 outbounds 定义", i, rs.To)
+		}
+		var geoSets []rule.IPSet
+		if len(rs.GeoIP) > 0 {
+			geoSets = append(geoSets, geoDB.CountrySet(rs.GeoIP))
 		}
 		rules[i] = rule.Rule{
 			Domain:        rs.Domain,
@@ -424,6 +446,7 @@ func buildRouter(spec *RoutingSpec, outs map[string]endpoint.Outbound) (*rule.En
 			DomainKeyword: rs.DomainKeyword,
 			IPCIDR:        rs.IPCIDR,
 			Port:          rs.Port,
+			GeoIP:         geoSets,
 			To:            rs.To,
 		}
 	}

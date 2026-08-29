@@ -47,6 +47,11 @@ func ruleMatches(r *Rule, dst addr.Socksaddr) bool {
 				return true
 			}
 		}
+		for _, gs := range r.GeoIP {
+			if gs.MatchIP(dst.Addr.Unmap()) {
+				return true
+			}
+		}
 	}
 	for _, pt := range r.Port {
 		if dst.Port == pt {
@@ -127,8 +132,8 @@ func TestEngineMatchesNaive(t *testing.T) {
 // TestEngineMinOrdinalNotLongestPrefix 显式守 §8.3.3 的 CIDR 陷阱:重叠 CIDR 取 min ord,非最长前缀。
 func TestEngineMinOrdinalNotLongestPrefix(t *testing.T) {
 	rules := []Rule{
-		{IPCIDR: []string{"10.0.0.0/8"}, To: "A"},   // ord 0(更宽)
-		{IPCIDR: []string{"10.1.0.0/16"}, To: "B"},  // ord 1(更窄,最长前缀会误选它)
+		{IPCIDR: []string{"10.0.0.0/8"}, To: "A"},  // ord 0(更宽)
+		{IPCIDR: []string{"10.1.0.0/16"}, To: "B"}, // ord 1(更窄,最长前缀会误选它)
 	}
 	eng, err := Compile(rules, "def")
 	if err != nil {
@@ -155,6 +160,38 @@ func TestEngineSuffixLabelBoundary(t *testing.T) {
 	for host, want := range cases {
 		if got := eng.Route(addr.FromFqdn(host, 443)); got != want {
 			t.Errorf("suffix %q: got %q want %q", host, got, want)
+		}
+	}
+}
+
+// fakeIPSet 是测试用 geoip 集合:匹配预置的 IP 集。
+type fakeIPSet struct{ hit map[netip.Addr]bool }
+
+func (f fakeIPSet) MatchIP(ip netip.Addr) bool { return f.hit[ip.Unmap()] }
+
+// TestEngineGeoIP 验证 geoip 维:命中集合的 IP → 规则 To,否则 default;且 min-ordinal 与 cidr 共存。
+func TestEngineGeoIP(t *testing.T) {
+	cn := fakeIPSet{hit: map[netip.Addr]bool{
+		netip.MustParseAddr("223.5.5.5"):       true,
+		netip.MustParseAddr("114.114.114.114"): true,
+	}}
+	eng, err := Compile([]Rule{
+		{IPCIDR: []string{"8.8.8.0/24"}, To: "cidr-out"}, // ord0:优先于 geoip(同为 IP 维,但 min-ord)
+		{GeoIP: []IPSet{cn}, To: "cn-out"},               // ord1
+	}, "direct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct{ ip, want string }{
+		{"223.5.5.5", "cn-out"}, // 命中 geoip
+		{"114.114.114.114", "cn-out"},
+		{"8.8.8.8", "cidr-out"}, // 命中 cidr(ord0 < geoip ord1),且 8.8.8.8 不在 cn 集
+		{"1.1.1.1", "direct"},   // 都不命中 → 兜底
+	}
+	for _, c := range cases {
+		dst := addr.FromIPPort(netip.MustParseAddrPort(c.ip + ":80"))
+		if got := eng.Route(dst); got != c.want {
+			t.Errorf("Route(%s)=%q 期望 %q", c.ip, got, c.want)
 		}
 	}
 }

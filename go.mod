@@ -5,11 +5,13 @@ go 1.25.0
 require (
 	github.com/anytls/sing-anytls v0.0.13
 	github.com/enfein/mieru/v3 v3.36.0
+	github.com/golang/snappy v1.0.0
 	github.com/metacubex/blake3 v0.1.0
 	github.com/metacubex/chacha v0.1.5
 	github.com/metacubex/http v0.1.7
 	github.com/metacubex/jls-quic-go v0.0.0-20260727080412-732f2fc9a34d
 	github.com/metacubex/jls-tls v0.0.0-20260723084315-67adc0e2f796
+	github.com/metacubex/kcp-go v0.0.0-20260105040817-550693377604
 	github.com/metacubex/quic-go v0.59.1-0.20260112033758-aa29579f2001
 	github.com/metacubex/randv2 v0.2.0
 	github.com/metacubex/restls-client-go v0.1.9
@@ -18,7 +20,9 @@ require (
 	github.com/metacubex/sing-quic v0.0.0-20260726014900-38b0e9295f51
 	github.com/metacubex/sing-shadowsocks v0.2.12
 	github.com/metacubex/sing-vmess v0.2.5
+	github.com/metacubex/smux v0.0.0-20260105030934-d0c8756d3141
 	github.com/metacubex/tls v0.1.7
+	github.com/oschwald/maxminddb-golang v1.13.1
 	github.com/refraction-networking/utls v1.8.2
 	github.com/sagernet/sing v0.8.5-0.20260411123740-2a8053daaf99
 	github.com/sagernet/sing-quic v0.6.4
@@ -45,7 +49,6 @@ require (
 	github.com/ericlagergren/subtle v0.0.0-20220507045147-890d697da010 // indirect
 	github.com/gaukas/godicttls v0.0.4 // indirect
 	github.com/gofrs/uuid/v5 v5.3.2 // indirect
-	github.com/golang/snappy v1.0.0 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/juju/ratelimit v1.0.2 // indirect
 	github.com/klauspost/compress v1.17.9 // indirect
@@ -56,10 +59,8 @@ require (
 	github.com/metacubex/cpu v0.1.0 // indirect
 	github.com/metacubex/hkdf v0.1.0 // indirect
 	github.com/metacubex/hpke v0.1.0 // indirect
-	github.com/metacubex/kcp-go v0.0.0-20260105040817-550693377604 // indirect
 	github.com/metacubex/mlkem v0.1.0 // indirect
 	github.com/metacubex/qpack v0.6.0 // indirect
-	github.com/metacubex/smux v0.0.0-20260105030934-d0c8756d3141 // indirect
 	github.com/metacubex/utls v1.8.7 // indirect
 	github.com/metacubex/yamux v0.0.0-20250918083631-dd5f17c0be49 // indirect
 	github.com/oasisprotocol/deoxysii v0.0.0-20220228165953-2091330c22b7 // indirect
