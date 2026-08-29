@@ -43,6 +43,7 @@ type plan struct {
 type Resolver struct {
 	p     atomic.Pointer[plan]
 	cache *cache
+	fake  *fakeIPPool // fake-ip 池(nil=未启用);跨 reload 存活(伪 IP 映射不能丢),故挂 Resolver 非 plan
 }
 
 var _ route.Resolver = (*Resolver)(nil)
@@ -86,13 +87,16 @@ func buildPlan(nss []Nameserver, strategy string, hosts map[string][]netip.Addr)
 	return &plan{nameservers: ups, strategy: st, hosts: newHosts(hosts)}, nil
 }
 
-// New 建解析器。
-func New(nameservers []Nameserver, strategy string, hosts map[string][]netip.Addr) (*Resolver, error) {
+// New 建解析器。fake 非 nil 则启用 fake-ip(伪 IP 映射跨 reload 存活)。
+func New(nameservers []Nameserver, strategy string, hosts map[string][]netip.Addr, fake *FakeIPConfig) (*Resolver, error) {
 	pl, err := buildPlan(nameservers, strategy, hosts)
 	if err != nil {
 		return nil, err
 	}
 	r := &Resolver{cache: newCache()}
+	if fake != nil {
+		r.fake = newFakeIPPool(fake)
+	}
 	r.p.Store(pl)
 	return r, nil
 }
@@ -117,6 +121,19 @@ func (r *Resolver) Exchange(ctx context.Context, q *route.Message) (*route.Messa
 	if ok && p.hosts != nil {
 		if addrs, hit := p.hosts.lookup(key.name, key.qtype); hit {
 			if raw := buildHostsResponse(id, key.name, key.qtype, addrs); raw != nil {
+				return &route.Message{Raw: raw}, nil
+			}
+		}
+	}
+	// fake-ip:A/AAAA 且未排除 → 就地合成伪 IP 应答(记映射),不走上游、不入缓存(池即缓存)。
+	// hosts 优先于 fake(上面已判);AAAA 无 v6 段 → 空答(NOERROR 无记录),逼客户端用 v4 伪 IP、防 v6 泄漏。
+	if ok && r.fake != nil && (key.qtype == dnsmessage.TypeA || key.qtype == dnsmessage.TypeAAAA) && !r.fake.excluded(key.name) {
+		if fip, got := r.fake.alloc(key.name, key.qtype); got {
+			if raw := buildHostsResponse(id, key.name, key.qtype, []netip.Addr{fip}); raw != nil {
+				return &route.Message{Raw: raw}, nil
+			}
+		} else if key.qtype == dnsmessage.TypeAAAA { // 有 fake 但无 v6 段:AAAA 空答
+			if raw := buildHostsResponse(id, key.name, key.qtype, nil); raw != nil {
 				return &route.Message{Raw: raw}, nil
 			}
 		}
@@ -219,8 +236,13 @@ func (r *Resolver) LookupCached(host string, s route.Strategy) ([]netip.Addr, bo
 	return addrs, len(addrs) > 0
 }
 
-// FakeIPToDomain:Phase 2;MVP 恒 ("",false)。
-func (r *Resolver) FakeIPToDomain(netip.Addr) (string, bool) { return "", false }
+// FakeIPToDomain 反查伪 IP → 域名(bare、小写);未启用 fake-ip 或非本池 IP → ("",false)。
+func (r *Resolver) FakeIPToDomain(ip netip.Addr) (string, bool) {
+	if r.fake == nil {
+		return "", false
+	}
+	return r.fake.lookup(ip)
+}
 
 // ---- 小工具 ----
 

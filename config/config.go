@@ -31,6 +31,7 @@ import (
 	"github.com/LOVECHEN/ntr/core/transport"
 	"github.com/LOVECHEN/ntr/dns"
 	"github.com/LOVECHEN/ntr/geo"
+	dnsin "github.com/LOVECHEN/ntr/inbound/dns"
 	"github.com/LOVECHEN/ntr/inbound/transparent"
 	"github.com/LOVECHEN/ntr/inbound/tun"
 	"github.com/LOVECHEN/ntr/inbound/tunnel"
@@ -129,7 +130,16 @@ type DNSSpec struct {
 	Detour      string              `yaml:"detour"`   // 未写 detour 的 nameserver 默认出站(必具名)
 	Strategy    string              `yaml:"strategy"` // race(默认)| sequential
 	Nameservers []NameserverSpec    `yaml:"nameservers"`
-	Hosts       map[string][]string `yaml:"hosts"` // 静态 host→IP,命中不走上游(也防这些域名 DNS 泄漏)
+	Hosts       map[string][]string `yaml:"hosts"`   // 静态 host→IP,命中不走上游(也防这些域名 DNS 泄漏)
+	FakeIP      *FakeIPSpec         `yaml:"fake-ip"` // fake-ip:给域名发伪 IP,让只见 IP 的连接也能按域名分流
+}
+
+// FakeIPSpec 是 dns.fake-ip 块:enabled + v4/v6 伪 IP 段 + 排除后缀。
+type FakeIPSpec struct {
+	Enabled    bool     `yaml:"enabled"`
+	Inet4Range string   `yaml:"inet4-range"` // 默认 198.18.0.0/15
+	Inet6Range string   `yaml:"inet6-range"` // 空=不发 v6 伪 IP(AAAA 空答)
+	Exclude    []string `yaml:"exclude"`     // 排除域名后缀,命中走真解析
 }
 
 // NameserverSpec 是一台上游:tag + address(udp/tcp/tls(DoT)/https(DoH))+ 绑定的具名出站(防泄漏)。
@@ -294,7 +304,41 @@ func buildResolver(spec *DNSSpec, outs map[string]endpoint.Outbound) (route.Reso
 	if err != nil {
 		return nil, err
 	}
-	return dns.New(nss, spec.Strategy, hosts)
+	fake, err := parseFakeIP(spec.FakeIP)
+	if err != nil {
+		return nil, err
+	}
+	return dns.New(nss, spec.Strategy, hosts, fake)
+}
+
+// parseFakeIP 把 config 的 fake-ip 块解析成 *dns.FakeIPConfig(未启用→nil)。默认 v4 198.18.0.0/15。
+func parseFakeIP(spec *FakeIPSpec) (*dns.FakeIPConfig, error) {
+	if spec == nil || !spec.Enabled {
+		return nil, nil
+	}
+	v4s := spec.Inet4Range
+	if v4s == "" {
+		v4s = "198.18.0.0/15"
+	}
+	v4, err := netip.ParsePrefix(v4s)
+	if err != nil {
+		return nil, fmt.Errorf("config: dns.fake-ip.inet4-range %q:%w", v4s, err)
+	}
+	if !v4.Addr().Unmap().Is4() {
+		return nil, fmt.Errorf("config: dns.fake-ip.inet4-range %q 不是 IPv4 段", v4s)
+	}
+	cfg := &dns.FakeIPConfig{Inet4: v4.Masked(), Exclude: spec.Exclude}
+	if spec.Inet6Range != "" {
+		v6, err := netip.ParsePrefix(spec.Inet6Range)
+		if err != nil {
+			return nil, fmt.Errorf("config: dns.fake-ip.inet6-range %q:%w", spec.Inet6Range, err)
+		}
+		if !v6.Addr().Is6() || v6.Addr().Is4In6() {
+			return nil, fmt.Errorf("config: dns.fake-ip.inet6-range %q 不是 IPv6 段", spec.Inet6Range)
+		}
+		cfg.Inet6 = v6.Masked()
+	}
+	return cfg, nil
 }
 
 // parseHosts 把 config 的 hosts(域名→IP 字符串列表)解析成 netip.Addr(非法 IP 大声报)。
@@ -739,6 +783,9 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			return nil, err
 		}
 		router = &service.RuleRouter{Engine: eng, Outs: outs}
+		if dnsResolver != nil { // fake-ip 反查:伪 IP dst 路由前换回域名(未启用 fake-ip 时 FakeIPToDomain 恒 false,无害)
+			router.Fake = dnsResolver.FakeIPToDomain
+		}
 	}
 
 	var insts []Instance
@@ -863,6 +910,14 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			}
 			listen := in.Listen
 			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
+			continue
+		case "dns":
+			if dnsResolver == nil {
+				return nil, fmt.Errorf("config: 入站 %s(dns)需启用 dns:(dns.enabled=true 提供 resolver)", in.Listen)
+			}
+			srv := dnsin.New(dnsResolver)
+			listen := in.Listen
+			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return srv.Run(ctx, listen) }})
 			continue
 		case "tun":
 			hijack, herr := parseHijack(in.DNSHijack)
