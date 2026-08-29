@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	utls "github.com/refraction-networking/utls"
+
 	"github.com/LOVECHEN/ntr/core/cap"
 	"github.com/LOVECHEN/ntr/core/registry"
 	"github.com/LOVECHEN/ntr/core/spec"
@@ -22,11 +24,12 @@ import (
 // Config 是 TLS 层自有配置。服务端给 CertPEM/KeyPEM(留空 → 自签临时证书,dev/测试用);
 // 客户端给 ServerName + 是否跳过校验(自签场景)。
 type Config struct {
-	CertPEM    string
-	KeyPEM     string
-	ServerName string
-	Insecure   bool
-	ALPN       []string
+	CertPEM     string
+	KeyPEM      string
+	ServerName  string
+	Insecure    bool
+	ALPN        []string
+	Fingerprint string // 客户端 uTLS 指纹(chrome/firefox/safari/ios/edge/…);空=标准 crypto/tls
 }
 
 // Parse 从哑节点解出 Config。
@@ -40,11 +43,12 @@ func Parse(n *spec.Node) (Config, error) {
 		}
 	}
 	return Config{
-		CertPEM:    n.Get("cert").Str(),
-		KeyPEM:     n.Get("key").Str(),
-		ServerName: n.Get("sni").Str(),
-		Insecure:   n.Get("insecure").Bool(),
-		ALPN:       alpn,
+		CertPEM:     n.Get("cert").Str(),
+		KeyPEM:      n.Get("key").Str(),
+		ServerName:  n.Get("sni").Str(),
+		Insecure:    n.Get("insecure").Bool(),
+		ALPN:        alpn,
+		Fingerprint: n.Get("fingerprint").Str(),
 	}, nil
 }
 
@@ -63,7 +67,7 @@ func Build(_ context.Context, cfg Config, _ any) (any, error) {
 			return nil, err
 		}
 	}
-	return &Transport{
+	t := &Transport{
 		server: &cryptotls.Config{
 			Certificates: []cryptotls.Certificate{cert},
 			MinVersion:   cryptotls.VersionTLS12,
@@ -75,7 +79,34 @@ func Build(_ context.Context, cfg Config, _ any) (any, error) {
 			MinVersion:         cryptotls.VersionTLS12,
 			NextProtos:         cfg.ALPN,
 		},
-	}, nil
+	}
+	if cfg.Fingerprint != "" { // 客户端走 uTLS 仿真真实浏览器 ClientHello(抗指纹审查)
+		t.useUTLS = true
+		t.fingerprint = fingerprintOf(cfg.Fingerprint)
+	}
+	return t, nil
+}
+
+// fingerprintOf 把指纹名映射成 uTLS ClientHelloID(与 reality 同套)。
+func fingerprintOf(name string) utls.ClientHelloID {
+	switch strings.ToLower(name) {
+	case "chrome", "":
+		return utls.HelloChrome_Auto
+	case "chrome-120":
+		return utls.HelloChrome_120
+	case "firefox":
+		return utls.HelloFirefox_Auto
+	case "safari":
+		return utls.HelloSafari_Auto
+	case "ios":
+		return utls.HelloIOS_Auto
+	case "edge":
+		return utls.HelloEdge_Auto
+	case "random":
+		return utls.HelloRandomized
+	default:
+		return utls.HelloChrome_Auto
+	}
 }
 
 // ephemeralCert 生成一张自签 ECDSA P-256 证书(dev/测试;客户端需 insecure=true)。

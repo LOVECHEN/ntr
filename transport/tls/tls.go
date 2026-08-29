@@ -10,14 +10,18 @@ import (
 	cryptotls "crypto/tls"
 	"net"
 
+	utls "github.com/refraction-networking/utls"
+
 	"github.com/LOVECHEN/ntr/core/link"
 	"github.com/LOVECHEN/ntr/core/transport"
 )
 
 // Transport 是构建产物:握手所需的双向 *tls.Config 各一份(Build 时定,连接级复用)。
 type Transport struct {
-	server *cryptotls.Config
-	client *cryptotls.Config
+	server      *cryptotls.Config
+	client      *cryptotls.Config
+	useUTLS     bool               // 客户端是否走 uTLS 指纹仿真
+	fingerprint utls.ClientHelloID // useUTLS 时的 ClientHello 指纹
 }
 
 var _ transport.StreamTransport = (*Transport)(nil)
@@ -31,8 +35,21 @@ func (t *Transport) ServerWrap(ctx context.Context, below link.Stream) (link.Str
 	return &stream{Conn: c, below: below}, nil
 }
 
-// ClientWrap 以 ServerName/校验策略发起 TLS 握手。
+// ClientWrap 以 ServerName/校验策略发起 TLS 握手。配了 fingerprint 则走 uTLS 仿真真实浏览器
+// ClientHello(抗 TLS 指纹审查),否则标准 crypto/tls。
 func (t *Transport) ClientWrap(ctx context.Context, below link.Stream) (link.Stream, error) {
+	if t.useUTLS {
+		uConn := utls.UClient(below, &utls.Config{
+			ServerName:         t.client.ServerName,
+			InsecureSkipVerify: t.client.InsecureSkipVerify,
+			NextProtos:         t.client.NextProtos,
+			MinVersion:         t.client.MinVersion,
+		}, t.fingerprint)
+		if err := uConn.HandshakeContext(ctx); err != nil {
+			return nil, err
+		}
+		return &utlsStream{UConn: uConn, below: below}, nil
+	}
 	c := cryptotls.Client(below, t.client)
 	if err := c.HandshakeContext(ctx); err != nil {
 		return nil, err
@@ -50,3 +67,13 @@ func (s *stream) Unwrap() any { return s.below }
 
 // TLSConn 暴露底层 *crypto/tls.Conn(实现 link.TLSConnCarrier)—— 供 VLESS Vision 反射做 splice。
 func (s *stream) TLSConn() net.Conn { return s.Conn }
+
+// utlsStream 把 uTLS 的 *utls.UConn 抬成 link.Stream。也实现 TLSConnCarrier(返回 UConn,net.Conn),
+// 供 ALPN 等能力发现;但 Vision 反射需 *crypto/tls.Conn,故 uTLS 之上不支持 Vision(用 REALITY 承 Vision)。
+type utlsStream struct {
+	*utls.UConn
+	below any
+}
+
+func (s *utlsStream) Unwrap() any       { return s.below }
+func (s *utlsStream) TLSConn() net.Conn { return s.UConn }
