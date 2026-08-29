@@ -70,6 +70,13 @@ jobs:
           for img in alpine:latest curlimages/curl:latest traefik/whoami:latest $imgs; do
             echo "pull $img"; docker pull "$img" >/dev/null 2>&1 || true
           done
+      # 共享自签证书:多数 TLS 脚本假定 $D/cert.pem·key.pem·ca.pem 已由序列跑里的前序脚本生成;CI 每脚本是
+      # 独立 job、无此前序,缺证书时 docker 把 `-v $D/cert.pem:...` 的缺失源建成【目录】→ TLS 全崩(ix-transports
+      # /vmess-trojan/quic-protos/session-protos/vt-udp 0/N)。故这里先备好标准自签证书(CN/SAN=example.com,ca=自身)。
+      - name: prepare shared self-signed cert
+        run: |
+          docker run --rm -v /tmp/ntr-interop:/w -w /w alpine sh -c \
+            'apk add -q openssl >/dev/null 2>&1; openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 -nodes -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" >/dev/null 2>&1; cp cert.pem ca.pem'
       - name: run ${{ matrix.script }}
         run: |
           chmod +x /tmp/ntr-interop/ntr-linux
