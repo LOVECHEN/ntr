@@ -6,9 +6,11 @@ NET=ixgs; PFX=ixgs-; D=/tmp/ntr-interop; NTR=${NTR_BIN:-$D/ntr}
 CURL=curlimages/curl:latest
 cleanup(){ docker ps -aq --filter "name=$PFX"|xargs -r docker rm -f >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 wait_log(){ local i; for i in $(seq 1 $(( ${3:-20} * 2 ))); do docker logs "$1" 2>&1|grep -q "$2" && return 0; sleep 0.5; done; return 1; }
+# 优先用宿主原生 curl(CI runner / macOS 都有;比 docker-in-docker curl 稳),失败退 docker
+fetch(){ command -v curl >/dev/null 2>&1 && curl -fsSL --max-time 60 -o "$1" "$2" 2>/dev/null && [ -s "$1" ] && return 0; docker run --rm --network host -v $D:/w $CURL -fsSL --max-time 60 -o "/w/$(basename "$1")" "$2" 2>/dev/null; [ -s "$1" ]; }
 if [ ! -s "$D/geosite.dat" ]; then
-  docker run --rm --network host -v $D:/w $CURL -sL -o /w/geosite.dat \
-    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat" 2>/dev/null
+  fetch "$D/geosite.dat" "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat" ||
+  fetch "$D/geosite.dat" "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat"
 fi
 [ -s "$D/geosite.dat" ] || { echo "  [下载 geosite.dat 失败]  FAIL"; echo DONE; exit 0; }
 cleanup; docker network create $NET >/dev/null 2>&1

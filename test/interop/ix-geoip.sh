@@ -7,12 +7,12 @@ NET=ixgeo; PFX=ixgeo-; D=/tmp/ntr-interop; NTR=${NTR_BIN:-$D/ntr}
 CURL=curlimages/curl:latest
 cleanup(){ docker ps -aq --filter "name=$PFX"|xargs -r docker rm -f >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 wait_log(){ local i; for i in $(seq 1 $(( ${3:-20} * 2 ))); do docker logs "$1" 2>&1|grep -q "$2" && return 0; sleep 0.5; done; return 1; }
+# 优先宿主原生 curl(CI runner / macOS 都有),失败退 docker
+fetch(){ command -v curl >/dev/null 2>&1 && curl -fsSL --max-time 60 -o "$1" "$2" 2>/dev/null && [ -s "$1" ] && return 0; docker run --rm --network host -v $D:/w $CURL -fsSL --max-time 60 -o "/w/$(basename "$1")" "$2" 2>/dev/null; [ -s "$1" ]; }
 # 下载 GeoLite2-Country.mmdb(LOVECHEN 镜像;失败退 P3TERX)
 if [ ! -s "$D/geoip.mmdb" ]; then
-  docker run --rm --network host -v $D:/w $CURL -sL -o /w/geoip.mmdb \
-    "https://github.com/LOVECHEN/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb" 2>/dev/null
-  [ -s "$D/geoip.mmdb" ] || docker run --rm --network host -v $D:/w $CURL -sL -o /w/geoip.mmdb \
-    "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb" 2>/dev/null
+  fetch "$D/geoip.mmdb" "https://github.com/LOVECHEN/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb" ||
+  fetch "$D/geoip.mmdb" "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb"
 fi
 [ -s "$D/geoip.mmdb" ] || { echo "  [下载 geoip.mmdb 失败]  FAIL"; echo DONE; exit 0; }
 cleanup; docker network create $NET >/dev/null 2>&1
