@@ -33,21 +33,25 @@ start_cli(){ docker rm -f ${PFX}c >/dev/null 2>&1; docker run -d --name ${PFX}c 
 S(){ docker inspect ${PFX}s --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null; }
 
 echo "=== A. max-conns=2 ==="
-start_srv "max-conns: 2"; start_cli; sleep 8
-# 2 条慢下载(占 2 连接)
-for i in 1 2; do docker run -d --name ${PFX}dl$i --network $NET curlimages/curl:latest -s --max-time 60 --limit-rate 150k -x socks5h://${PFX}c:1080 http://${PFX}big/f -o /dev/null >/dev/null 2>&1; done
-sleep 8
-# 第 3 条:应被拒
-r3=$(docker run --rm --network $NET curlimages/curl:latest -s --max-time 6 -x socks5h://${PFX}c:1080 http://${PFX}who/ 2>/dev/null | grep -c Hostname)
-stats=$(docker run --rm --network $NET curlimages/curl:latest -s --max-time 5 http://$(S):9091/stats 2>/dev/null)
-live=$(echo "$stats" | grep -oE '"conns_live":[0-9]+' | head -1 | grep -oE '[0-9]+')
-rej=$(echo "$stats" | grep -oE '"rejected":[0-9]+' | head -1 | grep -oE '[0-9]+')
-a=FAIL; [ "$r3" = 0 ] && [ "${rej:-0}" -ge 1 ] && a=PASS
-echo "  第3条接入=$([ "$r3" = 0 ] && echo 被拒 || echo 通过)  conns_live=$live  rejected=${rej:-0}   [max-conns=2 拒新]  $a"
-docker rm -f ${PFX}dl1 ${PFX}dl2 >/dev/null 2>&1
+start_srv "max-conns: 2"; start_cli; sleep 6
+# 起 4 条慢下载(远超 max-conns=2)—— 超额的必被拒。判据看累计 rejected≥1 + 活跃≤2,
+# 不依赖"恰好2条同时 live"这种脆弱时序(旧写法在 CI/本地都偶发 conns_live=1 假失败)。
+docker run -d --name ${PFX}dl --network $NET curlimages/curl:latest sh -c "for i in 1 2 3 4 5 6; do curl -s --max-time 40 --limit-rate 60k -x socks5h://${PFX}c:1080 http://${PFX}big/f -o /dev/null & done; wait" >/dev/null 2>&1
+# 轮询到出现拒绝(max-conns 生效的确定信号)或超时
+rej=0; live=0
+for _ in $(seq 1 30); do
+  stats=$(docker run --rm --network $NET curlimages/curl:latest -s --max-time 4 http://$(S):9091/stats 2>/dev/null)
+  rej=$(echo "$stats" | grep -oE '"rejected":[0-9]+' | head -1 | grep -oE '[0-9]+')
+  live=$(echo "$stats" | grep -oE '"conns_live":[0-9]+' | head -1 | grep -oE '[0-9]+')
+  [ "${rej:-0}" -ge 1 ] && break
+  sleep 1
+done
+a=FAIL; [ "${rej:-0}" -ge 1 ] && [ "${live:-0}" -le 2 ] && a=PASS
+echo "  4条并发/上限2 → 被拒=${rej:-0}  活跃=${live:-0}(≤2)   [max-conns 拒超额]  $a"
+docker rm -f ${PFX}dl >/dev/null 2>&1
 
 echo "=== B. rate=16mbps(≈2MiB/s),下载 20MiB ==="
-start_srv 'rate: 16mbps'; start_cli; sleep 2
+start_srv 'rate: 16mbps'; start_cli; sleep 5
 spd=$(docker run --rm --network $NET curlimages/curl:latest -s --max-time 40 -x socks5h://${PFX}c:1080 http://${PFX}big/f -o /dev/null -w '%{speed_download}' 2>/dev/null)
 spd=${spd%.*}
 b=FAIL; [ -n "$spd" ] && [ "$spd" -ge 1400000 ] && [ "$spd" -le 3200000 ] && b=PASS
