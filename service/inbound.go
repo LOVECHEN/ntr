@@ -49,6 +49,7 @@ type ProxyInbound struct {
 	Out   OutboundResolver
 	Meter *meter.Registry // 非 nil = 开启按用户计量(承 §5);nil = 关闭、零成本
 	Gates []*meter.Gate   // 全局 + 每口连接闸/限速(承 §6.2 层1/2;可空)
+	Sniff bool            // 开启域名嗅探:IP 目标 peek 首包 SNI/Host 解真域名再分流(承 §10.4.2)
 	// Fallback:回落伪装站目标 host:port(非空才开)。协议握手失败(错凭据/畸形/非协议探测)时,不 RST/报错,
 	// 而是把【握手已消费的原始字节 + 后续流】中继到该真站 —— 主动探测/直连浏览器只看到一个正常网站(抗探测)。
 	// 禁改协议线格式:回落只是握手失败后的行为,不碰任何协议帧。发生在传输层(如 TLS)之上,故 dest 收到的是
@@ -312,6 +313,17 @@ func (h *ProxyInbound) HandleStream(ctx context.Context, s link.Stream, md *endp
 
 	if req.Network == endpoint.NetworkUDP { // 归一化网络判 UDP,不看协议私有 Command
 		return h.relayPacket(ctx, hs, req)
+	}
+
+	// 域名嗅探:目标只是 IP 时,peek 首包从 SNI/Host 解出真域名 → 覆盖路由目标(命中 domain/geosite/rule-set);
+	// replay 流保住已读的首包字节交给下游 relay,零丢失。已带域名的目标不嗅(省一次 peek)。
+	if h.Sniff && req.Dst.IsIP() {
+		proto, domain, replay, fail := sniff(hs, sniffTimeout)
+		md.SetSniff(proto, domain, fail)
+		hs = replay
+		if domain != "" {
+			req.Dst = addr.FromFqdn(domain, req.Dst.Port)
+		}
 	}
 
 	out, err := h.Out.Resolve(ctx, req.Dst)

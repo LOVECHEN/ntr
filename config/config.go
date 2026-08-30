@@ -169,6 +169,7 @@ type Inbound struct {
 	TLS           map[string]any   `yaml:"tls"`
 	Obfs          string           `yaml:"obfs"` // hysteria1 salamander 混淆口令(可空)
 	Outbound      string           `yaml:"outbound"`
+	Sniff         bool             `yaml:"sniff"`          // 开启域名嗅探:IP 目标 peek 首包 SNI/Host 解真域名再分流(承 §10.4.2)
 	ControlDomain string           `yaml:"control-domain"` // type=portal:Bridge 连接的注册域(默认 reverse.ntr)
 	AssignAddress string           `yaml:"assign-address"` // type=connect-ip:下发给客户端的隧道内地址(CIDR)
 	MTU           int              `yaml:"mtu"`            // type=connect-ip / type=tun
@@ -1265,6 +1266,7 @@ func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver servi
 		return nil, nil, fmt.Errorf("config: 入站 %s:%w", in.Listen, err)
 	}
 	handler.Fallback = in.Fallback // 回落伪装站(空=不开)
+	handler.Sniff = in.Sniff       // 域名嗅探(false=不开;IP 目标 peek 首包 SNI/Host 解真域名再分流)
 	for _, r := range in.Fallbacks {
 		handler.Fallbacks = append(handler.Fallbacks, service.FallbackRule{SNI: r.SNI, ALPN: r.ALPN, Path: r.Path, Dest: r.Dest, Xver: r.Xver})
 	}
