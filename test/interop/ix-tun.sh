@@ -6,7 +6,7 @@
 # 需 -tags with_tun 的 ntr-tun 二进制;容器需 --cap-add NET_ADMIN + /dev/net/tun。
 set -u
 NET=ix-tun; PFX=ixtun-; D=/tmp/ntr-interop
-NTR=${NTR_BIN:-$D/ntr}; NTRTUN=${NTRTUN_BIN:-$D/ntr-tun}
+NTR=${NTR_BIN:-$D/ntr}; NTRTUN=${NTRTUN_BIN:-$D/ntr}  # $D/ntr 已带 with_tun tag,无单独 ntr-tun 时复用它(CI artifact 只产 ntr)
 cleanup(){ docker ps -aq --filter "name=$PFX" | xargs -r docker rm -f >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 cleanup; docker network create $NET >/dev/null 2>&1
 

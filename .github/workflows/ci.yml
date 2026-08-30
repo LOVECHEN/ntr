@@ -86,7 +86,7 @@ jobs:
       - name: prepare shared self-signed cert
         run: |
           docker run --rm -v /tmp/ntr-interop:/w -w /w alpine sh -c \
-            'apk add -q openssl >/dev/null 2>&1; openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 -nodes -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" >/dev/null 2>&1; cp cert.pem ca.pem; chmod 644 cert.pem key.pem ca.pem'
+            'apk add -q openssl >/dev/null 2>&1; openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 397 -nodes -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1; cp cert.pem ca.pem; chmod 644 cert.pem key.pem ca.pem'
       - name: run ${{ matrix.script }}
         run: |
           mkdir -p /tmp/ntr-interop
