@@ -19,7 +19,8 @@ var _ endpoint.Outbound = Outbound{}
 
 // Outbound 是直连出站。零值可用;Dialer 可注入超时/本地地址/Control 等策略。
 type Outbound struct {
-	Dialer net.Dialer
+	Dialer   net.Dialer
+	FullCone bool // UDP 用 unconnected 单端口收发任意对端(endpoint-independent 映射 = full-cone NAT)
 }
 
 // DialStream 拨 TCP 到 dst(域名交系统解析器)。
@@ -34,6 +35,15 @@ func (o Outbound) DialStream(ctx context.Context, dst addr.Socksaddr) (link.Stre
 // DialPacket 拨 UDP 到 dst,返回单目标 PacketConn(连接式 UDP:内核只收发该对端)。
 // 多目标(SOCKS UDP ASSOCIATE / TUN)由上游 udpnat 拆成多条单目标 assoc,不在此。
 func (o Outbound) DialPacket(ctx context.Context, dst addr.Socksaddr) (link.PacketConn, error) {
+	if o.FullCone {
+		// unconnected UDP:一个本地端口收发任意对端 → endpoint-independent 映射(full-cone NAT)。
+		// dst 首包只为路由/占位,实际每包按 b 的 dst 发;回包 ReadPacket 返回真实来源(上游据此回写 client)。
+		uc, err := net.ListenUDP("udp", nil)
+		if err != nil {
+			return nil, err
+		}
+		return &fullConeConn{UDPConn: uc}, nil
+	}
 	conn, err := o.Dialer.DialContext(ctx, "udp", dst.String())
 	if err != nil {
 		return nil, err
@@ -72,6 +82,38 @@ func (c *udpConn) WritePacket(b *buf.Buffer, _ addr.Socksaddr) error {
 
 // Close/LocalAddr/SetDeadline 由内嵌 *net.UDPConn 提供。
 func (c *udpConn) Unwrap() any { return c.UDPConn }
+
+// fullConeConn 是 unconnected UDP 出站(full-cone NAT):一个本地端口收发任意对端。WritePacket 按每包 dst 发,
+// ReadPacket 返回【真实来源】—— 上游 udpnat 据此把回包带正确来源回写 client,实现 endpoint-independent 映射。
+type fullConeConn struct {
+	*net.UDPConn
+}
+
+var _ link.PacketConn = (*fullConeConn)(nil)
+
+// FullCone 是能力标记:udpnat 据此复用【单个】socket 服务全会话多目标(而非 per-target 建连),
+// 从而同一外部端口对任意目标/来源可达 —— 这正是 full-cone 的语义。
+func (c *fullConeConn) FullCone() {}
+
+func (c *fullConeConn) WritePacket(b *buf.Buffer, dst addr.Socksaddr) error {
+	ua, err := net.ResolveUDPAddr("udp", dst.String())
+	if err != nil {
+		return err
+	}
+	_, err = c.WriteToUDP(b.Bytes(), ua)
+	return err
+}
+
+func (c *fullConeConn) ReadPacket(b *buf.Buffer) (addr.Socksaddr, error) {
+	n, src, err := c.ReadFromUDPAddrPort(b.ExtendTail(b.Tailroom()))
+	if err != nil {
+		return addr.Socksaddr{}, err
+	}
+	b.Truncate(n)
+	return addr.FromIPPort(src), nil
+}
+
+func (c *fullConeConn) Unwrap() any { return c.UDPConn }
 
 // connStream 把 *net.TCPConn 抬成 link.Stream。它是链底,Unwrap 返回底层 net.Conn
 // 供能力发现(如需 splice/ReadFrom 时向下探到裸 *net.TCPConn)。

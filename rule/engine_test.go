@@ -22,6 +22,29 @@ func naiveRoute(rules []Rule, def string, dst addr.Socksaddr) string {
 }
 
 func ruleMatches(r *Rule, dst addr.Socksaddr) bool {
+	if r.Op != "" { // 组合规则:递归求值(naive 参照,对拍 Engine 的 evaluator)
+		var res bool
+		if r.Op == "and" {
+			res = true
+			for i := range r.Sub {
+				if !ruleMatches(&r.Sub[i], dst) {
+					res = false
+					break
+				}
+			}
+		} else { // or
+			for i := range r.Sub {
+				if ruleMatches(&r.Sub[i], dst) {
+					res = true
+					break
+				}
+			}
+		}
+		if r.Not {
+			res = !res
+		}
+		return res
+	}
 	if dst.IsFqdn() {
 		host := normDomain(dst.Fqdn)
 		for _, d := range r.Domain {
@@ -77,8 +100,9 @@ func TestEngineMatchesNaive(t *testing.T) {
 	genCIDR := func() string {
 		return fmt.Sprintf("%d.%d.0.0/%d", rng.Intn(256), rng.Intn(256), 8+rng.Intn(17))
 	}
-	genRule := func() Rule {
-		r := Rule{To: targets[rng.Intn(len(targets))]}
+	// genLeaf 生成一个恰好一个维度的叶子规则(无 To,可作子规则)。
+	genLeaf := func() Rule {
+		r := Rule{}
 		switch rng.Intn(5) {
 		case 0:
 			for k := 0; k < 1+rng.Intn(2); k++ {
@@ -96,6 +120,28 @@ func TestEngineMatchesNaive(t *testing.T) {
 			}
 		case 4:
 			r.Port = []uint16{uint16(rng.Intn(4)) * 100} // 0/100/200/300
+		}
+		return r
+	}
+	// genRule 生成顶层规则:2/3 叶子、1/3 组合(and/or,可 Not,子规则含 1/4 概率嵌套组合)。
+	genRule := func() Rule {
+		to := targets[rng.Intn(len(targets))]
+		if rng.Intn(3) != 0 {
+			r := genLeaf()
+			r.To = to
+			return r
+		}
+		r := Rule{To: to, Op: []string{"and", "or"}[rng.Intn(2)], Not: rng.Intn(2) == 0}
+		for k := 0; k < 1+rng.Intn(3); k++ {
+			if rng.Intn(4) == 0 { // 嵌套组合子规则
+				sub := Rule{Op: []string{"and", "or"}[rng.Intn(2)], Not: rng.Intn(2) == 0}
+				for m := 0; m < 1+rng.Intn(2); m++ {
+					sub.Sub = append(sub.Sub, genLeaf())
+				}
+				r.Sub = append(r.Sub, sub)
+			} else {
+				r.Sub = append(r.Sub, genLeaf())
+			}
 		}
 		return r
 	}
@@ -192,6 +238,202 @@ func TestEngineGeoIP(t *testing.T) {
 		dst := addr.FromIPPort(netip.MustParseAddrPort(c.ip + ":80"))
 		if got := eng.Route(dst); got != c.want {
 			t.Errorf("Route(%s)=%q 期望 %q", c.ip, got, c.want)
+		}
+	}
+}
+
+// fakeFinder 是测试用 ProcessFinder:恒返回预置的 name/path/ok(不碰 /proc)。
+type fakeFinder struct {
+	name, path string
+	ok         bool
+}
+
+func (f fakeFinder) FindProcess(string, netip.AddrPort) (string, string, bool) {
+	return f.name, f.path, f.ok
+}
+
+// TestRouteProcess 覆盖 process 规则:name/path 命中、不命中回 default、finder nil / ok=false 不命中、
+// 与 min-ordinal 交互(靠前的 process 规则赢靠后的 domain 规则)。
+func TestRouteProcess(t *testing.T) {
+	dst := addr.FromFqdn("example.com", 443)
+	src := netip.MustParseAddrPort("127.0.0.1:40000")
+
+	// process-name 命中
+	e, err := Compile([]Rule{{ProcessName: []string{"curl"}, To: "proxy"}}, "direct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := e.RouteConn(dst, src, "tcp", fakeFinder{"curl", "/usr/bin/curl", true}); g != "proxy" {
+		t.Errorf("process-name 命中=%q 期望 proxy", g)
+	}
+	// 进程名不同 → default
+	if g := e.RouteConn(dst, src, "tcp", fakeFinder{"wget", "/usr/bin/wget", true}); g != "direct" {
+		t.Errorf("进程名不匹配=%q 期望 direct", g)
+	}
+	// finder=nil → process 规则不参与 → default
+	if g := e.RouteConn(dst, src, "tcp", nil); g != "direct" {
+		t.Errorf("finder nil=%q 期望 direct", g)
+	}
+	// finder ok=false(查不到进程)→ 不命中 → default
+	if g := e.RouteConn(dst, src, "tcp", fakeFinder{"", "", false}); g != "direct" {
+		t.Errorf("finder ok=false=%q 期望 direct", g)
+	}
+
+	// process-path 命中
+	e2, _ := Compile([]Rule{{ProcessPath: []string{"/opt/app/bin/foo"}, To: "vpn"}}, "direct")
+	if g := e2.RouteConn(dst, src, "tcp", fakeFinder{"foo", "/opt/app/bin/foo", true}); g != "vpn" {
+		t.Errorf("process-path 命中=%q 期望 vpn", g)
+	}
+
+	// min-ordinal:process 规则(ord0)在前,应赢 domain 规则(ord1)
+	e3, _ := Compile([]Rule{
+		{ProcessName: []string{"curl"}, To: "byproc"},
+		{Domain: []string{"example.com"}, To: "bydomain"},
+	}, "direct")
+	if g := e3.RouteConn(dst, src, "tcp", fakeFinder{"curl", "/usr/bin/curl", true}); g != "byproc" {
+		t.Errorf("process 在前应赢=%q 期望 byproc", g)
+	}
+	// domain 规则(ord0)在前,进程也匹配(ord1)→ domain 赢
+	e4, _ := Compile([]Rule{
+		{Domain: []string{"example.com"}, To: "bydomain"},
+		{ProcessName: []string{"curl"}, To: "byproc"},
+	}, "direct")
+	if g := e4.RouteConn(dst, src, "tcp", fakeFinder{"curl", "/usr/bin/curl", true}); g != "bydomain" {
+		t.Errorf("domain 在前应赢=%q 期望 bydomain", g)
+	}
+
+	// HasProcess 正确反映
+	if !e.HasProcess() || e4.HasProcess() != true {
+		t.Error("HasProcess 应为 true")
+	}
+	eNoProc, _ := Compile([]Rule{{Domain: []string{"a.com"}, To: "x"}}, "direct")
+	if eNoProc.HasProcess() {
+		t.Error("无 process 规则 HasProcess 应 false")
+	}
+	// Route(纯 dst,无源)不受 process 规则影响
+	if g := e.Route(dst); g != "direct" {
+		t.Errorf("Route 纯 dst=%q 期望 direct(process 不参与)", g)
+	}
+}
+
+// TestRouteLogical 覆盖 and/or/not 组合规则:各算子、嵌套、process 子规则、min-ordinal 交互、校验。
+func TestRouteLogical(t *testing.T) {
+	ff := fakeFinder{"curl", "/usr/bin/curl", true}
+	g443 := addr.FromFqdn("www.google.com", 443)
+	g80 := addr.FromFqdn("www.google.com", 80)
+	other := addr.FromFqdn("example.org", 443)
+	src := netip.MustParseAddrPort("127.0.0.1:40000")
+
+	// AND:域名后缀 google.com 且 端口 443 → proxy
+	eAnd, err := Compile([]Rule{{
+		Op: "and", To: "proxy",
+		Sub: []Rule{{DomainSuffix: []string{"google.com"}}, {Port: []uint16{443}}},
+	}}, "direct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := eAnd.Route(g443); g != "proxy" {
+		t.Errorf("AND 全命中=%q 期望 proxy", g)
+	}
+	if g := eAnd.Route(g80); g != "direct" {
+		t.Errorf("AND 端口不符=%q 期望 direct", g)
+	}
+	if g := eAnd.Route(other); g != "direct" {
+		t.Errorf("AND 域名不符=%q 期望 direct", g)
+	}
+
+	// OR:域名 a 或 b → x
+	eOr, _ := Compile([]Rule{{
+		Op: "or", To: "x",
+		Sub: []Rule{{Domain: []string{"a.com"}}, {Domain: []string{"b.com"}}},
+	}}, "direct")
+	if g := eOr.Route(addr.FromFqdn("a.com", 1)); g != "x" {
+		t.Errorf("OR a=%q 期望 x", g)
+	}
+	if g := eOr.Route(addr.FromFqdn("b.com", 1)); g != "x" {
+		t.Errorf("OR b=%q 期望 x", g)
+	}
+	if g := eOr.Route(addr.FromFqdn("c.com", 1)); g != "direct" {
+		t.Errorf("OR c=%q 期望 direct", g)
+	}
+
+	// NOT:非 cn 后缀 → proxy(NOT(or(domain-suffix cn)))
+	eNot, _ := Compile([]Rule{{
+		Op: "or", Not: true, To: "proxy",
+		Sub: []Rule{{DomainSuffix: []string{"cn"}}},
+	}}, "direct")
+	if g := eNot.Route(addr.FromFqdn("baidu.cn", 1)); g != "direct" {
+		t.Errorf("NOT cn 命中(是cn)=%q 期望 direct", g)
+	}
+	if g := eNot.Route(addr.FromFqdn("google.com", 1)); g != "proxy" {
+		t.Errorf("NOT cn(非cn)=%q 期望 proxy", g)
+	}
+
+	// 嵌套:AND[ OR[domain a, domain b], NOT[port 22] ] → nested
+	eNest, _ := Compile([]Rule{{
+		Op: "and", To: "nested",
+		Sub: []Rule{
+			{Op: "or", Sub: []Rule{{Domain: []string{"a.com"}}, {Domain: []string{"b.com"}}}},
+			{Op: "or", Not: true, Sub: []Rule{{Port: []uint16{22}}}},
+		},
+	}}, "direct")
+	if g := eNest.Route(addr.FromFqdn("a.com", 443)); g != "nested" {
+		t.Errorf("嵌套 a:443=%q 期望 nested", g)
+	}
+	if g := eNest.Route(addr.FromFqdn("a.com", 22)); g != "direct" {
+		t.Errorf("嵌套 a:22(被NOT挡)=%q 期望 direct", g)
+	}
+	if g := eNest.Route(addr.FromFqdn("z.com", 443)); g != "direct" {
+		t.Errorf("嵌套 z:443(OR不中)=%q 期望 direct", g)
+	}
+
+	// 组合里含 process 子规则:AND[ process-name curl, port 443 ] → viaproc
+	eProc, _ := Compile([]Rule{{
+		Op: "and", To: "viaproc",
+		Sub: []Rule{{ProcessName: []string{"curl"}}, {Port: []uint16{443}}},
+	}}, "direct")
+	if g := eProc.RouteConn(g443, src, "tcp", ff); g != "viaproc" {
+		t.Errorf("AND+process 命中=%q 期望 viaproc", g)
+	}
+	if g := eProc.RouteConn(g443, src, "tcp", fakeFinder{"wget", "/usr/bin/wget", true}); g != "direct" {
+		t.Errorf("AND+process 进程不符=%q 期望 direct", g)
+	}
+	// 纯 dst Route(无 finder):process 子规则不命中 → AND 失败 → default
+	if g := eProc.Route(g443); g != "direct" {
+		t.Errorf("Route 无源 process 子规则应不命中=%q 期望 direct", g)
+	}
+
+	// min-ordinal:组合规则(ord0)赢后面的叶子(ord1)
+	eMix, _ := Compile([]Rule{
+		{Op: "and", To: "bycombo", Sub: []Rule{{DomainSuffix: []string{"google.com"}}, {Port: []uint16{443}}}},
+		{DomainSuffix: []string{"google.com"}, To: "byleaf"},
+	}, "direct")
+	if g := eMix.Route(g443); g != "bycombo" {
+		t.Errorf("组合在前应赢=%q 期望 bycombo", g)
+	}
+	// 叶子(ord0)在前赢组合(ord1)
+	eMix2, _ := Compile([]Rule{
+		{DomainSuffix: []string{"google.com"}, To: "byleaf"},
+		{Op: "and", To: "bycombo", Sub: []Rule{{DomainSuffix: []string{"google.com"}}, {Port: []uint16{443}}}},
+	}, "direct")
+	if g := eMix2.Route(g443); g != "byleaf" {
+		t.Errorf("叶子在前应赢=%q 期望 byleaf", g)
+	}
+
+	// 校验错误
+	bad := []struct {
+		name string
+		r    Rule
+	}{
+		{"op非法", Rule{Op: "xor", To: "x", Sub: []Rule{{Domain: []string{"a"}}}}},
+		{"sub空", Rule{Op: "and", To: "x"}},
+		{"组合带叶子维度", Rule{Op: "and", To: "x", Port: []uint16{1}, Sub: []Rule{{Domain: []string{"a"}}}}},
+		{"子规则带to", Rule{Op: "and", To: "x", Sub: []Rule{{Domain: []string{"a"}, To: "nope"}}}},
+		{"子规则多维度", Rule{Op: "and", To: "x", Sub: []Rule{{Domain: []string{"a"}, Port: []uint16{1}}}}},
+	}
+	for _, tc := range bad {
+		if _, err := Compile([]Rule{tc.r}, "direct"); err == nil {
+			t.Errorf("校验 %q 应报错但没有", tc.name)
 		}
 	}
 }

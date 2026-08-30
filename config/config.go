@@ -108,10 +108,19 @@ type RuleSpec struct {
 	DomainKeyword []string `yaml:"domain-keyword"` // 域名子串
 	IPCIDR        []string `yaml:"ip-cidr"`        // CIDR(仅对 IP 目标)
 	Port          []uint16 `yaml:"port"`           // 目标端口
+	Network       []string `yaml:"network"`        // 传输层网络(tcp/udp)
 	GeoIP         []string `yaml:"geoip"`          // geoip 国码(如 [CN,US];仅对 IP 目标;需 routing.geoip-path)
 	GeoSite       []string `yaml:"geosite"`        // geosite 类目(如 [google,cn];仅对域名目标;需 routing.geosite-path)
 	RuleSet       []string `yaml:"rule-set"`       // 引用 rule-providers 里的规则集名(按其 behavior 判域名/IP)
-	To            string   `yaml:"to"`             // 命中派发到的出站名
+	ProcessName   []string `yaml:"process-name"`   // 发起进程可执行名(basename,精确;仅对本机入站有意义;仅 Linux)
+	ProcessPath   []string `yaml:"process-path"`   // 发起进程可执行完整路径(精确;仅 Linux)
+
+	// 逻辑组合(and/or/not):op 非空 → 组合规则,叶子维度须空、sub 为子规则列表、not 取反。
+	Op  string     `yaml:"op"`  // and / or
+	Sub []RuleSpec `yaml:"sub"` // 子规则(叶子或嵌套组合;不带 to)
+	Not bool       `yaml:"not"` // 组合结果取反
+
+	To string `yaml:"to"` // 命中派发到的出站名(组合规则也用)
 }
 
 // MetricsSpec 是 metrics: 配置块(承设计 §5,MVP)。listen 非空 → 开启按用户计量 + HTTP 快照/控制端点。
@@ -204,6 +213,7 @@ type Outbound struct {
 	SNI         string           `yaml:"sni"`
 	Obfs        string           `yaml:"obfs"` // hysteria1 salamander 混淆口令(可空)
 	Insecure    bool             `yaml:"insecure"`
+	FullCone    bool             `yaml:"full-cone"`          // type=direct:UDP 用 unconnected 单端口(endpoint-independent = full-cone NAT)
 	User        string           `yaml:"user"`               // ssh 登录用户(默认 root)
 	PrivateKey  string           `yaml:"private-key"`        // ssh 出站私钥 PEM(与 secret 密码二选一)
 	HostKey     string           `yaml:"host-key"`           // ssh 出站固定服务端 host key(authorized_keys 单行,可空)
@@ -493,55 +503,80 @@ func buildRouter(ctx context.Context, spec *RoutingSpec, outs map[string]endpoin
 		}
 		providers[ps.Name] = &ruleset.Provider{Name: ps.Name, Behavior: ps.Behavior, Path: ps.Path, URL: ps.URL, Detour: det}
 	}
-	// 有 geoip 规则则打开 IP 库(一次,共享给所有 geoip 规则)。geoip-path 兼容两大格式:
-	// .dat 后缀 → V2Ray/Xray geoip.dat(protobuf);其余 → MaxMind mmdb。二者都产出 rule.IPSet,引擎无感。
-	var geoSetFor func([]string) (rule.IPSet, error)
-	for _, rs := range spec.Rules {
-		if len(rs.GeoIP) > 0 {
-			if spec.GeoIPPath == "" {
-				return nil, fmt.Errorf("config: 用了 geoip 规则但缺 routing.geoip-path(mmdb 或 V2Ray geoip.dat 路径)")
+	// walkSpecs 递归遍历规则及其组合子规则(用于 geoip/geosite 是否被用到的探测,含 sub)。
+	var walkSpecs func([]RuleSpec, func(RuleSpec))
+	walkSpecs = func(rs []RuleSpec, fn func(RuleSpec)) {
+		for _, r := range rs {
+			fn(r)
+			if len(r.Sub) > 0 {
+				walkSpecs(r.Sub, fn)
 			}
-			if strings.HasSuffix(strings.ToLower(spec.GeoIPPath), ".dat") {
-				db, err := geo.OpenGeoIPDat(spec.GeoIPPath)
-				if err != nil {
-					return nil, err
-				}
-				geoSetFor = db.CountrySet
-			} else {
-				db, err := geo.OpenGeoIP(spec.GeoIPPath)
-				if err != nil {
-					return nil, err
-				}
-				geoSetFor = func(codes []string) (rule.IPSet, error) { return db.CountrySet(codes), nil }
-			}
-			break
 		}
 	}
-	// 有 geosite 规则则打开 geosite.dat(一次,共享)。
-	var siteDB *geo.GeoSiteDB
-	for _, rs := range spec.Rules {
-		if len(rs.GeoSite) > 0 {
-			if spec.GeoSitePath == "" {
-				return nil, fmt.Errorf("config: 用了 geosite 规则但缺 routing.geosite-path(geosite.dat 路径)")
-			}
-			db, err := geo.OpenGeoSite(spec.GeoSitePath)
+	// 有 geoip 规则(含组合子规则里的)则打开 IP 库(一次,共享)。geoip-path 兼容两大格式:
+	// .dat 后缀 → V2Ray/Xray geoip.dat(protobuf);其余 → MaxMind mmdb。二者都产出 rule.IPSet,引擎无感。
+	var geoSetFor func([]string) (rule.IPSet, error)
+	needGeoIP := false
+	walkSpecs(spec.Rules, func(r RuleSpec) {
+		if len(r.GeoIP) > 0 {
+			needGeoIP = true
+		}
+	})
+	if needGeoIP {
+		if spec.GeoIPPath == "" {
+			return nil, fmt.Errorf("config: 用了 geoip 规则但缺 routing.geoip-path(mmdb 或 V2Ray geoip.dat 路径)")
+		}
+		if strings.HasSuffix(strings.ToLower(spec.GeoIPPath), ".dat") {
+			db, err := geo.OpenGeoIPDat(spec.GeoIPPath)
 			if err != nil {
 				return nil, err
 			}
-			siteDB = db
-			break
+			geoSetFor = db.CountrySet
+		} else {
+			db, err := geo.OpenGeoIP(spec.GeoIPPath)
+			if err != nil {
+				return nil, err
+			}
+			geoSetFor = func(codes []string) (rule.IPSet, error) { return db.CountrySet(codes), nil }
 		}
 	}
-	rules := make([]rule.Rule, len(spec.Rules))
-	for i, rs := range spec.Rules {
-		if _, ok := outs[rs.To]; !ok {
-			return nil, fmt.Errorf("config: routing.rules[%d].to %q 未在 outbounds 定义", i, rs.To)
+	// 有 geosite 规则(含组合子规则里的)则打开 geosite.dat(一次,共享)。
+	var siteDB *geo.GeoSiteDB
+	needGeoSite := false
+	walkSpecs(spec.Rules, func(r RuleSpec) {
+		if len(r.GeoSite) > 0 {
+			needGeoSite = true
+		}
+	})
+	if needGeoSite {
+		if spec.GeoSitePath == "" {
+			return nil, fmt.Errorf("config: 用了 geosite 规则但缺 routing.geosite-path(geosite.dat 路径)")
+		}
+		db, err := geo.OpenGeoSite(spec.GeoSitePath)
+		if err != nil {
+			return nil, err
+		}
+		siteDB = db
+	}
+	// specToRule 递归把一条 RuleSpec 转 rule.Rule(组合规则递归 sub;叶子物化 geoip/geosite/rule-set)。
+	var specToRule func(RuleSpec) (rule.Rule, error)
+	specToRule = func(rs RuleSpec) (rule.Rule, error) {
+		if rs.Op != "" { // 组合规则:递归子规则(子规则不带 to、维度校验交 rule.Compile)
+			r := rule.Rule{Op: rs.Op, Not: rs.Not, To: rs.To}
+			for _, sub := range rs.Sub {
+				sr, err := specToRule(sub)
+				if err != nil {
+					return rule.Rule{}, err
+				}
+				r.Sub = append(r.Sub, sr)
+			}
+			return r, nil
 		}
 		var geoSets []rule.IPSet
 		if len(rs.GeoIP) > 0 {
 			set, err := geoSetFor(rs.GeoIP)
 			if err != nil {
-				return nil, fmt.Errorf("config: routing.rules[%d].geoip:%w", i, err)
+				return rule.Rule{}, fmt.Errorf("geoip:%w", err)
 			}
 			geoSets = append(geoSets, set)
 		}
@@ -549,7 +584,7 @@ func buildRouter(ctx context.Context, spec *RoutingSpec, outs map[string]endpoin
 		for _, code := range rs.GeoSite {
 			ds, err := siteDB.DomainSet(code)
 			if err != nil {
-				return nil, fmt.Errorf("config: routing.rules[%d].geosite:%w", i, err)
+				return rule.Rule{}, fmt.Errorf("geosite:%w", err)
 			}
 			siteSets = append(siteSets, ds)
 		}
@@ -557,32 +592,46 @@ func buildRouter(ctx context.Context, spec *RoutingSpec, outs map[string]endpoin
 		for _, name := range rs.RuleSet {
 			pv, ok := providers[name]
 			if !ok {
-				return nil, fmt.Errorf("config: routing.rules[%d].rule-set 引用未定义 provider %q", i, name)
+				return rule.Rule{}, fmt.Errorf("rule-set 引用未定义 provider %q", name)
 			}
 			if pv.Behavior == "ipcidr" {
 				ips, err := pv.LoadIP(ctx)
 				if err != nil {
-					return nil, err
+					return rule.Rule{}, err
 				}
 				geoSets = append(geoSets, ips)
 			} else {
 				ds, err := pv.LoadDomain(ctx)
 				if err != nil {
-					return nil, err
+					return rule.Rule{}, err
 				}
 				siteSets = append(siteSets, ds)
 			}
 		}
-		rules[i] = rule.Rule{
+		return rule.Rule{
 			Domain:        rs.Domain,
 			DomainSuffix:  rs.DomainSuffix,
 			DomainKeyword: rs.DomainKeyword,
 			IPCIDR:        rs.IPCIDR,
 			Port:          rs.Port,
+			Network:       rs.Network,
 			GeoIP:         geoSets,
 			GeoSite:       siteSets,
+			ProcessName:   rs.ProcessName,
+			ProcessPath:   rs.ProcessPath,
 			To:            rs.To,
+		}, nil
+	}
+	rules := make([]rule.Rule, len(spec.Rules))
+	for i, rs := range spec.Rules {
+		if _, ok := outs[rs.To]; !ok { // 顶层规则的 to 必须是已定义出站(子规则 to 空,不校验)
+			return nil, fmt.Errorf("config: routing.rules[%d].to %q 未在 outbounds 定义", i, rs.To)
 		}
+		r, err := specToRule(rs)
+		if err != nil {
+			return nil, fmt.Errorf("config: routing.rules[%d]:%w", i, err)
+		}
+		rules[i] = r
 	}
 	return rule.Compile(rules, spec.Default)
 }
@@ -611,7 +660,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		case "select", "urltest", "fallback", "load-balance":
 			pendingGroups = append(pendingGroups, o) // 见出站 loop 后的第二趟
 		case "direct", "":
-			outs[o.Name] = direct.Outbound{}
+			outs[o.Name] = direct.Outbound{FullCone: o.FullCone}
 		case "dns":
 			dnsOutboundNames = append(dnsOutboundNames, o.Name) // 延迟(见出站 loop 后)
 		case "block":
@@ -787,6 +836,9 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		if dnsResolver != nil { // fake-ip 反查:伪 IP dst 路由前换回域名(未启用 fake-ip 时 FakeIPToDomain 恒 false,无害)
 			router.Fake = dnsResolver.FakeIPToDomain
 		}
+		if eng.HasProcess() { // 有 process 规则才装进程反查器(读 /proc,仅 Linux;其他平台优雅降级不命中)
+			router.Finder = service.NewProcessFinder()
+		}
 	}
 
 	var insts []Instance
@@ -811,6 +863,9 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		var resolver service.OutboundResolver = service.StaticOutbound{Out: out}
 		if router != nil {
 			resolver = router
+			// 会话式 / TUN / tproxy / redirect / tunnel 持 endpoint.Outbound(非 resolver),
+			// 用适配器让它们也经规则引擎分流 + fake-ip 反查(TUN/tproxy 只见 IP 的流量按域名分流)。
+			out = service.NewResolverOutbound(router)
 		}
 
 		var handler endpoint.InboundHandler

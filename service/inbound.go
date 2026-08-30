@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
 
 	"github.com/LOVECHEN/ntr/addr"
@@ -27,6 +28,55 @@ import (
 // OutboundResolver 把逻辑目标解析到一个出站(分流的最小面;完整 route.Engine 后续接入)。
 type OutboundResolver interface {
 	Resolve(ctx context.Context, dst addr.Socksaddr) (endpoint.Outbound, error)
+}
+
+// ConnResolver 是【带源上下文】的可选路由接口:实现者可据 client 源地址反查发起进程(process 规则)。
+// HandleStream 优先用之;未实现的解析器(如 StaticOutbound)自动退回 OutboundResolver.Resolve。
+type ConnResolver interface {
+	ResolveConn(ctx context.Context, dst addr.Socksaddr, src netip.AddrPort, network string) (endpoint.Outbound, error)
+}
+
+// resolveOut 优先走 ConnResolver(带 src,供 process 规则);否则退回纯 dst 的 Resolve。
+func resolveOut(ctx context.Context, r OutboundResolver, dst addr.Socksaddr, src netip.AddrPort, network string) (endpoint.Outbound, error) {
+	if cr, ok := r.(ConnResolver); ok {
+		return cr.ResolveConn(ctx, dst, src, network)
+	}
+	return r.Resolve(ctx, dst)
+}
+
+// NewResolverOutbound 把 OutboundResolver 适配成 endpoint.Outbound:每次拨号按 dst 现查规则引擎
+// 选出站再委托。供【持 endpoint.Outbound 而非 resolver】的入站(TUN/tproxy/redirect/tunnel/会话式)
+// 也享规则分流 + fake-ip 反查 —— 这正是 fake-ip 主用例(TUN/tproxy 只见 IP 的流量按域名分流)所需。
+func NewResolverOutbound(r OutboundResolver) endpoint.Outbound { return resolverOutbound{r: r} }
+
+type resolverOutbound struct{ r OutboundResolver }
+
+var _ endpoint.Outbound = resolverOutbound{}
+
+func (o resolverOutbound) DialStream(ctx context.Context, dst addr.Socksaddr) (link.Stream, error) {
+	out, err := resolveOut(ctx, o.r, dst, netip.AddrPort{}, "tcp")
+	if err != nil {
+		return nil, err
+	}
+	return out.DialStream(ctx, dst)
+}
+
+func (o resolverOutbound) DialPacket(ctx context.Context, dst addr.Socksaddr) (link.PacketConn, error) {
+	out, err := resolveOut(ctx, o.r, dst, netip.AddrPort{}, "udp")
+	if err != nil {
+		return nil, err
+	}
+	return out.DialPacket(ctx, dst)
+}
+
+// srcAddrPort 取 client 连接的源地址(process 规则据此反查发起进程);取不到返回零值。
+func srcAddrPort(s link.Stream) netip.AddrPort {
+	if ra := s.RemoteAddr(); ra != nil {
+		if ap, err := netip.ParseAddrPort(ra.String()); err == nil {
+			return ap
+		}
+	}
+	return netip.AddrPort{}
 }
 
 // StaticOutbound 恒返回同一个出站(单出站部署 / 测试用)。
@@ -326,7 +376,8 @@ func (h *ProxyInbound) HandleStream(ctx context.Context, s link.Stream, md *endp
 		}
 	}
 
-	out, err := h.Out.Resolve(ctx, req.Dst)
+	// process 规则:用最外层 client 连接的源地址(s,非 sniff 包装后的 hs)反查发起进程。
+	out, err := resolveOut(ctx, h.Out, req.Dst, srcAddrPort(s), "tcp")
 	if err != nil {
 		_ = hs.Close()
 		return err
