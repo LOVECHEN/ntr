@@ -71,15 +71,13 @@ t_socks5_server(){
 # 2. SOCKS5 客户端(NTR socks 出站)—— NTR 未实现 socks Client,预期 config 构建失败
 # =========================================================================
 t_socks5_client(){
-  echo "── [2] SOCKS5 client (NTR→对端) ──"
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "ixh-whoami:80", secret: "", layers: [{type: socks}]}\n' > ix-s5cli.yaml
-  out=$(docker run --rm --network $NET -v $NTR:/ntr:ro -v $D/ix-s5cli.yaml:/c.yaml:ro -e NTR_DEBUG=1 alpine /ntr -config /c.yaml 2>&1 | head -5)
-  if echo "$out" | grep -qi "proxy.Client\|不能作出站\|not.*client"; then
-    echo "  ⛔ NTR socks 出站不支持(设计:socks 仅 proxy.Server,无 Client)"
-    echo "     └ $(echo "$out"|tr '\n' ' '|cut -c1-140)"
-  else
-    echo "  ?? 预期失败但未见断言错误: $(echo "$out"|tr '\n' ' '|cut -c1-140)"
-  fi
+  echo "── [2] SOCKS5 client (NTR socks 出站 → 上游 socks) ──"
+  # NTR SOCKS5 出站(proxy.Client,601f42b:SOCKS5 出站 + UDP ASSOCIATE):NTR 作 socks 客户端连
+  # 上游 socks 服务端(复用 [1] 的 ixh-s5srv)→ 落地。socks 出站已实现,此处正向验证其可用。
+  docker ps --format '{{.Names}}'|grep -q '^ixh-s5srv$' || { printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}\noutbounds: [{name: direct, type: direct}]\n' > ix-s5srv.yaml; ntr_up ixh-s5srv ix-s5srv.yaml; sleep 1; }
+  printf 'inbounds:\n  - {listen: 0.0.0.0:2080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "ixh-s5srv:1080", layers: [{type: socks}]}\n' > ix-s5cli.yaml
+  ntr_up ixh-s5cli ix-s5cli.yaml; sleep 1
+  judge "$(docker run --rm --network $NET $CURL -s --max-time 10 -x socks5h://ixh-s5cli:2080 http://ixh-whoami/ 2>&1)" "NTR socks 出站 → 上游 NTR socks 入站 → whoami"
 }
 
 # =========================================================================
