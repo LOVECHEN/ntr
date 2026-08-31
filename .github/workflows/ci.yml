@@ -34,6 +34,8 @@ jobs:
         run: |
           mkdir -p out
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags "http2legacy with_tun" -o out/ntr-linux ./cmd/ntr
+          # connect-ip 是可选特性(with_connectip),单独产 ntr-l3 供 connect-ip 类脚本(ix-masque-mihomo 等)用
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags "http2legacy with_tun with_connectip" -o out/ntr-l3 ./cmd/ntr
           for h in udpecho udpclient udpprobe; do
             CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "out/$h" "test/interop/helpers/$h.go"
           done
@@ -90,7 +92,7 @@ jobs:
       - name: run ${{ matrix.script }}
         run: |
           mkdir -p /tmp/ntr-interop
-          chmod +x /tmp/ntr-interop/ntr-linux /tmp/ntr-interop/udpecho /tmp/ntr-interop/udpclient /tmp/ntr-interop/udpprobe 2>/dev/null || true
+          chmod +x /tmp/ntr-interop/ntr-linux /tmp/ntr-interop/ntr-l3 /tmp/ntr-interop/udpecho /tmp/ntr-interop/udpclient /tmp/ntr-interop/udpprobe 2>/dev/null || true
           cp /tmp/ntr-interop/ntr-linux /tmp/ntr-interop/ntr
           log=/tmp/ntr-interop/${{ matrix.script }}.log
           NTR_BIN=/tmp/ntr-interop/ntr timeout 1200 bash "test/interop/${{ matrix.script }}.sh" 2>&1 | tee "$log" || true
