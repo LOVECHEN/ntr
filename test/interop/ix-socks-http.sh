@@ -8,6 +8,40 @@ NET=ix-sh
 NTR=$D/ntr
 CURL="curlimages/curl:latest"
 
+# ---------- 自包含内联生成 python 助手 ----------
+# CI 每个 ix-*.sh 是隔离 job,$D 里只有 workflow 放的 ntr binary + cert,没有前序产物。
+# 不内联则 docker run -v $D/xxx.py 把「不存在的单文件」挂成空目录 → python: can't find '__main__' module。
+cat > $D/udpecho.py <<'UDPECHO'
+import socket
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('0.0.0.0',9999))
+while True:
+    d,a=s.recvfrom(4096); s.sendto(d,a)
+UDPECHO
+cat > $D/ix-socksudp.py <<'SOCKSUDP'
+import socket,struct,sys
+# argv: proxy_host target_host [msg]
+proxy=(sys.argv[1],1080); target=(sys.argv[2],9999)
+msg=(sys.argv[3] if len(sys.argv)>3 else 'PINGUDP-socks-42').encode()
+tcp=socket.create_connection(proxy,timeout=6)
+tcp.sendall(b'\x05\x01\x00')
+if tcp.recv(2)!=b'\x05\x00': print('greet fail'); sys.exit(2)
+tcp.sendall(b'\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00')
+r=tcp.recv(10)
+if r[1]!=0: print('associate fail',r); sys.exit(3)
+bnd_ip=socket.inet_ntoa(r[4:8]); bnd_port=struct.unpack('>H',r[8:10])[0]
+if bnd_ip in ('0.0.0.0','127.0.0.1'): bnd_ip=proxy[0]
+udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); udp.settimeout(6)
+th=target[0].encode()
+pkt=b'\x00\x00\x00\x03'+bytes([len(th)])+th+struct.pack('>H',target[1])+msg
+udp.sendto(pkt,(bnd_ip,bnd_port))
+data,_=udp.recvfrom(4096)
+atyp=data[3]
+off=10 if atyp==1 else (22 if atyp==4 else 4+1+data[4]+2)
+payload=data[off:]
+print('GOT',payload)
+sys.exit(0 if payload==msg else 1)
+SOCKSUDP
+
 # ---------- 基础设施 ----------
 setup(){
   docker network create $NET >/dev/null 2>&1
