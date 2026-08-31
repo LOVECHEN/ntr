@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/LOVECHEN/ntr/outbound/upstream"
 	"net"
 	"net/http"
 	"net/netip"
@@ -214,6 +215,7 @@ type Outbound struct {
 	Obfs        string           `yaml:"obfs"` // hysteria1 salamander 混淆口令(可空)
 	Insecure    bool             `yaml:"insecure"`
 	FullCone    bool             `yaml:"full-cone"`          // type=direct:UDP 用 unconnected 单端口(endpoint-independent = full-cone NAT)
+	Dialer      string           `yaml:"dialer"`             // relay 多跳/dialerProxy:底层连接经此具名 stream 出站(多级链天然支持)
 	User        string           `yaml:"user"`               // ssh 登录用户(默认 root)
 	PrivateKey  string           `yaml:"private-key"`        // ssh 出站私钥 PEM(与 secret 密码二选一)
 	HostKey     string           `yaml:"host-key"`           // ssh 出站固定服务端 host key(authorized_keys 单行,可空)
@@ -478,6 +480,65 @@ func buildOneGroup(o Outbound, members []group.Member) (*group.Group, error) {
 		TestURL: o.URL, Interval: interval, Tolerance: o.Tolerance,
 		LBHash: o.LB == "consistent-hashing" || o.LB == "hash",
 	})
+}
+
+// wireDialers 实现 relay 多跳/dialerProxy:把配了 dialer 的 stream 出站的底层拨号接到另一具名出站。
+// 全部出站建好后第二趟设 BaseDial(闭包运行时查 outs → 天然支持多级链 A→B→C);先做环检测。
+func wireDialers(specs []Outbound, outs map[string]endpoint.Outbound) error {
+	edge := map[string]string{}
+	for _, o := range specs {
+		if o.Dialer != "" {
+			edge[o.Name] = o.Dialer
+		}
+	}
+	for start := range edge { // 环检测:沿单出边走,重复即环
+		seen := map[string]bool{}
+		for n := start; n != ""; n = edge[n] {
+			if seen[n] {
+				return fmt.Errorf("config: dialer 链成环(涉及出站 %q)", n)
+			}
+			seen[n] = true
+		}
+	}
+	for _, o := range specs {
+		if o.Dialer == "" {
+			continue
+		}
+		if _, ok := outs[o.Dialer]; !ok {
+			return fmt.Errorf("config: 出站 %q 的 dialer %q 未定义", o.Name, o.Dialer)
+		}
+		p, ok := outs[o.Name].(*upstream.Outbound)
+		if !ok {
+			return fmt.Errorf("config: 出站 %q 非 stream 类,不支持 dialer(会话式协议自管连接)", o.Name)
+		}
+		dst, err := parseDialTarget(p.Server)
+		if err != nil {
+			return fmt.Errorf("config: 出站 %q 的 dialer 上游地址 %q 非法: %w", o.Name, p.Server, err)
+		}
+		name := o.Dialer
+		// BaseDial 收 host:port 字符串(dialBase 传入的是 p.Server);经具名 dialer 出站拨到该上游。
+		p.BaseDial = func(ctx context.Context, server string) (link.Stream, error) {
+			return outs[name].DialStream(ctx, dst)
+		}
+	}
+	return nil
+}
+
+// parseDialTarget 把 "host:port" 拆成 Socksaddr(IP→FromIPPort,域名→FromFqdn),
+// 与 mtproto/snell/ruleset 等处既有解析范式一致;供 relay dialer 链在建栈期解析上游地址。
+func parseDialTarget(server string) (addr.Socksaddr, error) {
+	host, portStr, err := net.SplitHostPort(server)
+	if err != nil {
+		return addr.Socksaddr{}, err
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return addr.Socksaddr{}, fmt.Errorf("端口 %q 非法: %w", portStr, err)
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return addr.FromIPPort(netip.AddrPortFrom(ip, uint16(port))), nil
+	}
+	return addr.FromFqdn(host, uint16(port)), nil
 }
 
 // buildRouter 把 routing: 块编译成 rule.Engine:转换规则、校验 default 与每条 to 均为已定义出站
@@ -826,6 +887,10 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 
 	// 规则分流引擎(承 §8.3):有 routing: 块 → 编译规则表,所有代理入站按目标(域名/IP/端口)分流,
 	// 首个命中生效、末尾 default 兜底。无则退回每口 outbound: 静态绑定。
+	// relay 多跳/dialerProxy:全部出站建好后接线 dialer 链(设 BaseDial)+ 环检测
+	if err := wireDialers(f.Outbounds, outs); err != nil {
+		return nil, err
+	}
 	var router *service.RuleRouter
 	if f.Routing != nil {
 		eng, err := buildRouter(ctx, f.Routing, outs)
