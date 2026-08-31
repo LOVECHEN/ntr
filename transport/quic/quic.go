@@ -22,7 +22,9 @@ import (
 	"time"
 
 	mquic "github.com/metacubex/quic-go"
+	hyCC "github.com/metacubex/sing-quic/hysteria2/congestion"
 	mtls "github.com/metacubex/tls"
+	"github.com/sagernet/sing/common/logger"
 
 	"github.com/LOVECHEN/ntr/core/link"
 	"github.com/LOVECHEN/ntr/core/spec"
@@ -35,21 +37,27 @@ const defaultALPN = "h3" // sing-box v2rayquic 默认 ALPN
 
 // Config 是 QUIC 传输配置。客户端 SNI+Insecure;服务端 CertPEM/KeyPEM(留空 → 自签,dev/测试)。ALPN 默认 h3。
 type Config struct {
-	SNI      string
-	Insecure bool
-	CertPEM  string
-	KeyPEM   string
-	ALPN     string
+	SNI        string
+	Insecure   bool
+	CertPEM    string
+	KeyPEM     string
+	ALPN       string
+	Congestion string // "brutal" = 用 Hysteria Brutal 定速拥塞控制(需 up/down-mbps);空=quic-go 默认(cubic/bbr)
+	UpMbps     uint64 // Brutal 上行带宽(Mbps);客户端发送速率
+	DownMbps   uint64 // Brutal 下行带宽(Mbps);服务端发送速率
 }
 
 // Parse 从哑节点解出 Config。
 func Parse(n *spec.Node) (Config, error) {
 	return Config{
-		SNI:      n.Get("sni").Str(),
-		Insecure: n.Get("insecure").Bool(),
-		CertPEM:  fileOrStr(n, "cert"),
-		KeyPEM:   fileOrStr(n, "key"),
-		ALPN:     n.Get("alpn").Str(),
+		SNI:        n.Get("sni").Str(),
+		Insecure:   n.Get("insecure").Bool(),
+		CertPEM:    fileOrStr(n, "cert"),
+		KeyPEM:     fileOrStr(n, "key"),
+		ALPN:       n.Get("alpn").Str(),
+		Congestion: n.Get("congestion").Str(),
+		UpMbps:     uint64(n.Get("up-mbps").Int(0)),
+		DownMbps:   uint64(n.Get("down-mbps").Int(0)),
 	}, nil
 }
 
@@ -57,11 +65,13 @@ func fileOrStr(n *spec.Node, k string) string { return n.Get(k).Str() }
 
 // Transport 是 QUIC 传输句柄。
 type Transport struct {
-	sni      string
-	insecure bool
-	alpn     string
-	cert     *mtls.Certificate // 服务端证书(nil → ListenBase 时自签)
-	certErr  error
+	sni        string
+	insecure   bool
+	alpn       string
+	cert       *mtls.Certificate // 服务端证书(nil → ListenBase 时自签)
+	certErr    error
+	brutalUp   uint64 // Brutal 客户端发送速率(bps);0=不启用
+	brutalDown uint64 // Brutal 服务端发送速率(bps);0=不启用
 }
 
 // Build 构造 Transport。
@@ -71,6 +81,10 @@ func Build(_ context.Context, cfg Config, _ any) (any, error) {
 		alpn = defaultALPN
 	}
 	t := &Transport{sni: cfg.SNI, insecure: cfg.Insecure, alpn: alpn}
+	if cfg.Congestion == "brutal" { // 通用 Brutal 开关:Mbps → bps(×1e6/8),客户端用 up、服务端用 down
+		t.brutalUp = cfg.UpMbps * 125000
+		t.brutalDown = cfg.DownMbps * 125000
+	}
 	if cfg.CertPEM != "" && cfg.KeyPEM != "" {
 		c, err := mtls.X509KeyPair([]byte(cfg.CertPEM), []byte(cfg.KeyPEM))
 		if err != nil {
@@ -99,6 +113,9 @@ func (t *Transport) DialBase(ctx context.Context, server string) (link.Stream, e
 	if err != nil {
 		_ = pc.Close()
 		return nil, err
+	}
+	if t.brutalUp > 0 { // 通用 Brutal:客户端发送用 Hysteria Brutal 定速拥塞控制(复用 sing-quic BrutalSender)
+		conn.SetCongestionControl(hyCC.NewBrutalSender(t.brutalUp, false, logger.NOP()))
 	}
 	st, err := conn.OpenStreamSync(ctx)
 	if err != nil {
@@ -133,17 +150,18 @@ func (t *Transport) ListenBase(ctx context.Context, listen string) (transport.Ba
 		_ = pc.Close()
 		return nil, err
 	}
-	l := &quicListener{ln: ln, pc: pc, ch: make(chan link.Stream, 16), done: make(chan struct{})}
+	l := &quicListener{ln: ln, pc: pc, ch: make(chan link.Stream, 16), done: make(chan struct{}), brutalDown: t.brutalDown}
 	go l.acceptLoop()
 	return l, nil
 }
 
 // quicListener 多路展平:每个 QUIC conn 的多条流都平摊进 ch,由 Accept 逐一取出交正常代理栈。
 type quicListener struct {
-	ln   *mquic.Listener
-	pc   net.PacketConn
-	ch   chan link.Stream
-	done chan struct{}
+	ln         *mquic.Listener
+	pc         net.PacketConn
+	ch         chan link.Stream
+	done       chan struct{}
+	brutalDown uint64 // Brutal 服务端发送速率(bps);0=不启用
 }
 
 func (l *quicListener) acceptLoop() {
@@ -157,6 +175,9 @@ func (l *quicListener) acceptLoop() {
 }
 
 func (l *quicListener) acceptStreams(conn *mquic.Conn) {
+	if l.brutalDown > 0 { // 通用 Brutal:服务端发送用 Hysteria Brutal 定速拥塞控制
+		conn.SetCongestionControl(hyCC.NewBrutalSender(l.brutalDown, false, logger.NOP()))
+	}
 	for {
 		st, err := conn.AcceptStream(context.Background())
 		if err != nil {
