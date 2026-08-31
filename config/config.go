@@ -197,6 +197,8 @@ type Inbound struct {
 	Address       []string         `yaml:"address"`        // type=tun:TUN 网卡地址 CIDR(至少一个)
 	IfName        string           `yaml:"if-name"`        // type=tun:接口名(空=平台默认)
 	DNSHijack     []string         `yaml:"dns-hijack"`     // type=tun:劫持的 DNS 目标(如 ["any:53"] 或 "10.0.0.1:53"),就地由内置 resolver 应答
+	AutoRoute     bool             `yaml:"auto-route"`     // type=tun:自动配 split-default 路由导流入 tun(footgun,仅 Linux + CAP_NET_ADMIN + iproute2)
+	RouteExclude  []string         `yaml:"route-exclude"`  // type=tun:auto-route 时经原网关直连的 IP(每个 proxy 出站的 server 地址,防回环)
 	Target        string           `yaml:"target"`         // type=tunnel:固定目标 host:port
 	Network       []string         `yaml:"network"`        // type=tunnel/tproxy:tcp/udp(空=两者)
 	Limits        *LimitsSpec      `yaml:"limits"`         // 每口限制(承设计 §6.2 层2:单口隔离)
@@ -1067,7 +1069,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			if len(hijack) > 0 && dnsResolver == nil {
 				return nil, fmt.Errorf("config: 入站 tun 用了 dns-hijack,但未启用 dns:(需 dns.enabled=true 提供 resolver)")
 			}
-			inb, err := tun.NewInbound(tun.Options{Name: in.IfName, Address: in.Address, MTU: in.MTU, Resolver: dnsResolver, HijackDNS: hijack}, out)
+			inb, err := tun.NewInbound(tun.Options{Name: in.IfName, Address: in.Address, MTU: in.MTU, Resolver: dnsResolver, HijackDNS: hijack, AutoRoute: in.AutoRoute, RouteExclude: in.RouteExclude}, out)
 			if err != nil {
 				return nil, fmt.Errorf("config: 入站 tun:%w", err)
 			}

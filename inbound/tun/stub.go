@@ -17,11 +17,13 @@ var ErrNotBuilt = errors.New("tun: 本二进制未编入 TUN 支持(需 -tags wi
 
 // Options 与真实现同名同字段。
 type Options struct {
-	Name      string
-	Address   []string
-	MTU       int
-	Resolver  route.Resolver
-	HijackDNS []netip.AddrPort
+	Name         string
+	Address      []string
+	MTU          int
+	Resolver     route.Resolver
+	HijackDNS    []netip.AddrPort
+	AutoRoute    bool
+	RouteExclude []string
 }
 
 // Inbound 占位。

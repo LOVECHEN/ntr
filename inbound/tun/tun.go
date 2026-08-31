@@ -25,11 +25,13 @@ import (
 
 // Options 是 TUN 入站配置(与 stub.go 同名同字段,两态可链接)。
 type Options struct {
-	Name      string           // 接口名;空 = 平台默认(linux ntr-tun0)
-	Address   []string         // TUN 网卡地址 CIDR(如 10.9.9.1/24);至少一个
-	MTU       int              // 默认 1500
-	Resolver  route.Resolver   // 非 nil 且 HijackDNS 命中 → DNS 就地应答(不走出站),防 DNS 泄漏
-	HijackDNS []netip.AddrPort // 劫持的 DNS 目标;含 unspecified:53 = 任意 :53(空=不劫持)
+	Name         string           // 接口名;空 = 平台默认(linux ntr-tun0)
+	Address      []string         // TUN 网卡地址 CIDR(如 10.9.9.1/24);至少一个
+	MTU          int              // 默认 1500
+	Resolver     route.Resolver   // 非 nil 且 HijackDNS 命中 → DNS 就地应答(不走出站),防 DNS 泄漏
+	HijackDNS    []netip.AddrPort // 劫持的 DNS 目标;含 unspecified:53 = 任意 :53(空=不劫持)
+	AutoRoute    bool             // 自动配 split-default 路由把流量导入 tun(footgun,仅 Linux,需 CAP_NET_ADMIN + iproute2)
+	RouteExclude []string         // auto-route 时经原网关直连的 IP(每个 proxy 出站的 server 地址,防回环)
 }
 
 // Inbound 是 TUN 入站,自身即 netstack.Handler。
@@ -75,6 +77,14 @@ func (h *Inbound) Run(ctx context.Context, _ string) error {
 	dev, err := openDevice(deviceName(h.opts.Name), mtu, primary)
 	if err != nil {
 		return err
+	}
+	if h.opts.AutoRoute { // 自动把默认流量导入 tun(split-default + 排除代理服务器 IP);footgun,失败即中止
+		undo, aerr := autoRoute(deviceName(h.opts.Name), h.opts.RouteExclude)
+		if aerr != nil {
+			_ = dev.Close()
+			return fmt.Errorf("tun auto-route:%w", aerr)
+		}
+		defer undo()
 	}
 	st, err := netstack.New(dev, netstack.Options{MTU: mtu, Addresses: prefixes}, h)
 	if err != nil {
