@@ -64,7 +64,7 @@ func (c *fakePC) Unwrap() any                   { return nil }
 // TestExchangeAndCache:Exchange 解出应答;同名再查命中缓存(上游只被拨一次)。
 func TestExchangeAndCache(t *testing.T) {
 	var calls atomic.Int64
-	r, err := New([]Nameserver{{Tag: "fake", Address: "udp://1.1.1.1:53", Detour: fakeUpstream{calls: &calls}}}, "race", nil, nil)
+	r, err := New([]Nameserver{{Tag: "fake", Address: "udp://1.1.1.1:53", Detour: fakeUpstream{calls: &calls}}}, nil, "race", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestExchangeAndCache(t *testing.T) {
 // TestLookup:Lookup 返回 A 地址。
 func TestLookup(t *testing.T) {
 	var calls atomic.Int64
-	r, _ := New([]Nameserver{{Tag: "fake", Address: "udp://1.1.1.1:53", Detour: fakeUpstream{calls: &calls}}}, "race", nil, nil)
+	r, _ := New([]Nameserver{{Tag: "fake", Address: "udp://1.1.1.1:53", Detour: fakeUpstream{calls: &calls}}}, nil, "race", nil, nil)
 	addrs, err := r.Lookup(context.Background(), "example.com", route.StratV4Only)
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)

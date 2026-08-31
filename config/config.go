@@ -140,6 +140,7 @@ type DNSSpec struct {
 	Detour      string              `yaml:"detour"`   // 未写 detour 的 nameserver 默认出站(必具名)
 	Strategy    string              `yaml:"strategy"` // race(默认)| sequential
 	Nameservers []NameserverSpec    `yaml:"nameservers"`
+	Policies    []NameserverPolicySpec `yaml:"nameserver-policy"` // 按域名选上游(不同域名走不同 DNS 上游)
 	Hosts       map[string][]string `yaml:"hosts"`   // 静态 host→IP,命中不走上游(也防这些域名 DNS 泄漏)
 	FakeIP      *FakeIPSpec         `yaml:"fake-ip"` // fake-ip:给域名发伪 IP,让只见 IP 的连接也能按域名分流
 }
@@ -159,6 +160,15 @@ type NameserverSpec struct {
 	SNI      string `yaml:"sni"`      // DoT/DoH:TLS ServerName(可空→取地址 host)
 	Insecure bool   `yaml:"insecure"` // DoT/DoH:跳过证书校验
 	Detour   string `yaml:"detour"`
+}
+
+// NameserverPolicySpec 是一条 nameserver-policy:域名维度(任一命中)→ 命中时用的上游 tag 子集
+// (引用 nameservers 里的 tag;让不同域名走不同 DNS 上游,对齐 mihomo nameserver-policy)。
+type NameserverPolicySpec struct {
+	Domain        []string `yaml:"domain"`         // 精确域名
+	DomainSuffix  []string `yaml:"domain-suffix"`  // 域名后缀(标签边界)
+	DomainKeyword []string `yaml:"domain-keyword"` // 域名子串
+	Nameserver    []string `yaml:"nameserver"`     // 命中用的上游 tag(≥1)
 }
 
 // Bridge 是一个反连隧道:经 Portal 出站(任意代理)拨到公网 Portal,把用户流量反向复用
@@ -321,7 +331,16 @@ func buildResolver(spec *DNSSpec, outs map[string]endpoint.Outbound) (route.Reso
 	if err != nil {
 		return nil, err
 	}
-	return dns.New(nss, spec.Strategy, hosts, fake)
+	var policies []dns.NameserverPolicy
+	for _, pol := range spec.Policies {
+		policies = append(policies, dns.NameserverPolicy{
+			Domain:        pol.Domain,
+			DomainSuffix:  pol.DomainSuffix,
+			DomainKeyword: pol.DomainKeyword,
+			Nameservers:   pol.Nameserver,
+		})
+	}
+	return dns.New(nss, policies, spec.Strategy, hosts, fake)
 }
 
 // parseFakeIP 把 config 的 fake-ip 块解析成 *dns.FakeIPConfig(未启用→nil)。默认 v4 198.18.0.0/15。

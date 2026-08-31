@@ -91,7 +91,7 @@ func TestFakeIPRecycleFIFO(t *testing.T) {
 
 func TestResolverExchangeFakeIPRoundTrip(t *testing.T) {
 	r, err := New([]Nameserver{{Tag: "up", Address: "udp://1.1.1.1:53", Detour: fakeUpstream{calls: new(atomic.Int64)}}},
-		"race", nil, &FakeIPConfig{Inet4: netip.MustParsePrefix("198.18.0.0/15")})
+		nil, "race", nil, &FakeIPConfig{Inet4: netip.MustParsePrefix("198.18.0.0/15")})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -35,8 +35,15 @@ const (
 
 type plan struct {
 	nameservers []*upstream
+	policies    []policyRule // 按域名选上游(nameserver-policy);空=全走 nameservers
 	strategy    strat
 	hosts       *hostsMap // 静态 host→IP,命中不走上游
+}
+
+// policyRule 是一条 nameserver-policy 的运行时形态:域名匹配命中 → 只用 ups 上游子集(而非默认全表)。
+type policyRule struct {
+	m   *domainMatcher
+	ups []*upstream
 }
 
 // Resolver 实现 route.Resolver。
@@ -58,7 +65,7 @@ type Nameserver struct {
 }
 
 // buildPlan 把 Nameserver 配置解析成运行时 plan(解析承载 + 地址)。
-func buildPlan(nss []Nameserver, strategy string, hosts map[string][]netip.Addr) (*plan, error) {
+func buildPlan(nss []Nameserver, policies []NameserverPolicy, strategy string, hosts map[string][]netip.Addr) (*plan, error) {
 	if len(nss) == 0 {
 		return nil, errors.New("dns: 至少需一个 nameserver")
 	}
@@ -72,6 +79,7 @@ func buildPlan(nss []Nameserver, strategy string, hosts map[string][]netip.Addr)
 		return nil, fmt.Errorf("dns: 未知 strategy %q(仅 race/sequential)", strategy)
 	}
 	var ups []*upstream
+	byTag := make(map[string]*upstream, len(nss))
 	for _, ns := range nss {
 		if ns.Detour == nil {
 			return nil, fmt.Errorf("dns: nameserver %q 缺 detour 出站(绝不隐式直连)", ns.Tag)
@@ -83,13 +91,20 @@ func buildPlan(nss []Nameserver, strategy string, hosts map[string][]netip.Addr)
 		u.tag = ns.Tag
 		u.detour = ns.Detour
 		ups = append(ups, &u)
+		if ns.Tag != "" {
+			byTag[ns.Tag] = &u
+		}
 	}
-	return &plan{nameservers: ups, strategy: st, hosts: newHosts(hosts)}, nil
+	prs, err := buildPolicies(policies, byTag)
+	if err != nil {
+		return nil, err
+	}
+	return &plan{nameservers: ups, policies: prs, strategy: st, hosts: newHosts(hosts)}, nil
 }
 
 // New 建解析器。fake 非 nil 则启用 fake-ip(伪 IP 映射跨 reload 存活)。
-func New(nameservers []Nameserver, strategy string, hosts map[string][]netip.Addr, fake *FakeIPConfig) (*Resolver, error) {
-	pl, err := buildPlan(nameservers, strategy, hosts)
+func New(nameservers []Nameserver, policies []NameserverPolicy, strategy string, hosts map[string][]netip.Addr, fake *FakeIPConfig) (*Resolver, error) {
+	pl, err := buildPlan(nameservers, policies, strategy, hosts)
 	if err != nil {
 		return nil, err
 	}
@@ -102,8 +117,8 @@ func New(nameservers []Nameserver, strategy string, hosts map[string][]netip.Add
 }
 
 // Reload 原子换代(全热:in-flight 查询跑完旧代,缓存跨代存活)。
-func (r *Resolver) Reload(nameservers []Nameserver, strategy string, hosts map[string][]netip.Addr) error {
-	pl, err := buildPlan(nameservers, strategy, hosts)
+func (r *Resolver) Reload(nameservers []Nameserver, policies []NameserverPolicy, strategy string, hosts map[string][]netip.Addr) error {
+	pl, err := buildPlan(nameservers, policies, strategy, hosts)
 	if err != nil {
 		return err
 	}
@@ -144,7 +159,11 @@ func (r *Resolver) Exchange(ctx context.Context, q *route.Message) (*route.Messa
 			return &route.Message{Raw: cached}, nil
 		}
 	}
-	resp, err := p.exchange(ctx, q.Raw)
+	name := ""
+	if ok {
+		name = key.name
+	}
+	resp, err := p.exchange(ctx, q.Raw, name)
 	if err != nil {
 		return nil, err
 	}
@@ -156,11 +175,12 @@ func (r *Resolver) Exchange(ctx context.Context, q *route.Message) (*route.Messa
 	return &route.Message{Raw: resp}, nil
 }
 
-// exchange 按策略向上游发查询。
-func (p *plan) exchange(ctx context.Context, raw []byte) ([]byte, error) {
+// exchange 按策略向上游发查询;上游子集由 upstreamsFor(name) 决定(policy 命中→子集,否则全表)。
+func (p *plan) exchange(ctx context.Context, raw []byte, name string) ([]byte, error) {
+	ups := p.upstreamsFor(name)
 	if p.strategy == stratSequential {
 		var last error
-		for _, u := range p.nameservers {
+		for _, u := range ups {
 			resp, err := u.query(ctx, raw)
 			if err == nil {
 				return resp, nil
@@ -176,9 +196,9 @@ func (p *plan) exchange(ctx context.Context, raw []byte) ([]byte, error) {
 		raw []byte
 		err error
 	}
-	ch := make(chan res, len(p.nameservers))
+	ch := make(chan res, len(ups))
 	var wg sync.WaitGroup
-	for _, u := range p.nameservers {
+	for _, u := range ups {
 		wg.Add(1)
 		go func(u *upstream) {
 			defer wg.Done()
