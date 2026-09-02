@@ -1261,9 +1261,26 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			pi.Gates = gates
 			if metricReg != nil { // 按用户计量 + 每用户限额
 				pi.Meter = metricReg
-				for j, u := range in.Users {
-					if lim, ok := parseUserLimits(u); ok {
-						metricReg.SetLimits(cred.UserBase+cred.ID(j)+1, lim)
+				if binds := bindingsByInbound[in.inboundName()]; len(binds) > 0 {
+					// 第4章路径:顶层 users 脱糖的 LimitRef → SetLimits(BillID 数字句柄;同 BillID 共享,只设一次)
+					seen := make(map[cred.ID]bool, len(binds))
+					for _, b := range binds {
+						if b.Limit == nil {
+							continue
+						}
+						id := billIDs[b.BillID]
+						if seen[id] {
+							continue
+						}
+						seen[id] = true
+						metricReg.SetLimits(id, meter.Limits{MaxConns: int64(b.Limit.MaxConns), Rate: float64(b.Limit.Rate), MaxIPs: int(b.Limit.MaxIPs)})
+					}
+				} else {
+					// 兼容垫片:旧口内 users(身份 UserBase+j+1)
+					for j, u := range in.Users {
+						if lim, ok := parseUserLimits(u); ok {
+							metricReg.SetLimits(cred.UserBase+cred.ID(j)+1, lim)
+						}
 					}
 				}
 			}
