@@ -26,6 +26,7 @@ import (
 	"github.com/LOVECHEN/ntr/core/cred"
 	"github.com/LOVECHEN/ntr/core/endpoint"
 	"github.com/LOVECHEN/ntr/core/link"
+	"github.com/LOVECHEN/ntr/core/principal"
 	"github.com/LOVECHEN/ntr/core/proxy"
 	"github.com/LOVECHEN/ntr/core/route"
 	"github.com/LOVECHEN/ntr/core/spec"
@@ -70,6 +71,7 @@ type File struct {
 	Metrics   *MetricsSpec `yaml:"metrics"` // 计量与可观测(承设计 §5;按用户流量 + 连接数,HTTP 快照)
 	Limits    *LimitsSpec  `yaml:"limits"`  // 全局限制(承设计 §6.2 层1:护机器 fd/带宽)
 	Routing   *RoutingSpec `yaml:"routing"` // 规则分流引擎(承设计 §8.3;按目标域名/IP/端口选出站,首个命中)
+	Users     []User       `yaml:"users"`   // 顶层用户集中式(第4章):权限白名单 on + keys 按协议/口;Desugar 脱糖成 CredBinding。空=无按人认证(纯面板模式凭据全走 API)
 
 	// Reg 是运行时注入的计量注册表(非 YAML)。热重载:调用方设它以跨代复用同一 Registry;Build 会写回。
 	Reg *meter.Registry `yaml:"-"`
@@ -182,6 +184,7 @@ type Bridge struct {
 // Inbound 是一个入站:监听地址 + 底→顶层栈 + 用户 + 路由到哪个出站。
 // Type 空/"proxy" = 流式栈模型;"anytls" 等 = 会话式协议(不走栈)。
 type Inbound struct {
+	Name          string           `yaml:"name"`   // 口名(第4章):users[].on/off 引用它,BillID=<user>@<口名>;缺省用 listen 兜底
 	Listen        string           `yaml:"listen"`
 	Type          string           `yaml:"type"`
 	Layers        []map[string]any `yaml:"layers"`
@@ -204,6 +207,30 @@ type Inbound struct {
 	Limits        *LimitsSpec      `yaml:"limits"`         // 每口限制(承设计 §6.2 层2:单口隔离)
 	Fallback      string           `yaml:"fallback"`       // 回落伪装站 host:port:协议握手失败时把连接中继到该真站(抗探测)
 	Fallbacks     []FallbackSpec   `yaml:"fallbacks"`      // 多站回落:按 ALPN + HTTP path 前缀选伪装站(对齐 xray fallbacks;非空优先于 fallback)
+}
+
+// inboundName 口名:name 字段;缺省用 listen 兜底(旧格式无 name 的口仍可被 users 引用)。
+func (in Inbound) inboundName() string {
+	if in.Name != "" {
+		return in.Name
+	}
+	return in.Listen
+}
+
+// authProto 该口的 per-user 认证协议(= 栈顶协议名,供 Desugar 按栈取密钥,§4.4 规则 3)。
+// 当前只接流式栈(空/proxy/portal):取 layers 最后一层 type。空 = 不产 per-user binding。
+// 会话式(anytls/hysteria2/tuic…)各自持 users map、未接 cred/meter(蓝图世界 C),暂返空;
+// 多层认证(shadowtls 外层)待 Descriptor 自报 + 传输层参与 auth(蓝图骨头 4),当前单层。
+func (in Inbound) authProto() string {
+	switch in.Type {
+	case "", "proxy", "portal":
+		if n := len(in.Layers); n > 0 {
+			if t, _ := in.Layers[n-1]["type"].(string); t != "" {
+				return t
+			}
+		}
+	}
+	return ""
 }
 
 // FallbackSpec 是一条多站回落规则(对齐 xray fallbacks 的 name/alpn/path/dest)。
@@ -933,6 +960,33 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		g := g
 		insts = append(insts, Instance{Listen: "group:" + g.Name(), Run: g.HealthLoop})
 	}
+	// 第4章:顶层 users 脱糖成各口 CredBinding(纯函数,见 desugar.go)。口名缺省 listen 兜底;
+	// 认证协议 = 栈顶协议名(单层;多层待骨头 4)。canonical 留到每口建栈后(那时 CredentialCodec 才可用)。
+	inboundNames := make(map[string]bool, len(f.Inbounds))
+	stackProtos := make(map[string][]string, len(f.Inbounds))
+	for i := range f.Inbounds {
+		name := f.Inbounds[i].inboundName()
+		if name == "" {
+			continue // 无 listen 无 name 的口(tun):不进凭据体系
+		}
+		if inboundNames[name] {
+			return nil, fmt.Errorf("config: 入站口名重复 %q (E-INBOUND-DUP)", name)
+		}
+		inboundNames[name] = true
+		if p := f.Inbounds[i].authProto(); p != "" {
+			stackProtos[name] = []string{p}
+		}
+	}
+	bindings, err := Desugar(f.Users, inboundNames, stackProtos, func(_, secret string) ([]byte, error) { return []byte(secret), nil })
+	if err != nil {
+		return nil, err
+	}
+	bindingsByInbound := make(map[string][]principal.CredBinding, len(bindings))
+	for _, b := range bindings {
+		bindingsByInbound[b.Inbound] = append(bindingsByInbound[b.Inbound], b)
+	}
+	billIDs := make(map[string]cred.ID) // BillID → 运行时数字句柄;同 BillID(轮换平行 binding)共享一个
+
 	for i, in := range f.Inbounds {
 		if in.Listen == "" && in.Type != "tun" { // tun 无监听端口,靠接口名
 			return nil, fmt.Errorf("config: 入站 #%d 缺 listen", i)
@@ -957,7 +1011,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		var handler endpoint.InboundHandler
 		switch in.Type {
 		case "", "proxy":
-			h, base, err := f.buildProxyInbound(ctx, in, resolver)
+			h, base, err := f.buildProxyInbound(ctx, in, resolver, bindingsByInbound[in.inboundName()], billIDs)
 			if err != nil {
 				return nil, err
 			}
@@ -976,7 +1030,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		case "portal":
 			// 反向代理 Portal:复用普通代理入站建栈 + 注册用户,再包成 reverse.Portal
 			// (control-domain 区分 Bridge 控制连接与用户连接)。out 未用(Portal 覆盖 HandleStream)。
-			pin, _, err := f.buildProxyInbound(ctx, in, resolver)
+			pin, _, err := f.buildProxyInbound(ctx, in, resolver, bindingsByInbound[in.inboundName()], billIDs)
 			if err != nil {
 				return nil, err
 			}
@@ -1395,8 +1449,9 @@ func accessAllowed(remoteAddr string, allow []netip.Prefix) bool {
 	return false
 }
 
-// buildProxyInbound 建流式栈入站(BuildInbound + 经 CredentialCodec 注册用户)。
-func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver service.OutboundResolver) (*service.ProxyInbound, transport.BaseTransport, error) {
+// buildProxyInbound 建流式栈入站(BuildInbound + 注册凭据)。凭据来源二选一:顶层 users 脱糖的
+// bindings(第4章,优先);无则退回旧口内 in.Users(兼容垫片,脚本迁完即拆)。
+func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver service.OutboundResolver, bindings []principal.CredBinding, billIDs map[string]cred.ID) (*service.ProxyInbound, transport.BaseTransport, error) {
 	layers, err := toLayerSpecs(in.Layers)
 	if err != nil {
 		return nil, nil, fmt.Errorf("config: 入站 %s:%w", in.Listen, err)
@@ -1413,16 +1468,35 @@ func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver servi
 	}
 	scheme := layers[len(layers)-1].Name
 	if cc, ok := handler.Proxy.(proxy.CredentialCodec); ok {
-		for j, u := range in.Users {
-			secret := userSecret(u)
-			if secret == "" {
-				continue
+		if len(bindings) > 0 {
+			// 第4章路径:每条 binding 每层 canonical(AuthKey)后登记;BillID 映射稳定数字句柄,同 BillID 共享。
+			for _, b := range bindings {
+				id, seen := billIDs[b.BillID]
+				if !seen {
+					id = cred.UserBase + cred.ID(len(billIDs)) + 1
+					billIDs[b.BillID] = id
+				}
+				for _, layer := range b.Layers { // 当前单层(栈顶);多层待传输层参与 auth(骨头 4)
+					key, err := cc.AuthKey(string(layer.Key))
+					if err != nil {
+						return nil, nil, fmt.Errorf("config: 入站 %s 凭据 %s:%w", in.inboundName(), b.BillID, err)
+					}
+					auth.Add(layer.Scheme, key, cred.Ref{ID: id})
+				}
 			}
-			key, err := cc.AuthKey(secret)
-			if err != nil {
-				return nil, nil, fmt.Errorf("config: 入站 %s 用户 #%d:%w", in.Listen, j, err)
+		} else {
+			// 兼容垫片:旧口内 users(身份 = UserBase+j+1,跨口会撞——正是第4章要修的;脚本迁完拆)
+			for j, u := range in.Users {
+				secret := userSecret(u)
+				if secret == "" {
+					continue
+				}
+				key, err := cc.AuthKey(secret)
+				if err != nil {
+					return nil, nil, fmt.Errorf("config: 入站 %s 用户 #%d:%w", in.Listen, j, err)
+				}
+				auth.Add(scheme, key, cred.Ref{ID: cred.UserBase + cred.ID(j) + 1})
 			}
-			auth.Add(scheme, key, cred.Ref{ID: cred.UserBase + cred.ID(j) + 1})
 		}
 	}
 	return handler, base, nil
