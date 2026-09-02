@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -74,8 +75,23 @@ type File struct {
 	Routing   *RoutingSpec `yaml:"routing"` // 规则分流引擎(承设计 §8.3;按目标域名/IP/端口选出站,首个命中)
 	Users     []User       `yaml:"users"`   // 顶层用户集中式(第4章):权限白名单 on + keys 按协议/口;Desugar 脱糖成 CredBinding。空=无按人认证(纯面板模式凭据全走 API)
 
+	MemGuard *MemGuardSpec `yaml:"mem-guard"` // 防 OOM 三道防线(承设计 §6.4bis;SetMemoryLimit + soft 拒新 + hard 踢空闲)
+
 	// Reg 是运行时注入的计量注册表(非 YAML)。热重载:调用方设它以跨代复用同一 Registry;Build 会写回。
 	Reg *meter.Registry `yaml:"-"`
+}
+
+// MemGuardSpec 是防 OOM 治理配置(承设计 §6.4bis)。limit 必填(= debug.SetMemoryLimit 的值,也是 soft/
+// hard 百分比的基数);soft/hard 是 limit 的百分比("80%"/"92%",缺省 80%/92%)。判定读进程 RSS。
+//
+//	mem-guard:
+//	  limit: 1.5gb   # → debug.SetMemoryLimit;GC 逼近时更激进回收
+//	  soft: 80%      # RSS ≥ 此 → 拒新连接(已建立不动)
+//	  hard: 92%      # RSS ≥ 此 → 踢最久空闲连接,直到回落 soft 以下
+type MemGuardSpec struct {
+	Limit string `yaml:"limit"` // 内存预算(1.5gb/512mb/2gib…);必填
+	Soft  string `yaml:"soft"`  // 拒新阈值百分比(默认 80%)
+	Hard  string `yaml:"hard"`  // 踢连接阈值百分比(默认 92%)
 }
 
 // LimitsSpec 是一层限制(全局 limits: 或每口 inbounds[].limits:;承设计 §6.2 层1/2)。
@@ -870,6 +886,17 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 	if f.Metrics != nil && f.Metrics.Listen != "" {
 		metricReg = reg
 	}
+	// mem-guard(防 OOM,§6.4bis):第一道 SetMemoryLimit 立即生效;第二/三道由 memGuard 采样器执行,
+	// 挂到各 ProxyInbound(soft 拒新)+ 一个采样 Instance(hard 踢空闲)。硬阈值踢连接的候选集是 reg 里
+	// 的活连接 —— 计量关闭时踢无可踢(退化为持续拒新,仍安全)。
+	var memGuard *meter.MemGuard
+	if f.MemGuard != nil {
+		mg, err := buildMemGuard(f.MemGuard, reg)
+		if err != nil {
+			return nil, err
+		}
+		memGuard = mg
+	}
 	globalGate, err := buildGate(f.Limits) // 全局连接闸/限速(§6.2 层1;nil=不限)
 	if err != nil {
 		return nil, fmt.Errorf("config: limits:%w", err)
@@ -1153,7 +1180,8 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			if err != nil {
 				return nil, err
 			}
-			if base != nil { // UDP-base(mkcp):自管 UDP 监听 + KCP accept,accept 出的流交 HandleStream
+			h.MemGuard = memGuard // §6.4bis 软阈值拒新(nil 时零成本)
+			if base != nil {      // UDP-base(mkcp):自管 UDP 监听 + KCP accept,accept 出的流交 HandleStream
 				listen := in.Listen
 				insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error {
 					ln, err := base.ListenBase(ctx, listen)
@@ -1172,6 +1200,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			if err != nil {
 				return nil, err
 			}
+			pin.MemGuard = memGuard // §6.4bis 软阈值拒新(nil 时零成本)
 			handler = &reverse.Portal{HS: pin, Control: in.ControlDomain}
 		case "anytls":
 			h, err := buildAnytlsInbound(in, out)
@@ -1365,6 +1394,12 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		insts = append(insts, Instance{Listen: label, Hash: hashOf(b), Run: br.Run})
 	}
 
+	// mem-guard 采样器(开启时):周期采内存 → 置档位(soft 拒新已挂各口;hard 踢空闲)。作为一个 Instance
+	// 跑到 ctx 取消。第一道 SetMemoryLimit 已在 buildMemGuard 里立即施加,不依赖本 Instance。
+	if memGuard != nil {
+		insts = append(insts, Instance{Listen: "mem-guard", Hash: hashOf(f.MemGuard), Run: memGuard.Run})
+	}
+
 	// 计量/控制 HTTP 端点(开启时):默认仅本机可访问,access 白名单显式放开。
 	if metricReg != nil {
 		listen := f.Metrics.Listen
@@ -1373,7 +1408,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			return nil, fmt.Errorf("config: metrics.access:%w", err)
 		}
 		insts = append(insts, Instance{Listen: "metrics:" + listen, Hash: hashOf(f.Metrics), Run: func(ctx context.Context) error {
-			return serveMetrics(ctx, listen, metricReg, allow)
+			return serveMetrics(ctx, listen, metricReg, allow, memGuard)
 		}})
 	}
 
@@ -1389,7 +1424,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 //	POST /disable?id=<credID> 停用凭据(拒新 + 断老,承 §6.5);回执 {"killed":N}
 //	POST /enable?id=<credID>  恢复凭据
 //	POST /kill?conn=<connID>  断单条连接;回执 {"killed":0|1}
-func serveMetrics(ctx context.Context, listen string, reg *meter.Registry, allow []netip.Prefix) error {
+func serveMetrics(ctx context.Context, listen string, reg *meter.Registry, allow []netip.Prefix, memGuard *meter.MemGuard) error {
 	// gate:按客户端源 IP 过白名单;不在则 403(即便 listen 绑 0.0.0.0 也只放白名单)。
 	gate := func(h http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -1451,6 +1486,15 @@ func serveMetrics(ctx context.Context, listen string, reg *meter.Registry, allow
 		}
 		writeKilled(w, reg.KillConn(connID))
 	}))
+	// mem-guard 状态面(§6.4bis.4:必须暴露当前处于哪一档,否则运维只看到"用户连不上"查不出因)。
+	mux.HandleFunc("/memguard", gate(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if memGuard == nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"enabled": false})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(memGuard.Stat())
+	}))
 	srv := &http.Server{Addr: listen, Handler: mux}
 	context.AfterFunc(ctx, func() { _ = srv.Close() })
 	err := srv.ListenAndServe()
@@ -1501,6 +1545,33 @@ func buildGate(l *LimitsSpec) (*meter.Gate, error) {
 		rate = r
 	}
 	return meter.NewGate(l.MaxConns, rate), nil
+}
+
+// buildMemGuard 从 mem-guard 配置建守卫并立即施加第一道防线(debug.SetMemoryLimit)。limit 必填;
+// soft/hard 是 limit 的百分比(缺省 80%/92%),换算成绝对字节交 meter.MemGuard。校验 hard > soft。
+func buildMemGuard(s *MemGuardSpec, reg *meter.Registry) (*meter.MemGuard, error) {
+	limit, err := parseByteSize(s.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("config: mem-guard.limit:%w", err)
+	}
+	if limit == 0 {
+		return nil, fmt.Errorf("config: mem-guard.limit 必填(= 内存预算 = SetMemoryLimit 的值 = soft/hard 基数)")
+	}
+	soft, err := parsePercent(s.Soft, 0.80)
+	if err != nil {
+		return nil, fmt.Errorf("config: mem-guard.soft:%w", err)
+	}
+	hard, err := parsePercent(s.Hard, 0.92)
+	if err != nil {
+		return nil, fmt.Errorf("config: mem-guard.hard:%w", err)
+	}
+	if hard <= soft {
+		return nil, fmt.Errorf("config: mem-guard.hard(%.0f%%)须大于 soft(%.0f%%)", hard*100, soft*100)
+	}
+	debug.SetMemoryLimit(int64(limit)) // 第一道:Go 运行时原生软上限,堆逼近时 GC 更激进回收
+	softB := uint64(float64(limit) * soft)
+	hardB := uint64(float64(limit) * hard)
+	return meter.NewMemGuard(reg, limit, softB, hardB, 0, 0), nil
 }
 
 // parseUserLimits 从用户配置 map 解出 max-conns / rate / max-ips(承 §6.2)。ok=false 表示无任何限额。
@@ -1556,6 +1627,69 @@ func parseRate(s string) (float64, error) {
 		return 0, fmt.Errorf("config: 速率非法 %q", s)
 	}
 	return n * mult / 8, nil // bits/s → bytes/s
+}
+
+// parseByteSize 解析字节量("1.5gb"/"512mb"/"2gib"/"1048576"/裸数字=字节)→ 字节。二进制(kib/mib/gib/
+// tib,1024 进)与十进制(kb/mb/gb/tb,1000 进)都收;裸后缀 k/m/g/t 按二进制(与运维直觉一致)。
+func parseByteSize(s string) (uint64, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return 0, fmt.Errorf("config: 字节量为空")
+	}
+	var mult float64 = 1
+	switch {
+	case strings.HasSuffix(s, "tib"):
+		mult, s = 1<<40, strings.TrimSuffix(s, "tib")
+	case strings.HasSuffix(s, "gib"):
+		mult, s = 1<<30, strings.TrimSuffix(s, "gib")
+	case strings.HasSuffix(s, "mib"):
+		mult, s = 1<<20, strings.TrimSuffix(s, "mib")
+	case strings.HasSuffix(s, "kib"):
+		mult, s = 1<<10, strings.TrimSuffix(s, "kib")
+	case strings.HasSuffix(s, "tb"):
+		mult, s = 1e12, strings.TrimSuffix(s, "tb")
+	case strings.HasSuffix(s, "gb"):
+		mult, s = 1e9, strings.TrimSuffix(s, "gb")
+	case strings.HasSuffix(s, "mb"):
+		mult, s = 1e6, strings.TrimSuffix(s, "mb")
+	case strings.HasSuffix(s, "kb"):
+		mult, s = 1e3, strings.TrimSuffix(s, "kb")
+	case strings.HasSuffix(s, "t"):
+		mult, s = 1<<40, strings.TrimSuffix(s, "t")
+	case strings.HasSuffix(s, "g"):
+		mult, s = 1<<30, strings.TrimSuffix(s, "g")
+	case strings.HasSuffix(s, "m"):
+		mult, s = 1<<20, strings.TrimSuffix(s, "m")
+	case strings.HasSuffix(s, "k"):
+		mult, s = 1<<10, strings.TrimSuffix(s, "k")
+	case strings.HasSuffix(s, "b"):
+		mult, s = 1, strings.TrimSuffix(s, "b")
+	}
+	n, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("config: 字节量非法 %q", s)
+	}
+	return uint64(n * mult), nil
+}
+
+// parsePercent 解析百分比("80%"/"0.8"/"80")→ (0,1) 之间的小数。def 是缺省(空串时用)。
+func parsePercent(s string, def float64) (float64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return def, nil
+	}
+	hadSign := strings.HasSuffix(s, "%")
+	n, err := strconv.ParseFloat(strings.TrimSuffix(s, "%"), 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: 百分比非法 %q", s)
+	}
+	if hadSign || n > 1 { // "80%" 或 "80" → 0.80;"0.8" 原样
+		n /= 100
+	}
+	if n <= 0 || n >= 1 {
+		return 0, fmt.Errorf("config: 百分比须在 (0,100) 开区间,实为 %q", s)
+	}
+	return n, nil
 }
 
 // hashOf 取任意配置值的语义哈希(YAML 规范序列化 + SHA256),供热重载 diff。

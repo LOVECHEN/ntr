@@ -11,12 +11,21 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/LOVECHEN/ntr/core/cred"
 )
 
 // drainThreshold 是稀疏 drain 阈值 T(字节):local 累够 T 才原子加一次到 Cell。
 const drainThreshold = 128 * 1024
+
+// connHandle 是一条活连接的杀点 + 活跃时间戳(承 §6.5.1「计量树就是开关树」+ §6.4bis.3 踢最久空闲)。
+// kill 断两端(幂等);lastActive 是最近一次 drain(有数据流动)的 unix 纳秒,mem-guard 硬阈值据此排序
+// 踢「最久无数据传输」的连接。lastActive 单点原子:热路径每 T 字节写一次(稀疏),踢连接侧读快照。
+type connHandle struct {
+	kill       func()
+	lastActive atomic.Int64
+}
 
 // Cell 是一个计费槽(用户)的原子计数 + 热开关状态(承 §6.5「计量树就是开关树」)。
 type Cell struct {
@@ -25,9 +34,9 @@ type Cell struct {
 	connsTotal atomic.Uint64 // 单调累计连接数
 	connsLive  atomic.Int64  // 当前活跃连接
 
-	disabled atomic.Bool       // 热开关:停用(拒新 + 断老,承 §6.5.2)
-	liveMu   sync.Mutex        // 配对 disabled 检查与 live 增删(D-01 竞态修法,承 §6.5.5)
-	live     map[uint64]func() // connID → close 函数(KillConn/killAll 用)
+	disabled atomic.Bool            // 热开关:停用(拒新 + 断老,承 §6.5.2)
+	liveMu   sync.Mutex             // 配对 disabled 检查与 live 增删(D-01 竞态修法,承 §6.5.5)
+	live     map[uint64]*connHandle // connID → 杀点+活跃戳(KillConn/killAll/mem-guard 踢空闲 用)
 
 	// 限制(承 §6.2 每用户;config 期设,连接前;0/nil = 不限)。
 	maxConns      atomic.Int64  // 并发连接上限(原地 atomic 更新支持 reload InPlace);shared 非 nil 时不用
@@ -38,16 +47,16 @@ type Cell struct {
 }
 
 // addGuarded 在同一把锁下【先查 disabled 再登记】:已停用则拒绝登记(调用方关连接),消除 D-01 幽灵连接。
-func (c *Cell) addGuarded(connID uint64, kill func()) bool {
+func (c *Cell) addGuarded(connID uint64, h *connHandle) bool {
 	c.liveMu.Lock()
 	defer c.liveMu.Unlock()
 	if c.disabled.Load() {
 		return false
 	}
 	if c.live == nil {
-		c.live = make(map[uint64]func())
+		c.live = make(map[uint64]*connHandle)
 	}
-	c.live[connID] = kill
+	c.live[connID] = h
 	return true
 }
 
@@ -61,10 +70,10 @@ func (c *Cell) removeLive(connID uint64) {
 func (c *Cell) killAll() int {
 	c.liveMu.Lock()
 	kills := make([]func(), 0, len(c.live))
-	for _, k := range c.live {
-		kills = append(kills, k)
+	for _, h := range c.live {
+		kills = append(kills, h.kill)
 	}
-	c.live = make(map[uint64]func())
+	c.live = make(map[uint64]*connHandle)
 	c.liveMu.Unlock()
 	for _, k := range kills {
 		go k()
@@ -168,7 +177,9 @@ func (r *Registry) Open(id cred.ID, src netip.Addr, kill func()) (*Meter, func()
 		return nil, nil, false
 	}
 	connID := r.connSeq.Add(1)
-	if !c.addGuarded(connID, kill) { // 已被 Disable(热开关)→ 拒
+	h := &connHandle{kill: kill}
+	h.lastActive.Store(time.Now().UnixNano()) // 建连即算一次活跃(避免刚接入就被判「最久空闲」误踢)
+	if !c.addGuarded(connID, h) {             // 已被 Disable(热开关)→ 拒
 		c.releaseConn()
 		if c.ipg != nil {
 			c.ipg.release(src)
@@ -177,7 +188,7 @@ func (r *Registry) Open(id cred.ID, src netip.Addr, kill func()) (*Meter, func()
 	}
 	c.connsTotal.Add(1)
 	r.idx.Store(connID, c)
-	m := &Meter{cell: c}
+	m := &Meter{cell: c, h: h}
 	return m, func() {
 		m.Flush()
 		c.releaseConn()
@@ -221,23 +232,80 @@ func (r *Registry) KillConn(connID uint64) int {
 	}
 	c := v.(*Cell)
 	c.liveMu.Lock()
-	kill := c.live[connID]
+	h := c.live[connID]
 	delete(c.live, connID)
 	c.liveMu.Unlock()
-	if kill == nil {
+	if h == nil {
 		return 0
 	}
-	go kill()
+	go h.kill()
 	return 1
+}
+
+// evictIdle 踢最多 n 条「最久无数据传输」的活连接(承 §6.4bis.3:mem-guard 硬阈值止损)。按 lastActive
+// 升序(最久空闲优先)全局排序,在锁下摘除再异步 kill(摘除防同一条被下一轮重复选中)。返回实际踢掉条数。
+// 只有登记进 Registry 的连接(即计量开启时接入的)才在候选集里 —— 计量关闭时本函数为空操作(诚实:
+// 硬阈值踢连接依赖计量注册,承第三道防线的前提)。
+func (r *Registry) evictIdle(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	type ent struct {
+		cell *Cell
+		id   uint64
+		last int64
+		kill func()
+	}
+	r.mu.RLock()
+	cells := make([]*Cell, 0, len(r.cells))
+	for _, c := range r.cells {
+		cells = append(cells, c)
+	}
+	r.mu.RUnlock()
+	var ents []ent
+	for _, c := range cells {
+		c.liveMu.Lock()
+		for id, h := range c.live {
+			ents = append(ents, ent{cell: c, id: id, last: h.lastActive.Load(), kill: h.kill})
+		}
+		c.liveMu.Unlock()
+	}
+	sort.Slice(ents, func(i, j int) bool { return ents[i].last < ents[j].last }) // 最久空闲在前
+	killed := 0
+	for _, e := range ents {
+		if killed >= n {
+			break
+		}
+		e.cell.liveMu.Lock()
+		_, still := e.cell.live[e.id]
+		if still {
+			delete(e.cell.live, e.id) // 先摘除:防本轮踢的连接在下一 tick 再次入选
+		}
+		e.cell.liveMu.Unlock()
+		if still {
+			go e.kill()
+			killed++
+		}
+	}
+	return killed
 }
 
 // Meter 是每连接计量器。localUp 仅由 Read 侧 goroutine 写、localDown 仅由 Write 侧写(relay 的两个
 // copyStream 各一 goroutine)—— 故各为单写者,无需原子、无数据竞争。
 type Meter struct {
-	cell    *Cell   // per-user Cell(可 nil:仅全局/每口限速的 gate-only 计量器)
-	gates   []*Gate // 全局 + 每口(rate 在稀疏泄流点一并 throttle;可空)
-	localUp uint64  // 单写者(Read goroutine)
-	localDn uint64  // 单写者(Write goroutine)
+	cell    *Cell       // per-user Cell(可 nil:仅全局/每口限速的 gate-only 计量器)
+	h       *connHandle // 本连接杀点+活跃戳(mem-guard 踢空闲用;gate-only / 无注册时 nil)
+	gates   []*Gate     // 全局 + 每口(rate 在稀疏泄流点一并 throttle;可空)
+	localUp uint64      // 单写者(Read goroutine)
+	localDn uint64      // 单写者(Write goroutine)
+}
+
+// touch 在稀疏 drain 点更新活跃戳(有数据流动即刷新;mem-guard 硬阈值据此判「最久空闲」)。
+// 每 T 字节至多一次,非每字节 —— 与 drain 同频,几乎零成本。h 为 nil(gate-only)时空操作。
+func (m *Meter) touch() {
+	if m.h != nil {
+		m.h.lastActive.Store(time.Now().UnixNano())
+	}
 }
 
 // GateMeter 建一个仅承载 gate 限速的计量器(metering 关但全局/每口有 rate 时用;cell=nil)。
@@ -259,6 +327,7 @@ func (m *Meter) AddUp(n int) {
 	m.localUp += uint64(n)
 	if m.localUp >= drainThreshold {
 		drained := int(m.localUp)
+		m.touch() // 活跃戳(mem-guard 踢空闲)
 		if m.cell != nil {
 			m.cell.up.Add(m.localUp)
 			if m.cell.rate != nil { // 用户层限速(承 §6.3.1;每 T 一次,非每字节)
@@ -280,6 +349,7 @@ func (m *Meter) AddDown(n int) {
 	m.localDn += uint64(n)
 	if m.localDn >= drainThreshold {
 		drained := int(m.localDn)
+		m.touch() // 活跃戳(mem-guard 踢空闲)
 		if m.cell != nil {
 			m.cell.down.Add(m.localDn)
 			if m.cell.rate != nil { // 用户层限速(下行;与上行共用同一桶 → 合计吞吐受限)

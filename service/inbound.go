@@ -94,13 +94,14 @@ func (s StaticOutbound) Resolve(context.Context, addr.Socksaddr) (endpoint.Outbo
 // ProxyInbound 把一条编译好的服务端栈抬成 endpoint.InboundHandler:
 // Below 是【底→顶】排好序的传输层链(如 [tls]),顶上是 Proxy(终端协议)。
 type ProxyInbound struct {
-	Below []transport.StreamTransport // 底→顶;nil = 裸 TCP 直接跑协议
-	Proxy proxy.Server
-	Auth  proxy.Authenticator
-	Out   OutboundResolver
-	Meter *meter.Registry // 非 nil = 开启按用户计量(承 §5);nil = 关闭、零成本
-	Gates []*meter.Gate   // 全局 + 每口连接闸/限速(承 §6.2 层1/2;可空)
-	Sniff bool            // 开启域名嗅探:IP 目标 peek 首包 SNI/Host 解真域名再分流(承 §10.4.2)
+	Below    []transport.StreamTransport // 底→顶;nil = 裸 TCP 直接跑协议
+	Proxy    proxy.Server
+	Auth     proxy.Authenticator
+	Out      OutboundResolver
+	Meter    *meter.Registry // 非 nil = 开启按用户计量(承 §5);nil = 关闭、零成本
+	Gates    []*meter.Gate   // 全局 + 每口连接闸/限速(承 §6.2 层1/2;可空)
+	MemGuard *meter.MemGuard // 防 OOM 软阈值拒新(承 §6.4bis;nil = 不设,AdmitOK 恒真零成本)
+	Sniff    bool            // 开启域名嗅探:IP 目标 peek 首包 SNI/Host 解真域名再分流(承 §10.4.2)
 	// Fallback:回落伪装站目标 host:port(非空才开)。协议握手失败(错凭据/畸形/非协议探测)时,不 RST/报错,
 	// 而是把【握手已消费的原始字节 + 后续流】中继到该真站 —— 主动探测/直连浏览器只看到一个正常网站(抗探测)。
 	// 禁改协议线格式:回落只是握手失败后的行为,不碰任何协议帧。发生在传输层(如 TLS)之上,故 dest 收到的是
@@ -412,6 +413,7 @@ func (h *ProxyInbound) HandleStream(ctx context.Context, s link.Stream, md *endp
 
 // admitConn 是接入的唯一入口(所有落地路径 —— 普通 TCP、UDP-over-stream、mux 承载、库内 mux 子流 ——
 // 都经此,不许绕):
+//  0. mem-guard 软阈值(§6.4bis.2):内存进 soft/hard 档 → 拒新(已建立连接不动);最先判,护进程存亡;
 //  1. 全局 / 每口连接闸(§6.2 层1/2,max-conns):接入 CAS,叠加顺序 全局→口,任一超即拒;
 //  2. 按用户计量 + 热开关 + 每用户限额(开启时):登记到 who 的 Cell(kill=关 closers);Disable(§6.5)/
 //     触顶(max-conns/max-ips,§6.3)→ 拒新、立即关。
@@ -423,6 +425,10 @@ func (h *ProxyInbound) admitConn(who cred.ID, src addr.Socksaddr, closers ...int
 		for _, c := range closers {
 			_ = c.Close()
 		}
+	}
+	if !h.MemGuard.AdmitOK() { // §6.4bis.2 内存软阈值:拒新(计数在 MemGuard 内);护进程最先判
+		closeAll()
+		return nil, nil, errAdmissionRejected
 	}
 	for i, g := range h.Gates {
 		if !g.TryAcquire() {
