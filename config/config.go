@@ -29,6 +29,7 @@ import (
 	"github.com/LOVECHEN/ntr/core/principal"
 	"github.com/LOVECHEN/ntr/core/proxy"
 	"github.com/LOVECHEN/ntr/core/route"
+	"github.com/LOVECHEN/ntr/core/registry"
 	"github.com/LOVECHEN/ntr/core/spec"
 	"github.com/LOVECHEN/ntr/core/transport"
 	"github.com/LOVECHEN/ntr/dns"
@@ -184,9 +185,11 @@ type Bridge struct {
 // Inbound 是一个入站:监听地址 + 底→顶层栈 + 用户 + 路由到哪个出站。
 // Type 空/"proxy" = 流式栈模型;"anytls" 等 = 会话式协议(不走栈)。
 type Inbound struct {
-	Name          string           `yaml:"name"`   // 口名(第4章):users[].on/off 引用它,BillID=<user>@<口名>;缺省用 listen 兜底
-	Listen        string           `yaml:"listen"`
-	Type          string           `yaml:"type"`
+	Name          string           `yaml:"name"`    // 口名(第4章):users[].on/off 引用它,BillID=<user>@<口名>;缺省用 listen 兜底
+	Listen        string           `yaml:"listen"`  // 旧格式 host:port;第4章写 host(缺省 0.0.0.0)配 port
+	Port          uint16           `yaml:"port"`    // 第4章:监听端口;非零时 listen 只写 host
+	Type          string           `yaml:"type"`    // 第4章:协议名(vless/trojan/snell…,由 registry 判定)或形态(tun/tproxy/portal/会话式)
+	Extra         map[string]any   `yaml:",inline"` // 第4章新格式:所有未声明键 —— 层块(reality:/ws:/shadowtls:…)与协议专属字段(flow/version…),synthLayers 分拣
 	Layers        []map[string]any `yaml:"layers"`
 	Users         []map[string]any `yaml:"users"`
 	TLS           map[string]any   `yaml:"tls"`
@@ -209,19 +212,86 @@ type Inbound struct {
 	Fallbacks     []FallbackSpec   `yaml:"fallbacks"`      // 多站回落:按 ALPN + HTTP path 前缀选伪装站(对齐 xray fallbacks;非空优先于 fallback)
 }
 
-// inboundName 口名:name 字段;缺省用 listen 兜底(旧格式无 name 的口仍可被 users 引用)。
+// inboundName 口名:name 字段;缺省用监听地址兜底(旧格式无 name 的口仍可被 users 引用)。
 func (in Inbound) inboundName() string {
 	if in.Name != "" {
 		return in.Name
 	}
-	return in.Listen
+	return in.listenAddr()
+}
+
+// listenAddr 合成监听地址:第4章 listen(host,缺省 0.0.0.0)+ port;旧格式 listen 已是 host:port 则原样。
+func (in Inbound) listenAddr() string {
+	if in.Port == 0 {
+		return in.Listen
+	}
+	host := in.Listen
+	if host == "" {
+		host = "0.0.0.0"
+	}
+	return net.JoinHostPort(host, strconv.Itoa(int(in.Port)))
+}
+
+// isProxyProto 报 name 是否注册为 Band=Proxy 的终端协议(vless/trojan/snell/ss/…)。
+// config 层【不枚举协议名】,全靠 registry 自报 —— 核心零 switch 的落点。
+func isProxyProto(name string) bool {
+	d, ok := registry.Lookup(name)
+	return ok && d.Band() == registry.BandProxy
+}
+
+// newFormat 报此口是第4章新格式:type 为注册的终端协议名,且未写旧 layers 数组。
+func (in Inbound) newFormat() bool { return len(in.Layers) == 0 && isProxyProto(in.Type) }
+
+// synthLayers 产此口的层集交 buildStack(顺序无关,compile.Order 按 Band 排、书写序不参与):
+//   - 旧格式(layers 数组):原样 toLayerSpecs —— 兼容垫片,脚本迁完即拆。
+//   - 新格式(type=协议名 + 层块):Extra 里「键是注册层插件且值为映射」→ 一层(reality:/ws:/grpc:/
+//     shadowtls:/mkcp:…);其余键(flow/version/cipher/psk…)→ 归终端协议字段;tls: 具名字段非空 → tls 层。
+//     config 不认识任何协议名,分拣全靠 registry.Lookup。
+func (in Inbound) synthLayers() ([]service.LayerSpec, error) {
+	if len(in.Layers) > 0 {
+		return toLayerSpecs(in.Layers)
+	}
+	if !isProxyProto(in.Type) {
+		return nil, fmt.Errorf("type %q 不是注册的终端协议,且未写 layers", in.Type)
+	}
+	var specs []service.LayerSpec
+	protoFields := make(map[string]any)
+	for k, v := range in.Extra {
+		if m, isMap := v.(map[string]any); isMap {
+			if _, isLayer := registry.Lookup(k); isLayer {
+				node, err := mapToNode(m, "")
+				if err != nil {
+					return nil, fmt.Errorf("层 %q:%w", k, err)
+				}
+				specs = append(specs, service.LayerSpec{Name: k, Node: node})
+				continue
+			}
+		}
+		protoFields[k] = v
+	}
+	if len(in.TLS) > 0 { // tls: 是 Inbound 具名字段(会话式共用),新格式下即 tls 层
+		node, err := mapToNode(in.TLS, "")
+		if err != nil {
+			return nil, fmt.Errorf("层 tls:%w", err)
+		}
+		specs = append(specs, service.LayerSpec{Name: "tls", Node: node})
+	}
+	node, err := mapToNode(protoFields, "")
+	if err != nil {
+		return nil, fmt.Errorf("协议 %q 字段:%w", in.Type, err)
+	}
+	specs = append(specs, service.LayerSpec{Name: in.Type, Node: node})
+	return specs, nil
 }
 
 // authProto 该口的 per-user 认证协议(= 栈顶协议名,供 Desugar 按栈取密钥,§4.4 规则 3)。
-// 当前只接流式栈(空/proxy/portal):取 layers 最后一层 type。空 = 不产 per-user binding。
+// 新格式:type 即终端协议;旧格式流式栈(空/proxy/portal):取 layers 最后一层 type。空 = 不产 binding。
 // 会话式(anytls/hysteria2/tuic…)各自持 users map、未接 cred/meter(蓝图世界 C),暂返空;
 // 多层认证(shadowtls 外层)待 Descriptor 自报 + 传输层参与 auth(蓝图骨头 4),当前单层。
 func (in Inbound) authProto() string {
+	if in.newFormat() {
+		return in.Type
+	}
 	switch in.Type {
 	case "", "proxy", "portal":
 		if n := len(in.Layers); n > 0 {
@@ -988,6 +1058,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 	billIDs := make(map[string]cred.ID) // BillID → 运行时数字句柄;同 BillID(轮换平行 binding)共享一个
 
 	for i, in := range f.Inbounds {
+		in.Listen = in.listenAddr() // 第4章 listen(host)+port 合成;旧格式 host:port 原样
 		if in.Listen == "" && in.Type != "tun" { // tun 无监听端口,靠接口名
 			return nil, fmt.Errorf("config: 入站 #%d 缺 listen", i)
 		}
@@ -1008,8 +1079,12 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			out = service.NewResolverOutbound(router)
 		}
 
+		typ := in.Type
+		if in.newFormat() { // 第4章新格式:type=协议名(vless/trojan/snell…)+ 层块,走流式栈(同 proxy 形态)
+			typ = "proxy"
+		}
 		var handler endpoint.InboundHandler
-		switch in.Type {
+		switch typ {
 		case "", "proxy":
 			h, base, err := f.buildProxyInbound(ctx, in, resolver, bindingsByInbound[in.inboundName()], billIDs)
 			if err != nil {
@@ -1452,9 +1527,9 @@ func accessAllowed(remoteAddr string, allow []netip.Prefix) bool {
 // buildProxyInbound 建流式栈入站(BuildInbound + 注册凭据)。凭据来源二选一:顶层 users 脱糖的
 // bindings(第4章,优先);无则退回旧口内 in.Users(兼容垫片,脚本迁完即拆)。
 func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver service.OutboundResolver, bindings []principal.CredBinding, billIDs map[string]cred.ID) (*service.ProxyInbound, transport.BaseTransport, error) {
-	layers, err := toLayerSpecs(in.Layers)
+	layers, err := in.synthLayers() // 旧 layers 数组(垫片)或第4章 type=协议名+层块
 	if err != nil {
-		return nil, nil, fmt.Errorf("config: 入站 %s:%w", in.Listen, err)
+		return nil, nil, fmt.Errorf("config: 入站 %s:%w", in.inboundName(), err)
 	}
 	auth := service.NewStaticAuth()
 	handler, base, err := service.BuildInbound(ctx, layers, auth, resolver)
