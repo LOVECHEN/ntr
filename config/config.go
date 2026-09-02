@@ -343,6 +343,7 @@ func (o Outbound) synthLayers() ([]service.LayerSpec, error) {
 // ★只登记真正接完线的协议(诚实纪律:未接的留空 → 其顶层 users 不生效,别假装)。
 var sessionAuthProtos = map[string]bool{
 	"hysteria2": true,
+	"hysteria1": true,
 	"anytls":    true,
 }
 
@@ -1238,7 +1239,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			}
 			handler = h
 		case "hysteria1":
-			inb, err := buildHy1Inbound(in, out)
+			inb, err := f.buildHy1Inbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
 			if err != nil {
 				return nil, fmt.Errorf("config: 入站 %s(hysteria1):%w", in.Listen, err)
 			}
@@ -1990,24 +1991,47 @@ func buildMasqueInbound(in Inbound, out endpoint.Outbound) (*masque.Inbound, err
 	return masque.NewInbound(users, tlsConfig, out, sessionPortalDispatch(in))
 }
 
-// buildHy2Inbound 建 Hysteria2 会话入站(metacubex-tls 证书 + 用户 + 绑定出站)。
-func buildHy1Inbound(in Inbound, out endpoint.Outbound) (*hysteria1.Inbound, error) {
+// buildHy1Inbound 建 Hysteria v1 会话入站。顶层 users(binds 非空):tag=BillID 喂库内多用户,命中后
+// hysteria1.UserFromContext 回读 → cred.ID;因 hy1 落地前须回 ReportConnHandshakeSuccess,用 AdmitHook
+// (接入+计量但不代管 relay)而非 SessionDispatch。无 binds 退回口内 in.Users 垫片(身份 Ambient,闸/mem-guard 仍生效)。
+func (f *File) buildHy1Inbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (*hysteria1.Inbound, error) {
 	tlsConfig, err := anytls.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
 	if err != nil {
 		return nil, err
 	}
+	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
+	if err != nil {
+		return nil, err
+	}
 	var users []hysteria1.User
-	for _, u := range in.Users {
-		pw, _ := u["password"].(string)
-		if pw == "" {
-			continue
+	var refs map[string]cred.ID
+	if len(binds) > 0 {
+		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
+		if err != nil {
+			return nil, err
 		}
-		users = append(users, hysteria1.User{Password: pw})
+		refs = r
+		for _, su := range sus {
+			users = append(users, hysteria1.User{Name: su.Tag, Password: su.Secret})
+		}
+	} else {
+		for _, u := range in.Users {
+			pw, _ := u["password"].(string)
+			if pw == "" {
+				continue
+			}
+			name, _ := u["name"].(string)
+			users = append(users, hysteria1.User{Name: name, Password: pw})
+		}
 	}
 	if len(users) == 0 {
-		return nil, fmt.Errorf("hysteria1 入站需至少一个 user{password}")
+		return nil, fmt.Errorf("hysteria1 入站需至少一个用户(顶层 users.keys.hysteria1 或口内 user{password})")
 	}
-	return hysteria1.NewInbound(users, in.Obfs, 0, 0, tlsConfig, out, sessionPortalDispatch(in))
+	var admit endpoint.AdmitHook
+	if in.ControlDomain == "" { // 反连 portal 口不计量(隧道载体),与 hy2/anytls 一致
+		admit = service.SessionAdmit(adm, refs, hysteria1.UserFromContext)
+	}
+	return hysteria1.NewInbound(users, in.Obfs, 0, 0, tlsConfig, out, sessionPortalDispatch(in), admit)
 }
 
 // sessionUser 是会话式口从顶层 users 脱糖出的一个库内用户(Tag=BillID 供 ctx 回读映射,Secret=该层原始密钥)。

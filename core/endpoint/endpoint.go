@@ -114,6 +114,13 @@ type InboundHandler interface {
 // (只在其入站接线注入一个函数),且不引 reverse/service 依赖(纯 core 契约)。
 type StreamDispatch func(ctx context.Context, stream link.Stream, dst addr.Socksaddr, network Network) error
 
+// AdmitHook 供【落地前需要协议特定信令】的会话式协议(如 hysteria v1:拨通出站后必须回
+// ReportConnHandshakeSuccess 才能开始转发)做接入 + 计量包裹但【不代管 relay】:返回计量流 + release,
+// 协议自行完成握手信令后 relay(计量流)。与 StreamDispatch 互补(后者代管 relay,适用无特殊落地信令的
+// 协议)。同样纯 core 契约、免协议 import service:接入逻辑作为一个函数注入。nil = 不接入(旧行为)。
+// 被拒(限额/停用/mem-guard)返回非 nil error 且已关 s;协议应据此放弃本流。
+type AdmitHook func(ctx context.Context, s link.Stream) (link.Stream, func(), error)
+
 // Outbound 是出站:拨到 dst、给一个传输。它以本机身份出示凭据向上游认证,不进凭据树。
 type Outbound interface {
 	DialStream(ctx context.Context, dst addr.Socksaddr) (link.Stream, error)

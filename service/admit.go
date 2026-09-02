@@ -83,6 +83,24 @@ func (a *Admitter) Admit(who cred.ID, src addr.Socksaddr, s link.Stream, closers
 	return s, release, nil
 }
 
+// SessionAdmit 建 endpoint.AdmitHook:读身份 → Admit(闸+计量+mem-guard)→ 返回计量流 + release,
+// 【不代管 relay】。供 hysteria v1 这类"落地前需回协议特定握手信令"的会话式协议:它拿到计量流后先做
+// 自己的 ReportConnHandshakeSuccess(在裸 conn 上),再 relay(计量流)。readUser/refs 语义同 SessionDispatch。
+func SessionAdmit(adm *Admitter, refs map[string]cred.ID, readUser func(context.Context) (string, bool)) endpoint.AdmitHook {
+	return func(ctx context.Context, s link.Stream) (link.Stream, func(), error) {
+		who := cred.Ambient
+		if readUser != nil {
+			if tag, ok := readUser(ctx); ok {
+				if id, ok2 := refs[tag]; ok2 {
+					who = id
+				}
+			}
+		}
+		ap := srcAddrPort(s)
+		return adm.Admit(who, addr.Socksaddr{Addr: ap.Addr(), Port: ap.Port()}, s)
+	}
+}
+
 // SessionDispatch 建【会话式协议】的计量版 endpoint.StreamDispatch:每条库内解复用出的已握手流,先按
 // readUser 从 ctx 读身份 tag(命中 refs 得 cred.ID,缺省 Ambient)→ 过 Admitter(连接闸 + 按用户计量 +
 // mem-guard,与流式栈同一唯一入口)→ 包计量流 → 拨出站 relay。供 anytls/hy2/tuic… 这些"库内自管会话、
