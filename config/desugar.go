@@ -9,23 +9,17 @@ import (
 
 // Desugar 把配置糖(顶层 users:on/off/all + 平铺 keys)脱糖成运行时装配单元 []CredBinding
 // (承第4章 §4.5.2;on 语义按 owner 调整为默认全开)。纯函数:不认识协议、不碰栈装配、无 I/O、
-// 输出确定(允许口按名排序)。
+// 输出确定(允许口按名排序)。产出的 AuthLayer.Key 是【原始 secret 字节】,canonical 派生
+// (CredentialCodec.AuthKey)留给装配期 —— 那时才拿得到协议实例。
 //
 //   - inboundNames: 所有已声明口名(校验 on/off 引用)。
 //   - stackProtos:  口名 → 该口栈所需 per-user 认证协议(按栈序,外→内)。由口的栈决定(§4.4 规则3),
 //     调用方(Build 期,有栈信息)传入;无认证口(mixed/tun)不在表或空 → 不产 per-user binding。
-//   - canon:        (proto, secret) → canonical 鉴权键(= 该协议 CredentialCodec.AuthKey)。装配期注入;
-//     测试可传 identity。
 //
 // 允许口集:全开(缺省 on 或 on:all)= 所有口;白名单(on:[口])= 列出的口;再由 off 黑名单挖除。
 // 缺密钥:全开下某口缺栈所需密钥 = 该用户没买这口,静默跳过;显式 on 了却缺 → E-KEY-MISSING。
 // 轮换:某层多把 key → 该层产多个平行 binding(多层则笛卡尔积),共享同一 BillID。
-func Desugar(
-	users []User,
-	inboundNames map[string]bool,
-	stackProtos map[string][]string,
-	canon func(proto, secret string) ([]byte, error),
-) ([]principal.CredBinding, error) {
+func Desugar(users []User, inboundNames map[string]bool, stackProtos map[string][]string) ([]principal.CredBinding, error) {
 	seen := make(map[string]bool, len(users))
 	var out []principal.CredBinding
 
@@ -77,11 +71,7 @@ func Desugar(
 				}
 				continue // 全开下缺密钥 = 没买这口,跳过
 			}
-			bindings, err := expandLayers(u, ib, protos, layerVals, limit, canon)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, bindings...)
+			out = append(out, expandLayers(u, ib, protos, layerVals, limit)...)
 		}
 	}
 	return out, nil
@@ -108,7 +98,13 @@ func allowedInbounds(u User, all map[string]bool) map[string]bool {
 }
 
 // buildLimitRef:设了 rate/max-conns/max-ips 任一 → 建一个 LimitRef(该 user 全部 binding 共指);否则 nil。
+// on-exceed-ips 当前只实现 reject:写了别的值报错而不是静默吞掉(冻结律#6 绝不静默)。
 func buildLimitRef(u User) (*principal.LimitRef, error) {
+	switch u.OnExceedIPs {
+	case "", "reject":
+	default:
+		return nil, fmt.Errorf("config: user %q on-exceed-ips %q 未实现(当前仅 reject)", u.Name, u.OnExceedIPs)
+	}
 	if u.Rate == "" && u.MaxConns == 0 && u.MaxIPs == 0 {
 		return nil, nil
 	}
@@ -120,15 +116,12 @@ func buildLimitRef(u User) (*principal.LimitRef, error) {
 		}
 		rate = uint64(r)
 	}
-	ipx := principal.IPReject
-	if u.OnExceedIPs == "evict-oldest" {
-		ipx = principal.IPEvictOldest
-	}
-	return &principal.LimitRef{Rate: rate, MaxConns: u.MaxConns, MaxIPs: u.MaxIPs, OnExceedIPs: ipx}, nil
+	return &principal.LimitRef{Rate: rate, MaxConns: u.MaxConns, MaxIPs: u.MaxIPs}, nil
 }
 
 // expandLayers 产一个口的 binding:多层 × 轮换 = 笛卡尔积(每层选一把 key),共享同一 BillID。
-func expandLayers(u User, ib string, protos []string, layerVals [][]string, limit *principal.LimitRef, canon func(string, string) ([]byte, error)) ([]principal.CredBinding, error) {
+// Key 放原始 secret 字节,装配期再经协议 CredentialCodec.AuthKey 派生。
+func expandLayers(u User, ib string, protos []string, layerVals [][]string, limit *principal.LimitRef) []principal.CredBinding {
 	combos := [][]string{{}}
 	for i := range protos {
 		var next [][]string
@@ -147,11 +140,7 @@ func expandLayers(u User, ib string, protos []string, layerVals [][]string, limi
 	for _, combo := range combos {
 		layers := make([]principal.AuthLayer, len(protos))
 		for i, p := range protos {
-			key, err := canon(p, combo[i])
-			if err != nil {
-				return nil, fmt.Errorf("config: user %q 口 %q 层 %q 密钥规范化失败: %w", u.Name, ib, p, err)
-			}
-			layers[i] = principal.AuthLayer{Scheme: p, Key: key}
+			layers[i] = principal.AuthLayer{Scheme: p, Key: []byte(combo[i])}
 		}
 		out = append(out, principal.CredBinding{
 			Inbound: ib,
@@ -162,7 +151,7 @@ func expandLayers(u User, ib string, protos []string, layerVals [][]string, limi
 			Origin:  principal.OriginConfig,
 		})
 	}
-	return out, nil
+	return out
 }
 
 func sortedKeys(m map[string]bool) []string {

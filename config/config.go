@@ -11,7 +11,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/LOVECHEN/ntr/outbound/upstream"
 	"net"
 	"net/http"
 	"net/netip"
@@ -28,8 +27,8 @@ import (
 	"github.com/LOVECHEN/ntr/core/link"
 	"github.com/LOVECHEN/ntr/core/principal"
 	"github.com/LOVECHEN/ntr/core/proxy"
-	"github.com/LOVECHEN/ntr/core/route"
 	"github.com/LOVECHEN/ntr/core/registry"
+	"github.com/LOVECHEN/ntr/core/route"
 	"github.com/LOVECHEN/ntr/core/spec"
 	"github.com/LOVECHEN/ntr/core/transport"
 	"github.com/LOVECHEN/ntr/dns"
@@ -56,6 +55,7 @@ import (
 	sshproto "github.com/LOVECHEN/ntr/outbound/ssh"
 	"github.com/LOVECHEN/ntr/outbound/trusttunnel"
 	"github.com/LOVECHEN/ntr/outbound/tuic"
+	"github.com/LOVECHEN/ntr/outbound/upstream"
 	"github.com/LOVECHEN/ntr/outbound/wireguard"
 	"github.com/LOVECHEN/ntr/reverse"
 	"github.com/LOVECHEN/ntr/rule"
@@ -139,13 +139,13 @@ type MetricsSpec struct {
 
 // DNSSpec 是 dns: 配置块(承设计 §10.1.8)。MVP:明文 UDP/TCP 上游 + 缓存 + race/sequential。
 type DNSSpec struct {
-	Enabled     bool                `yaml:"enabled"`
-	Detour      string              `yaml:"detour"`   // 未写 detour 的 nameserver 默认出站(必具名)
-	Strategy    string              `yaml:"strategy"` // race(默认)| sequential
-	Nameservers []NameserverSpec    `yaml:"nameservers"`
+	Enabled     bool                   `yaml:"enabled"`
+	Detour      string                 `yaml:"detour"`   // 未写 detour 的 nameserver 默认出站(必具名)
+	Strategy    string                 `yaml:"strategy"` // race(默认)| sequential
+	Nameservers []NameserverSpec       `yaml:"nameservers"`
 	Policies    []NameserverPolicySpec `yaml:"nameserver-policy"` // 按域名选上游(不同域名走不同 DNS 上游)
-	Hosts       map[string][]string `yaml:"hosts"`   // 静态 host→IP,命中不走上游(也防这些域名 DNS 泄漏)
-	FakeIP      *FakeIPSpec         `yaml:"fake-ip"` // fake-ip:给域名发伪 IP,让只见 IP 的连接也能按域名分流
+	Hosts       map[string][]string    `yaml:"hosts"`             // 静态 host→IP,命中不走上游(也防这些域名 DNS 泄漏)
+	FakeIP      *FakeIPSpec            `yaml:"fake-ip"`           // fake-ip:给域名发伪 IP,让只见 IP 的连接也能按域名分流
 }
 
 // FakeIPSpec 是 dns.fake-ip 块:enabled + v4/v6 伪 IP 段 + 排除后缀。
@@ -221,9 +221,14 @@ func (in Inbound) inboundName() string {
 }
 
 // listenAddr 合成监听地址:第4章 listen(host,缺省 0.0.0.0)+ port;旧格式 listen 已是 host:port 则原样。
+// ★幂等:Build 会把合成结果写回 in.Listen 再次调用,若 Listen 已含端口则不再拼接
+// (否则第二次会变成 "[0.0.0.0:2053]:2053",口名对不上、凭据静默丢失)。
 func (in Inbound) listenAddr() string {
 	if in.Port == 0 {
 		return in.Listen
+	}
+	if _, _, err := net.SplitHostPort(in.Listen); err == nil {
+		return in.Listen // 已是 host:port
 	}
 	host := in.Listen
 	if host == "" {
@@ -1055,6 +1060,10 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 	inboundNames := make(map[string]bool, len(f.Inbounds))
 	stackProtos := make(map[string][]string, len(f.Inbounds))
 	for i := range f.Inbounds {
+		if f.Inbounds[i].newFormat() && f.Inbounds[i].Name == "" {
+			// 新格式口是凭据/计费的锚点(users.on 引用它、BillID 以它为后缀),身份必须稳定,不能靠监听地址兜底
+			return nil, fmt.Errorf("config: 入站 #%d(type %q)是第4章新格式,必须写 name (E-INBOUND-NONAME)", i, f.Inbounds[i].Type)
+		}
 		name := f.Inbounds[i].inboundName()
 		if name == "" {
 			continue // 无 listen 无 name 的口(tun):不进凭据体系
@@ -1067,7 +1076,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			stackProtos[name] = []string{p}
 		}
 	}
-	bindings, err := Desugar(f.Users, inboundNames, stackProtos, func(_, secret string) ([]byte, error) { return []byte(secret), nil })
+	bindings, err := Desugar(f.Users, inboundNames, stackProtos)
 	if err != nil {
 		return nil, err
 	}
@@ -1078,7 +1087,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 	billIDs := make(map[string]cred.ID) // BillID → 运行时数字句柄;同 BillID(轮换平行 binding)共享一个
 
 	for i, in := range f.Inbounds {
-		in.Listen = in.listenAddr() // 第4章 listen(host)+port 合成;旧格式 host:port 原样
+		in.Listen = in.listenAddr()              // 第4章 listen(host)+port 合成;旧格式 host:port 原样
 		if in.Listen == "" && in.Type != "tun" { // tun 无监听端口,靠接口名
 			return nil, fmt.Errorf("config: 入站 #%d 缺 listen", i)
 		}
@@ -1106,7 +1115,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		var handler endpoint.InboundHandler
 		switch typ {
 		case "", "proxy":
-			h, base, err := f.buildProxyInbound(ctx, in, resolver, bindingsByInbound[in.inboundName()], billIDs)
+			h, base, err := f.buildProxyInbound(ctx, in, resolver, bindingsByInbound[in.inboundName()], billIDs, metricReg)
 			if err != nil {
 				return nil, err
 			}
@@ -1125,7 +1134,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		case "portal":
 			// 反向代理 Portal:复用普通代理入站建栈 + 注册用户,再包成 reverse.Portal
 			// (control-domain 区分 Bridge 控制连接与用户连接)。out 未用(Portal 覆盖 HandleStream)。
-			pin, _, err := f.buildProxyInbound(ctx, in, resolver, bindingsByInbound[in.inboundName()], billIDs)
+			pin, _, err := f.buildProxyInbound(ctx, in, resolver, bindingsByInbound[in.inboundName()], billIDs, metricReg)
 			if err != nil {
 				return nil, err
 			}
@@ -1259,30 +1268,8 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		gates := nonNilGates(globalGate, inboundGate)
 		if pi := asProxyInbound(handler); pi != nil {
 			pi.Gates = gates
-			if metricReg != nil { // 按用户计量 + 每用户限额
+			if metricReg != nil { // 按用户计量;每用户限额已在 buildProxyInbound 装配凭据时同处挂载
 				pi.Meter = metricReg
-				if binds := bindingsByInbound[in.inboundName()]; len(binds) > 0 {
-					// 第4章路径:顶层 users 脱糖的 LimitRef → SetLimits(BillID 数字句柄;同 BillID 共享,只设一次)
-					seen := make(map[cred.ID]bool, len(binds))
-					for _, b := range binds {
-						if b.Limit == nil {
-							continue
-						}
-						id := billIDs[b.BillID]
-						if seen[id] {
-							continue
-						}
-						seen[id] = true
-						metricReg.SetLimits(id, meter.Limits{MaxConns: int64(b.Limit.MaxConns), Rate: float64(b.Limit.Rate), MaxIPs: int(b.Limit.MaxIPs)})
-					}
-				} else {
-					// 兼容垫片:旧口内 users(身份 UserBase+j+1)
-					for j, u := range in.Users {
-						if lim, ok := parseUserLimits(u); ok {
-							metricReg.SetLimits(cred.UserBase+cred.ID(j)+1, lim)
-						}
-					}
-				}
 			}
 		}
 		insts = append(insts, Instance{Listen: in.Listen, Handler: handler})
@@ -1561,9 +1548,10 @@ func accessAllowed(remoteAddr string, allow []netip.Prefix) bool {
 	return false
 }
 
-// buildProxyInbound 建流式栈入站(BuildInbound + 注册凭据)。凭据来源二选一:顶层 users 脱糖的
-// bindings(第4章,优先);无则退回旧口内 in.Users(兼容垫片,脚本迁完即拆)。
-func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver service.OutboundResolver, bindings []principal.CredBinding, billIDs map[string]cred.ID) (*service.ProxyInbound, transport.BaseTransport, error) {
+// buildProxyInbound 建流式栈入站(BuildInbound + 注册凭据 + 挂每用户限额)。凭据来源二选一:
+// 顶层 users 脱糖的 bindings(第4章,优先);无则退回旧口内 in.Users(兼容垫片,脚本迁完即拆)。
+// 认证登记与限额挂载在【同一处】分叉,避免两处各判一次凭据来源、靠隐式时序耦合。
+func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver service.OutboundResolver, bindings []principal.CredBinding, billIDs map[string]cred.ID, metricReg *meter.Registry) (*service.ProxyInbound, transport.BaseTransport, error) {
 	layers, err := in.synthLayers() // 旧 layers 数组(垫片)或第4章 type=协议名+层块
 	if err != nil {
 		return nil, nil, fmt.Errorf("config: 入站 %s:%w", in.inboundName(), err)
@@ -1578,36 +1566,48 @@ func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver servi
 	for _, r := range in.Fallbacks {
 		handler.Fallbacks = append(handler.Fallbacks, service.FallbackRule{SNI: r.SNI, ALPN: r.ALPN, Path: r.Path, Dest: r.Dest, Xver: r.Xver})
 	}
-	scheme := layers[len(layers)-1].Name
-	if cc, ok := handler.Proxy.(proxy.CredentialCodec); ok {
-		if len(bindings) > 0 {
-			// 第4章路径:每条 binding 每层 canonical(AuthKey)后登记;BillID 映射稳定数字句柄,同 BillID 共享。
-			for _, b := range bindings {
-				id, seen := billIDs[b.BillID]
-				if !seen {
-					id = cred.UserBase + cred.ID(len(billIDs)) + 1
-					billIDs[b.BillID] = id
-				}
-				for _, layer := range b.Layers { // 当前单层(栈顶);多层待传输层参与 auth(骨头 4)
-					key, err := cc.AuthKey(string(layer.Key))
-					if err != nil {
-						return nil, nil, fmt.Errorf("config: 入站 %s 凭据 %s:%w", in.inboundName(), b.BillID, err)
-					}
-					auth.Add(layer.Scheme, key, cred.Ref{ID: id})
+	cc, hasCodec := handler.Proxy.(proxy.CredentialCodec)
+	if !hasCodec {
+		return handler, base, nil // 协议无 per-user 凭据(socks no-auth / mixed …):不登记、不设限
+	}
+	if len(bindings) > 0 {
+		// 第4章路径:每条 binding 每层 canonical(AuthKey)后登记;BillID 映射稳定数字句柄,同 BillID 共享;
+		// 该 user 的 LimitRef 在首次遇到其 BillID 时挂到计量 cell(仅 metrics 开启时)。
+		for _, b := range bindings {
+			id, seen := billIDs[b.BillID]
+			if !seen {
+				id = cred.UserBase + cred.ID(len(billIDs)) + 1
+				billIDs[b.BillID] = id
+				if metricReg != nil && b.Limit != nil {
+					metricReg.SetLimits(id, meter.Limits{MaxConns: int64(b.Limit.MaxConns), Rate: float64(b.Limit.Rate), MaxIPs: int(b.Limit.MaxIPs)})
 				}
 			}
-		} else {
-			// 兼容垫片:旧口内 users(身份 = UserBase+j+1,跨口会撞——正是第4章要修的;脚本迁完拆)
-			for j, u := range in.Users {
-				secret := userSecret(u)
-				if secret == "" {
-					continue
-				}
-				key, err := cc.AuthKey(secret)
+			for _, layer := range b.Layers { // 当前单层(栈顶);多层待传输层参与 auth(骨头 4)
+				key, err := cc.AuthKey(string(layer.Key))
 				if err != nil {
-					return nil, nil, fmt.Errorf("config: 入站 %s 用户 #%d:%w", in.Listen, j, err)
+					return nil, nil, fmt.Errorf("config: 入站 %s 凭据 %s:%w", in.inboundName(), b.BillID, err)
 				}
-				auth.Add(scheme, key, cred.Ref{ID: cred.UserBase + cred.ID(j) + 1})
+				auth.Add(layer.Scheme, key, cred.Ref{ID: id})
+			}
+		}
+		return handler, base, nil
+	}
+	// 兼容垫片:旧口内 users(身份 = UserBase+j+1,跨口会撞——正是第4章要修的;脚本迁完拆)
+	scheme := layers[len(layers)-1].Name
+	for j, u := range in.Users {
+		secret := userSecret(u)
+		if secret == "" {
+			continue
+		}
+		key, err := cc.AuthKey(secret)
+		if err != nil {
+			return nil, nil, fmt.Errorf("config: 入站 %s 用户 #%d:%w", in.Listen, j, err)
+		}
+		id := cred.UserBase + cred.ID(j) + 1
+		auth.Add(scheme, key, cred.Ref{ID: id})
+		if metricReg != nil {
+			if lim, ok := parseUserLimits(u); ok {
+				metricReg.SetLimits(id, lim)
 			}
 		}
 	}

@@ -1,13 +1,11 @@
 package config
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/LOVECHEN/ntr/core/principal"
 )
-
-// identityCanon 测试用:secret 原样作 key(不派生),便于断言。
-func identityCanon(proto, secret string) ([]byte, error) { return []byte(secret), nil }
 
 func TestDesugar(t *testing.T) {
 	inboundNames := map[string]bool{"vless-in": true, "stls-snell-in": true, "ss-in": true}
@@ -36,7 +34,7 @@ func TestDesugar(t *testing.T) {
 		},
 	}
 
-	binds, err := Desugar(users, inboundNames, stackProtos, identityCanon)
+	binds, err := Desugar(users, inboundNames, stackProtos)
 	if err != nil {
 		t.Fatalf("Desugar 失败: %v", err)
 	}
@@ -45,7 +43,7 @@ func TestDesugar(t *testing.T) {
 		byBill[b.BillID] = append(byBill[b.BillID], b)
 	}
 
-	// alice 全开:vless-in 单层 + stls-snell-in 多层;ss-in 缺密钥跳过
+	// alice 全开:vless-in 单层 + stls-snell-in 多层;ss-in 缺密钥跳过。Key = 原始 secret
 	av := byBill["alice@vless-in"]
 	if len(av) != 1 || len(av[0].Layers) != 1 || av[0].Layers[0].Scheme != "vless" || string(av[0].Layers[0].Key) != "alice-uuid" {
 		t.Errorf("alice@vless-in 单层错: %+v", av)
@@ -60,12 +58,14 @@ func TestDesugar(t *testing.T) {
 	if _, ok := byBill["alice@ss-in"]; ok {
 		t.Error("alice 无 ss 密钥,全开下 ss-in 应跳过")
 	}
-	// LimitRef 该 user 全部 binding 共指同一个
 	if av[0].Limit == nil || as[0].Limit != av[0].Limit {
 		t.Error("alice 全部 binding 应共指同一 LimitRef")
 	}
 	if av[0].Limit.MaxIPs != 8 || av[0].Limit.Rate != 25_000_000 { // 200mbps → 25e6 bytes/s
 		t.Errorf("alice LimitRef 错: %+v", av[0].Limit)
+	}
+	if av[0].Name != "alice" || av[0].Origin != principal.OriginConfig {
+		t.Errorf("binding Name/Origin 错: %+v", av[0])
 	}
 
 	// bob:on:all - off(stls-snell-in);vless 轮换 → 2 个平行 binding 共享 BillID;无 ss 密钥
@@ -94,19 +94,29 @@ func TestDesugarKeyMissing(t *testing.T) {
 	inboundNames := map[string]bool{"vless-in": true}
 	stackProtos := map[string][]string{"vless-in": {"vless"}}
 
-	// 显式 on 缺密钥 → 报错
 	explicit := []User{{Name: "x", On: NameList{"vless-in"}, Keys: map[string]KeySpec{}}}
-	if _, err := Desugar(explicit, inboundNames, stackProtos, identityCanon); err == nil {
+	if _, err := Desugar(explicit, inboundNames, stackProtos); err == nil {
 		t.Error("显式 on 缺密钥应报 E-KEY-MISSING")
 	}
 
-	// 全开缺密钥 → 静默跳过,不报错、不产 binding
 	allOpen := []User{{Name: "y", Keys: map[string]KeySpec{}}}
-	binds, err := Desugar(allOpen, inboundNames, stackProtos, identityCanon)
+	binds, err := Desugar(allOpen, inboundNames, stackProtos)
 	if err != nil {
 		t.Errorf("全开缺密钥不应报错: %v", err)
 	}
 	if len(binds) != 0 {
 		t.Errorf("全开缺密钥不应产 binding: %d", len(binds))
+	}
+}
+
+// TestDesugarRejectsUnimplementedKnob:on-exceed-ips 只实现 reject;写 evict-oldest 必须报错而非静默吞掉。
+func TestDesugarRejectsUnimplementedKnob(t *testing.T) {
+	users := []User{{Name: "z", MaxIPs: 2, OnExceedIPs: "evict-oldest", Keys: map[string]KeySpec{}}}
+	_, err := Desugar(users, map[string]bool{}, map[string][]string{})
+	if err == nil || !strings.Contains(err.Error(), "on-exceed-ips") {
+		t.Fatalf("evict-oldest 未实现,应报错: %v", err)
+	}
+	if _, err := Desugar([]User{{Name: "ok", MaxIPs: 2, OnExceedIPs: "reject", Keys: map[string]KeySpec{}}}, map[string]bool{}, map[string][]string{}); err != nil {
+		t.Errorf("reject 应通过: %v", err)
 	}
 }

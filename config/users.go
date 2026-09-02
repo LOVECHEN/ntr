@@ -49,7 +49,7 @@ type User struct {
 	Rate        string             `yaml:"rate"` // 带宽串(如 200mbps);合计上限。Desugar 解析
 	MaxConns    uint32             `yaml:"max-conns"`
 	MaxIPs      uint32             `yaml:"max-ips"`
-	OnExceedIPs string             `yaml:"on-exceed-ips"` // reject(默认) | evict-oldest
+	OnExceedIPs string             `yaml:"on-exceed-ips"` // reject(默认);evict-oldest 未实现——写了 Desugar 期报错,不静默
 }
 
 // AllowsAllInbounds 报此用户是否"全开"(缺省 on 或 on 含保留字 all)。
