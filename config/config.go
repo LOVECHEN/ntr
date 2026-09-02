@@ -343,6 +343,7 @@ func (o Outbound) synthLayers() ([]service.LayerSpec, error) {
 // ★只登记真正接完线的协议(诚实纪律:未接的留空 → 其顶层 users 不生效,别假装)。
 var sessionAuthProtos = map[string]bool{
 	"hysteria2": true,
+	"anytls":    true,
 }
 
 // authProto 该口的 per-user 认证协议(= 栈顶协议名,供 Desugar 按栈取密钥,§4.4 规则 3)。
@@ -1213,7 +1214,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			pin.MemGuard = memGuard // §6.4bis 软阈值拒新(nil 时零成本)
 			handler = &reverse.Portal{HS: pin, Control: in.ControlDomain}
 		case "anytls":
-			h, err := buildAnytlsInbound(in, out)
+			h, err := f.buildAnytlsInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
 			if err != nil {
 				return nil, fmt.Errorf("config: 入站 %s(anytls):%w", in.Listen, err)
 			}
@@ -1854,26 +1855,44 @@ func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver servi
 }
 
 // buildAnytlsInbound 建 AnyTLS 会话入站(TLS 证书 + 用户 + 绑定出站)。
-func buildAnytlsInbound(in Inbound, out endpoint.Outbound) (endpoint.InboundHandler, error) {
-	certPEM := fileOrStr(in.TLS, "cert")
-	keyPEM := fileOrStr(in.TLS, "key")
-	tlsConfig, err := anytls.ServerTLSConfig(certPEM, keyPEM)
+// buildAnytlsInbound 建 AnyTLS 入站。顶层 users(binds 非空):tag=BillID 喂 sing-anytls 多用户,命中后
+// anytls.UserFromContext 回读 → cred.ID → SessionDispatch 计量。无 binds 退回口内 in.Users 垫片(身份 Ambient,
+// 闸+mem-guard 仍生效)。注:UDP(UoT)当前走协议内 serveUOT 直落,不经本 dispatch → 暂不计量(TCP 已计)。
+func (f *File) buildAnytlsInbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (endpoint.InboundHandler, error) {
+	tlsConfig, err := anytls.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
+	if err != nil {
+		return nil, err
+	}
+	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
 	if err != nil {
 		return nil, err
 	}
 	var users []anytls.User
-	for _, u := range in.Users {
-		pw, _ := u["password"].(string)
-		if pw == "" {
-			continue
+	var refs map[string]cred.ID
+	if len(binds) > 0 {
+		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
+		if err != nil {
+			return nil, err
 		}
-		name, _ := u["name"].(string)
-		users = append(users, anytls.User{Name: name, Password: pw})
+		refs = r
+		for _, su := range sus {
+			users = append(users, anytls.User{Name: su.Tag, Password: su.Secret})
+		}
+	} else {
+		for _, u := range in.Users {
+			pw, _ := u["password"].(string)
+			if pw == "" {
+				continue
+			}
+			name, _ := u["name"].(string)
+			users = append(users, anytls.User{Name: name, Password: pw})
+		}
 	}
 	if len(users) == 0 {
-		return nil, fmt.Errorf("anytls 入站需至少一个 user{password}")
+		return nil, fmt.Errorf("anytls 入站需至少一个用户(顶层 users.keys.anytls 或口内 user{password})")
 	}
-	return anytls.NewInbound(users, tlsConfig, out, sessionPortalDispatch(in))
+	dispatch := f.sessionDispatch(in, out, adm, refs, anytls.UserFromContext)
+	return anytls.NewInbound(users, tlsConfig, out, dispatch)
 }
 
 // buildSshInbound 建 SSH 会话入站(host 私钥 = tls.key + 用户{password/public-key} + 绑定出站)。

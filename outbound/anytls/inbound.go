@@ -9,6 +9,7 @@ import (
 
 	sanytls "github.com/anytls/sing-anytls"
 	"github.com/anytls/sing-anytls/padding"
+	"github.com/sagernet/sing/common/auth"
 	sbuf "github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -25,6 +26,10 @@ var _ endpoint.InboundHandler = (*Inbound)(nil)
 
 // User 是 AnyTLS 服务端用户(名 + 密码)。
 type User = sanytls.User
+
+// UserFromContext 读 sing-anytls(sagernet/sing fork)鉴权命中后经 auth.ContextWithUser 写入的用户 tag。
+// 供 config 的会话式计量 dispatch 回读身份 → 映 cred.ID(承第4章顶层 users;tag = BillID)。
+func UserFromContext(ctx context.Context) (string, bool) { return auth.UserFromContext[string](ctx) }
 
 // Inbound 是 AnyTLS 会话解复用入站:一条 TLS 连接 → anytls 会话 → 多条复用流,每条路由到出站。
 type Inbound struct {
