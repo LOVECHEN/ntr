@@ -25,15 +25,16 @@ type Cell struct {
 	connsTotal atomic.Uint64 // 单调累计连接数
 	connsLive  atomic.Int64  // 当前活跃连接
 
-	disabled atomic.Bool          // 热开关:停用(拒新 + 断老,承 §6.5.2)
-	liveMu   sync.Mutex           // 配对 disabled 检查与 live 增删(D-01 竞态修法,承 §6.5.5)
-	live     map[uint64]func()    // connID → close 函数(KillConn/killAll 用)
+	disabled atomic.Bool       // 热开关:停用(拒新 + 断老,承 §6.5.2)
+	liveMu   sync.Mutex        // 配对 disabled 检查与 live 增删(D-01 竞态修法,承 §6.5.5)
+	live     map[uint64]func() // connID → close 函数(KillConn/killAll 用)
 
 	// 限制(承 §6.2 每用户;config 期设,连接前;0/nil = 不限)。
-	maxConns      atomic.Int64  // 并发连接上限(原地 atomic 更新支持 reload InPlace)
+	maxConns      atomic.Int64  // 并发连接上限(原地 atomic 更新支持 reload InPlace);shared 非 nil 时不用
 	rejectedConns atomic.Uint64 // 因 max-conns 触顶被拒的连接数(§6.4.2 必计数)
-	rate          *rateLimiter  // 吞吐令牌桶(稀疏泄流点 throttle)
-	ipg           *ipGate       // 同时在线不同源 IP 数限制
+	rate          *rateLimiter  // 吞吐令牌桶(稀疏泄流点 throttle);shared 时指向共享桶
+	ipg           *ipGate       // 同时在线不同源 IP 数限制;shared 时指向共享闸
+	shared        *sharedLimit  // 按人合计的限流单元(同一 user 各 BillID 的 Cell 共指);nil = 单 Cell 自限
 }
 
 // addGuarded 在同一把锁下【先查 disabled 再登记】:已停用则拒绝登记(调用方关连接),消除 D-01 幽灵连接。
@@ -71,16 +72,67 @@ func (c *Cell) killAll() int {
 	return len(kills)
 }
 
-// Registry 按 cred.ID 聚合 Cell(每用户一个)。热路径只读;Cell 建后不删(用户集稳定)。
+// Registry 按 cred.ID 聚合 Cell(每凭据一个)。热路径只读;Cell 建后不删(凭据集稳定)。
+//
+// 它同时是【BillID ↔ 数字句柄】的分配权所在:配置层的稳定身份是 BillID("name@inbound",承第 4 章
+// 规则 5),运行时热路径只认 cred.ID。分配放这里(而非 config 局部)的原因是 Registry 跨热重载复用 ——
+// 同一 bill 在下一代配置里拿到同一个 id,面板存下的 id 不会在 reload 后指向别人。
 type Registry struct {
 	mu      sync.RWMutex
 	cells   map[cred.ID]*Cell
 	connSeq atomic.Uint64 // 全局 connID 分配
 	idx     sync.Map      // connID(uint64) → *Cell,供 KillConn 全局定位
+
+	bills  map[string]cred.ID // BillID → id(同 bill 恒同 id)
+	labels map[cred.ID]string // id → BillID(对外报标签 / 反查)
+	nextID cred.ID            // 下一个空位;从 UserBase+1 起,不占 Unmatched(0)/Ambient(1) 保留位
 }
 
 // NewRegistry 建注册表。
-func NewRegistry() *Registry { return &Registry{cells: make(map[cred.ID]*Cell)} }
+func NewRegistry() *Registry {
+	return &Registry{
+		cells:  make(map[cred.ID]*Cell),
+		bills:  make(map[string]cred.ID),
+		labels: make(map[cred.ID]string),
+		nextID: cred.UserBase + 1,
+	}
+}
+
+// IDForBill 把稳定计费身份 BillID 映射到运行时数字句柄:同 bill 恒同 id(跨 reload 复用),新 bill 分配
+// 下一个空位。并发安全;幂等。
+func (r *Registry) IDForBill(bill string) cred.ID {
+	r.mu.RLock()
+	id, ok := r.bills[bill]
+	r.mu.RUnlock()
+	if ok {
+		return id
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if id, ok = r.bills[bill]; ok {
+		return id
+	}
+	id = r.nextID
+	r.nextID++
+	r.bills[bill] = id
+	r.labels[id] = bill
+	return id
+}
+
+// IDByBill 反查:只读,不分配。
+func (r *Registry) IDByBill(bill string) (cred.ID, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	id, ok := r.bills[bill]
+	return id, ok
+}
+
+// Bill 报 id 的 BillID 标签(未登记为空串)。
+func (r *Registry) Bill(id cred.ID) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.labels[id]
+}
 
 // cell 取 id 的 Cell(不存在则建)。
 func (r *Registry) cell(id cred.ID) *Cell {
@@ -145,7 +197,7 @@ func (r *Registry) Disable(id cred.ID) (killed int, ok bool) {
 	if c == nil {
 		return 0, false
 	}
-	c.disabled.Store(true) // ① 先置位:此后 addGuarded 拒新
+	c.disabled.Store(true)   // ① 先置位:此后 addGuarded 拒新
 	return c.killAll(), true // ② 再断老(与 addGuarded 同锁,无中间态)
 }
 
@@ -254,9 +306,11 @@ func (m *Meter) Flush() {
 	m.localUp, m.localDn = 0, 0
 }
 
-// UserStat 是一个用户的计量快照 + 开关状态。
+// UserStat 是一个凭据的计量快照 + 开关状态。Bill 是稳定身份("name@inbound"),面板按它对账;
+// ID 是本进程的运行时句柄(同 bill 跨 reload 复用,但仍不要跨机器/跨重启持久化 ID)。
 type UserStat struct {
 	ID         uint64 `json:"id"`
+	Bill       string `json:"bill,omitempty"`
 	Up         uint64 `json:"up"`
 	Down       uint64 `json:"down"`
 	ConnsTotal uint64 `json:"conns_total"`
@@ -272,14 +326,19 @@ func (r *Registry) Snapshot() []UserStat {
 	r.mu.RLock()
 	out := make([]UserStat, 0, len(r.cells))
 	for id, c := range r.cells {
+		maxConns := c.maxConns.Load()
+		if s := c.shared; s != nil {
+			maxConns = s.maxConns // 按人合计的上限
+		}
 		out = append(out, UserStat{
 			ID:         uint64(id),
+			Bill:       r.labels[id],
 			Up:         c.up.Load(),
 			Down:       c.down.Load(),
 			ConnsTotal: c.connsTotal.Load(),
 			ConnsLive:  c.connsLive.Load(),
 			Disabled:   c.disabled.Load(),
-			MaxConns:   c.maxConns.Load(),
+			MaxConns:   maxConns,
 			Rejected:   c.rejectedConns.Load(),
 		})
 	}

@@ -21,9 +21,20 @@ import (
 
 // 编译期断言:Snell 作为纯插件实现统一契约。
 var (
-	_ proxy.Server = (*Proxy)(nil)
-	_ proxy.Client = (*Proxy)(nil)
+	_ proxy.Server          = (*Proxy)(nil)
+	_ proxy.Client          = (*Proxy)(nil)
+	_ proxy.CredentialCodec = (*Proxy)(nil)
 )
+
+// ClientKey / AuthKey 实现 proxy.CredentialCodec:Snell 的 per-user 凭据就是【clientID 明文】
+// (命令帧里的 [idLen][clientID],v1–v6 都解出),线上原样、无派生 → 两者皆 identity。
+// 顶层 users 写 `keys.snell: <clientID>`,脱糖后登记 (snell, clientID) → BillID。
+//
+// ★语义护栏:Snell 的访问闸是【单端口 PSK】(Config.PSK,口级),clientID 只是计费/身份标签。
+// 因此顶层 users 对 Snell 提供的是 clientID→BillID 的计费映射,【不 gate 访问】——持端口 PSK 但
+// clientID 未登记的连接仍按 Ambient 放行(server.go 的现行语义),与 vless/trojan「未匹配即拒」不同。
+func (*Proxy) ClientKey(secret string) ([]byte, error) { return []byte(secret), nil }
+func (*Proxy) AuthKey(secret string) ([]byte, error)   { return []byte(secret), nil }
 
 // Config 是 Snell 协议自有配置。PSK 是端口级密钥(单端口 PSK);出站时客户端出示的凭据
 // 由 ClientHandshake 的 key 传入。Version 选协议版本:1/2/3 走 snellv123(shadowsocks-AEAD 分帧,

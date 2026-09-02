@@ -68,19 +68,51 @@ type Config struct {
 	Password string
 }
 
-// Proxy 是 gost relay 连接级句柄。
-type Proxy struct{ cfg Config }
+// Proxy 是 gost relay 连接级句柄(Descriptor.Build 产物,连接间复用;authRequired 在装配期一次性设定)。
+type Proxy struct {
+	cfg          Config
+	authRequired bool // 装配侧经 AuthGate 告知:本口配了 per-user 凭据 → 未匹配即拒
+}
 
 // Build 构造 Proxy。
 func Build(_ context.Context, cfg Config, _ any) (any, error) { return &Proxy{cfg: cfg}, nil }
 
+// per-user 凭据(第4章顶层 users):线上明文 user/pass,凭据串约定 "user:pass"(冒号首切,口令可含冒号,
+// 与 socks/client.go 同款);两端都是 identity,无派生。
+var (
+	_ proxy.CredentialCodec = (*Proxy)(nil)
+	_ proxy.AuthGate        = (*Proxy)(nil)
+)
+
+func (*Proxy) ClientKey(secret string) ([]byte, error) { return []byte(secret), nil }
+func (*Proxy) AuthKey(secret string) ([]byte, error)   { return []byte(secret), nil }
+func (p *Proxy) SetAuthRequired(required bool)         { p.authRequired = required }
+
+// splitUserPass 把 "user:pass" 冒号首切;缺冒号则整体作用户名、口令空。
+func splitUserPass(s string) (user, pass string) {
+	for i := 0; i < len(s); i++ {
+		if s[i] == ':' {
+			return s[:i], s[i+1:]
+		}
+	}
+	return s, ""
+}
+
+// userPassKey 是 Authenticator 的精确键:与 AuthKey("user:pass") 同字节。
+func userPassKey(user, pass string) []byte { return []byte(user + ":" + pass) }
+
 // ClientHandshake 实现 proxy.Client:写 CONNECT 请求(目标=dst),返回【惰性读响应】的流。
+// 凭据:出站 secret(经 ClientKey 原样传入的 "user:pass")优先;为空则退回口级 cfg.Username/Password。
 // ★惰性:go-gost v3 的 relay 响应是【懒发】—— connect 后不立刻回,而是把 [0x01][status][2B] 前缀【拼在目标
 // 首段下行数据前】一起发(省一个 RTT)。若客户端在握手里阻塞读响应,就与"服务端等客户端先发数据"死锁
 // (同 grpc 懒响应那课)。故这里握手只写请求即返回,首次 Read 时才剥响应前缀。
-func (p *Proxy) ClientHandshake(_ context.Context, below link.Stream, _ []byte, dst addr.Socksaddr) (link.Stream, error) {
+func (p *Proxy) ClientHandshake(_ context.Context, below link.Stream, key []byte, dst addr.Socksaddr) (link.Stream, error) {
+	user, pass := p.cfg.Username, p.cfg.Password
+	if len(key) > 0 {
+		user, pass = splitUserPass(string(key))
+	}
 	var b bytes.Buffer
-	writeRelayRequest(&b, cmdConnect, dst, networkTCP, p.cfg.Username, p.cfg.Password)
+	writeRelayRequest(&b, cmdConnect, dst, networkTCP, user, pass)
 	if _, err := below.Write(b.Bytes()); err != nil {
 		return nil, err
 	}
@@ -105,7 +137,7 @@ func (c *clientStream) Read(p []byte) (int, error) {
 func (c *clientStream) Unwrap() any { return c.Stream }
 
 // ServerHandshake 实现 proxy.Server:读 CONNECT 请求 → 解目标/网络/鉴权 → 回 OK → 返回下层中继流。
-func (p *Proxy) ServerHandshake(_ context.Context, below link.Stream, _ proxy.Authenticator) (link.Stream, *proxy.Request, error) {
+func (p *Proxy) ServerHandshake(_ context.Context, below link.Stream, auth proxy.Authenticator) (link.Stream, *proxy.Request, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(below, hdr[:]); err != nil {
 		return nil, nil, err
@@ -123,11 +155,19 @@ func (p *Proxy) ServerHandshake(_ context.Context, below link.Stream, _ proxy.Au
 		_ = writeResponse(below, statusBadRequest)
 		return nil, nil, err
 	}
-	if p.cfg.Username != "" || p.cfg.Password != "" {
+	// 鉴权三档(按优先级):① 顶层 users 精确命中 → 该用户;② 口级单凭据(旧写法 cfg.Username/Password)
+	// 比对 → Ambient;③ 本口配了 users 却未命中 → 拒(AuthGate);④ 什么都没配 → no-auth Ambient。
+	ref := cred.Ref{ID: cred.Ambient}
+	if r, ok := auth.Auth("gost", userPassKey(user, pass)); ok {
+		ref = r
+	} else if p.cfg.Username != "" || p.cfg.Password != "" {
 		if user != p.cfg.Username || pass != p.cfg.Password {
 			_ = writeResponse(below, statusUnauthorized)
 			return nil, nil, errAuth
 		}
+	} else if p.authRequired {
+		_ = writeResponse(below, statusUnauthorized)
+		return nil, nil, errAuth
 	}
 	if err := writeResponse(below, statusOK); err != nil {
 		return nil, nil, err
@@ -136,7 +176,7 @@ func (p *Proxy) ServerHandshake(_ context.Context, below link.Stream, _ proxy.Au
 	if network == networkUDP {
 		net = endpoint.NetworkUDP
 	}
-	return below, &proxy.Request{Cred: cred.Ref{ID: cred.Ambient}, Network: net, Command: cmdConnect, Dst: dst}, nil
+	return below, &proxy.Request{Cred: ref, Network: net, Command: cmdConnect, Dst: dst}, nil
 }
 
 // writeRelayRequest 编 CONNECT 请求(逐字节承 mihomo/go-gost)。

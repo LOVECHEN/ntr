@@ -158,8 +158,53 @@ func (r *Registry) SetLimits(id cred.ID, l Limits) {
 	}
 }
 
-// tryAcquireConn:接入时一次 CAS(承 §6.3.2,无 overshoot);cap=0 不限。管理 connsLive。
+// sharedLimit 是「按人合计」的瞬时限流单元(承第 4 章 §4.5.1 LimitRef:一个 user 一个,其名下各口的
+// 凭据共指):令牌桶、IP 闸、并发连接数都在这里合计,而不是每个 BillID 的 Cell 各限一份。
+// 只有瞬时状态,零持久化,重启归零 —— 不是 User、不是 govCell。
+type sharedLimit struct {
+	maxConns int64         // 合计并发上限;0 = 不限
+	live     atomic.Int64  // 合计活跃连接
+	rejected atomic.Uint64 // 合计因 max-conns 被拒
+	rate     *rateLimiter
+	ipg      *ipGate
+}
+
+// SetLimitsShared 给一组凭据(同一 user 的各 BillID)设【合计】限额:建一个共享单元,各 Cell 的 rate/ipg
+// 指向同一对象、连接数走共享计数。config 期调用(连接前,无并发)。
+func (r *Registry) SetLimitsShared(ids []cred.ID, l Limits) {
+	s := &sharedLimit{maxConns: l.MaxConns}
+	if l.Rate > 0 {
+		s.rate = newRateLimiter(l.Rate)
+	}
+	if l.MaxIPs > 0 {
+		s.ipg = newIPGate(l.MaxIPs)
+	}
+	for _, id := range ids {
+		c := r.cell(id)
+		c.shared = s
+		c.rate = s.rate
+		c.ipg = s.ipg
+		c.maxConns.Store(0) // 单 Cell 不再各自限连接数,交共享单元合计
+	}
+}
+
+// tryAcquireConn:接入时一次 CAS(承 §6.3.2,无 overshoot);cap=0 不限。管理 connsLive(每 Cell 的
+// 统计计数);有共享单元时,上限判定与合计计数走共享单元。
 func (c *Cell) tryAcquireConn() bool {
+	if s := c.shared; s != nil && s.maxConns > 0 {
+		for {
+			cur := s.live.Load()
+			if cur >= s.maxConns {
+				s.rejected.Add(1)
+				c.rejectedConns.Add(1)
+				return false
+			}
+			if s.live.CompareAndSwap(cur, cur+1) {
+				c.connsLive.Add(1)
+				return true
+			}
+		}
+	}
 	cap := c.maxConns.Load()
 	if cap == 0 {
 		c.connsLive.Add(1)
@@ -177,4 +222,9 @@ func (c *Cell) tryAcquireConn() bool {
 	}
 }
 
-func (c *Cell) releaseConn() { c.connsLive.Add(-1) }
+func (c *Cell) releaseConn() {
+	c.connsLive.Add(-1)
+	if s := c.shared; s != nil && s.maxConns > 0 {
+		s.live.Add(-1)
+	}
+}

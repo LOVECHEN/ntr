@@ -90,3 +90,10 @@ type CredentialCodec interface {
 	// AuthKey 由口令派生"服务端登记进 Authenticator 的键"(与 ServerHandshake 读到的 key 同源)。
 	AuthKey(secret string) ([]byte, error)
 }
+
+// AuthGate 是可选能力:鉴权对该协议是"可选"的(socks / http / gost 这类无凭据也能跑的入站)。
+// 协议自身不知道、也不该知道配置里有没有给这口配 users —— 那是零协议 switch 的边界;
+// 由装配侧在登记完 per-user 凭据后告知:配了 → 握手必须出示凭据、未匹配即拒;没配 → 保持 no-auth。
+type AuthGate interface {
+	SetAuthRequired(required bool)
+}

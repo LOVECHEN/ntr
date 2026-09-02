@@ -103,8 +103,8 @@ inbounds:
 	}
 }
 
-// TestSynthLayersTLSFieldAndUnknownKey:tls: 具名字段在新格式下成 tls 层;未注册的映射键(不是层插件)
-// 归终端协议字段而非误判成层;形态词 type(tun/proxy)不是新格式。
+// TestSynthLayersTLSFieldAndUnknownKey:tls: 具名字段在新格式下成 tls 层;形态词 type(tun/proxy)不是新格式。
+// 未注册的【映射】键(十有八九是拼错的层名)必须判死而不是静默当协议字段(见 TestSynthStrict)。
 func TestSynthLayersTLSFieldAndUnknownKey(t *testing.T) {
 	const src = `
 inbounds:
@@ -116,8 +116,6 @@ inbounds:
       key-file: /k.pem
     grpc:
       service-name: tun
-    notalayer:
-      x: 1
 `
 	var f File
 	if err := yaml.Unmarshal([]byte(src), &f); err != nil {
@@ -136,7 +134,7 @@ inbounds:
 		return
 	}
 	if names := layerNames(ls); names != "grpc,tls,trojan" {
-		t.Errorf("层集应为 grpc,tls,trojan(notalayer 不是层): %s", names)
+		t.Errorf("层集应为 grpc,tls,trojan: %s", names)
 	}
 
 	for _, typ := range []string{"tun", "proxy", "", "anytls"} {

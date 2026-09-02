@@ -21,6 +21,9 @@ import (
 // 轮换:某层多把 key → 该层产多个平行 binding(多层则笛卡尔积),共享同一 BillID。
 func Desugar(users []User, inboundNames map[string]bool, stackProtos map[string][]string) ([]principal.CredBinding, error) {
 	seen := make(map[string]bool, len(users))
+	// keyOwner:(口, 协议, 原始密钥) → 已占用它的 user。同口同协议同 key 被两个人用 = 鉴权歧义 + 计费串号,
+	// 装配期 auth.Add 会静默覆盖(那语义是给 reload 换密的),所以必须在这里判死(E-KEY-DUP)。
+	keyOwner := make(map[string]string)
 	var out []principal.CredBinding
 
 	for _, u := range users {
@@ -32,12 +35,23 @@ func Desugar(users []User, inboundNames map[string]bool, stackProtos map[string]
 		}
 		seen[u.Name] = true
 
+		hasAll := false
 		for _, ib := range u.On {
-			if ib != OnAll && !inboundNames[ib] {
+			if ib == OnAll {
+				hasAll = true
+				continue
+			}
+			if !inboundNames[ib] {
 				return nil, fmt.Errorf("config: user %q 的 on 引用未知口 %q (E-INBOUND-UNKNOWN)", u.Name, ib)
 			}
 		}
+		if hasAll && len(u.On) > 1 { // all 已全开,再列具名口会让"显式 on 缺密钥报错"的意图失效 → 判死,不留歧义
+			return nil, fmt.Errorf("config: user %q 的 on 含保留字 all 时不能再列具名口(all 即全开;要收窄就去掉 all)", u.Name)
+		}
 		for _, ib := range u.Off {
+			if ib == OnAll {
+				return nil, fmt.Errorf("config: user %q 的 off 不支持保留字 all(要全屏蔽请把该 user 删掉或逐口列出)", u.Name)
+			}
 			if !inboundNames[ib] {
 				return nil, fmt.Errorf("config: user %q 的 off 引用未知口 %q (E-INBOUND-UNKNOWN)", u.Name, ib)
 			}
@@ -70,6 +84,15 @@ func Desugar(users []User, inboundNames map[string]bool, stackProtos map[string]
 					return nil, fmt.Errorf("config: user %q on 了口 %q 但缺该口栈所需协议 %q 的密钥 (E-KEY-MISSING)", u.Name, ib, missing)
 				}
 				continue // 全开下缺密钥 = 没买这口,跳过
+			}
+			for i, p := range protos {
+				for _, v := range layerVals[i] {
+					k := ib + "\x00" + p + "\x00" + v
+					if owner, dup := keyOwner[k]; dup && owner != u.Name {
+						return nil, fmt.Errorf("config: user %q 与 %q 在口 %q 的协议 %q 上用了同一把密钥 (E-KEY-DUP):鉴权无法区分、计费会串号", u.Name, owner, ib, p)
+					}
+					keyOwner[k] = u.Name
+				}
 			}
 			out = append(out, expandLayers(u, ib, protos, layerVals, limit)...)
 		}
@@ -152,6 +175,16 @@ func expandLayers(u User, ib string, protos []string, layerVals [][]string, limi
 		})
 	}
 	return out
+}
+
+// sortedKeysAny 报 map 的键(排序),供报错信息稳定可读。
+func sortedKeysAny(m map[string]any) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
 }
 
 func sortedKeys(m map[string]bool) []string {

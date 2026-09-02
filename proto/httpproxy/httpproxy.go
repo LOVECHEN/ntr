@@ -10,6 +10,7 @@ package httpproxy
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strconv"
+	"strings"
 
 	"github.com/LOVECHEN/ntr/addr"
 	"github.com/LOVECHEN/ntr/core/cred"
@@ -31,26 +33,65 @@ var (
 	_ proxy.Client = (*Proxy)(nil)
 )
 
-// Config 是 HTTP 代理配置(当前无自有参数,鉴权走外部 Authenticator / 无鉴权)。
+// Config 是 HTTP 代理配置(无线上参数;鉴权由顶层 users 经 Authenticator 提供)。
 type Config struct{}
 
 // Parse:HTTP 代理无自有线上参数。
 func Parse(*spec.Node) (Config, error) { return Config{}, nil }
 
-// Proxy 是 HTTP 代理连接级句柄(无状态)。
-type Proxy struct{}
+// Proxy 是 HTTP 代理连接级句柄(Descriptor.Build 产物,连接间复用;authRequired 装配期一次性设定)。
+type Proxy struct {
+	authRequired bool // 装配侧经 AuthGate 告知:本口配了 per-user 凭据 → 缺/错 Proxy-Authorization 即 407
+}
 
 // Build 构造 Proxy。
 func Build(_ context.Context, _ Config, _ any) (any, error) { return &Proxy{}, nil }
 
-// ServerHandshake 实现 proxy.Server:解析首个 HTTP 请求(CONNECT 或明文转发),返回承载流 + 目标。
-func (p *Proxy) ServerHandshake(_ context.Context, below link.Stream, _ proxy.Authenticator) (link.Stream, *proxy.Request, error) {
+// per-user 凭据(第4章顶层 users):HTTP Basic 的 "user:pass",两端 identity;线上是 base64,
+// 服务端解出来再以 (http, "user:pass") 精确匹配。
+var (
+	_ proxy.CredentialCodec = (*Proxy)(nil)
+	_ proxy.AuthGate        = (*Proxy)(nil)
+)
+
+func (*Proxy) ClientKey(secret string) ([]byte, error) { return []byte(secret), nil }
+func (*Proxy) AuthKey(secret string) ([]byte, error)   { return []byte(secret), nil }
+func (p *Proxy) SetAuthRequired(required bool)         { p.authRequired = required }
+
+var errProxyAuth = errors.New("httpproxy: Proxy-Authorization 缺失或未匹配(407)")
+
+// authenticate 解 Proxy-Authorization: Basic base64(user:pass) 并匹配;返回归属。
+// 三档:命中 → 该用户;本口配了 users 却缺/错 → 回 407 并拒;没配 → Ambient。
+// 无论如何都从请求里删掉 Proxy-Authorization —— 绝不把本口凭据泄给上游。
+func (p *Proxy) authenticate(below link.Stream, req *http.Request, auth proxy.Authenticator) (cred.Ref, error) {
+	hdr := req.Header.Get("Proxy-Authorization")
+	req.Header.Del("Proxy-Authorization")
+	if scheme, b64, ok := strings.Cut(hdr, " "); ok && strings.EqualFold(scheme, "Basic") {
+		if raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64)); err == nil {
+			if r, ok := auth.Auth("http", raw); ok {
+				return r, nil
+			}
+		}
+	}
+	if p.authRequired {
+		_, _ = below.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"ntr\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+		return cred.Ref{}, errProxyAuth
+	}
+	return cred.Ref{ID: cred.Ambient}, nil
+}
+
+// ServerHandshake 实现 proxy.Server:解析首个 HTTP 请求(CONNECT 或明文转发),鉴权,返回承载流 + 目标。
+func (p *Proxy) ServerHandshake(_ context.Context, below link.Stream, auth proxy.Authenticator) (link.Stream, *proxy.Request, error) {
 	br := bufio.NewReader(below)
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		return nil, nil, err
 	}
 	req.Header.Del("Proxy-Connection")
+	ref, err := p.authenticate(below, req, auth)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	if req.Method == http.MethodConnect {
 		dst, err := parseHostPort(req.Host, 443)
@@ -60,7 +101,7 @@ func (p *Proxy) ServerHandshake(_ context.Context, below link.Stream, _ proxy.Au
 		if _, err := below.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 			return nil, nil, err
 		}
-		req := &proxy.Request{Cred: cred.Ref{ID: cred.Ambient}, Network: endpoint.NetworkTCP, Dst: dst}
+		req := &proxy.Request{Cred: ref, Network: endpoint.NetworkTCP, Dst: dst}
 		return &bufStream{Conn: below, r: br, below: below}, req, nil
 	}
 
@@ -84,14 +125,18 @@ func (p *Proxy) ServerHandshake(_ context.Context, below link.Stream, _ proxy.Au
 	req.RequestURI = ""
 	pr, pw := io.Pipe()
 	go func() { pw.CloseWithError(req.Write(pw)) }()
-	preq := &proxy.Request{Cred: cred.Ref{ID: cred.Ambient}, Network: endpoint.NetworkTCP, Dst: dst}
+	preq := &proxy.Request{Cred: ref, Network: endpoint.NetworkTCP, Dst: dst}
 	return &forwardStream{Conn: below, pr: pr, up: pr, r: br, below: below}, preq, nil
 }
 
-// ClientHandshake 实现 proxy.Client:向上游 HTTP 代理发 CONNECT,校验 200,返回裸隧道。
-func (p *Proxy) ClientHandshake(_ context.Context, below link.Stream, _ []byte, dst addr.Socksaddr) (link.Stream, error) {
+// ClientHandshake 实现 proxy.Client:向上游 HTTP 代理发 CONNECT(key 非空则带 Basic 凭据),校验 200,返回裸隧道。
+func (p *Proxy) ClientHandshake(_ context.Context, below link.Stream, key []byte, dst addr.Socksaddr) (link.Stream, error) {
 	target := dst.String()
-	if _, err := fmt.Fprintf(below, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
+	authLine := ""
+	if len(key) > 0 {
+		authLine = "Proxy-Authorization: Basic " + base64.StdEncoding.EncodeToString(key) + "\r\n"
+	}
+	if _, err := fmt.Fprintf(below, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n%s\r\n", target, target, authLine); err != nil {
 		return nil, err
 	}
 	br := bufio.NewReader(below)

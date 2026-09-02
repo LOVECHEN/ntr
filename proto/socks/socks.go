@@ -25,7 +25,11 @@ import (
 	"github.com/LOVECHEN/ntr/core/proxy"
 )
 
-var _ proxy.Server = (*Proxy)(nil)
+var (
+	_ proxy.Server          = (*Proxy)(nil)
+	_ proxy.CredentialCodec = (*Proxy)(nil) // per-user 凭据 "user:pass"(RFC 1929),两端 identity
+	_ proxy.AuthGate        = (*Proxy)(nil) // 本口配了 users → 必须 user/pass 子协商,未匹配即拒
+)
 
 const version = 0x05
 
@@ -41,20 +45,66 @@ const (
 )
 
 var (
-	ErrVersion = errors.New("socks: 非 SOCKS5")
-	ErrNoAuth  = errors.New("socks: 客户端未提供 no-auth 方法")
-	ErrAtyp    = errors.New("socks: 未知地址类型")
-	ErrCommand = errors.New("socks: 仅支持 CONNECT")
+	ErrVersion     = errors.New("socks: 非 SOCKS5")
+	ErrNoAuth      = errors.New("socks: 客户端未提供可接受的认证方法")
+	ErrAuthVersion = errors.New("socks: RFC1929 子协商版本非 1")
+	ErrAuthFailed  = errors.New("socks: user/pass 未匹配任何凭据")
+	ErrAtyp        = errors.New("socks: 未知地址类型")
+	ErrCommand     = errors.New("socks: 仅支持 CONNECT")
 )
 
-// Config 是 SOCKS 自有配置(当前 no-auth,本地入站;user/pass 后续可加)。
+// Config 是 SOCKS 自有配置(无线上参数;鉴权由顶层 users 经 Authenticator 提供)。
 type Config struct{}
 
-// Proxy 是连接级句柄。
-type Proxy struct{ cfg Config }
+// Proxy 是连接级句柄(Descriptor.Build 产物,连接间复用;authRequired 装配期一次性设定)。
+type Proxy struct {
+	cfg          Config
+	authRequired bool // 装配侧经 AuthGate 告知:本口配了 per-user 凭据 → 必须 RFC1929,未匹配即拒
+}
 
 // Build 构造 Proxy。
 func Build(_ context.Context, cfg Config, _ any) (any, error) { return &Proxy{cfg: cfg}, nil }
+
+// ClientKey / AuthKey:凭据串 "user:pass" 原样(与 client.go 的 RFC1929 子协商同一约定);
+// SetAuthRequired 由装配侧调用。
+func (*Proxy) ClientKey(secret string) ([]byte, error) { return []byte(secret), nil }
+func (*Proxy) AuthKey(secret string) ([]byte, error)   { return []byte(secret), nil }
+func (p *Proxy) SetAuthRequired(required bool)         { p.authRequired = required }
+
+// serverUserPass 服务端 RFC 1929 子协商:读 [VER ULEN USER PLEN PASS],以 (socks, "user:pass")
+// 精确匹配顶层 users;未命中回状态 0x01 并拒。
+func serverUserPass(below link.Stream, auth proxy.Authenticator) (cred.Ref, error) {
+	var hdr [2]byte
+	if _, err := io.ReadFull(below, hdr[:]); err != nil {
+		return cred.Ref{}, err
+	}
+	if hdr[0] != authVersion {
+		return cred.Ref{}, ErrAuthVersion
+	}
+	user := make([]byte, hdr[1])
+	if _, err := io.ReadFull(below, user); err != nil {
+		return cred.Ref{}, err
+	}
+	var pl [1]byte
+	if _, err := io.ReadFull(below, pl[:]); err != nil {
+		return cred.Ref{}, err
+	}
+	pass := make([]byte, pl[0])
+	if _, err := io.ReadFull(below, pass); err != nil {
+		return cred.Ref{}, err
+	}
+	key := make([]byte, 0, len(user)+1+len(pass))
+	key = append(append(append(key, user...), ':'), pass...)
+	r, ok := auth.Auth("socks", key)
+	if !ok {
+		_, _ = below.Write([]byte{authVersion, 0x01})
+		return cred.Ref{}, ErrAuthFailed
+	}
+	if _, err := below.Write([]byte{authVersion, 0x00}); err != nil {
+		return cred.Ref{}, err
+	}
+	return r, nil
+}
 
 // ServerHandshake 实现 proxy.Server:方法协商(no-auth)→ 读请求 → 乐观回 success →
 // 返回下层 stream(其上即 payload)。
@@ -85,12 +135,30 @@ func (p *Proxy) serverHandshake5(below link.Stream, auth proxy.Authenticator) (l
 	if _, err := io.ReadFull(below, methods); err != nil {
 		return nil, nil, err
 	}
-	if !slices.Contains(methods, methodNoAuth) {
+	// 方法协商:本口配了 users → 只接受 RFC1929(0x02),子协商命中即得该用户;
+	// 没配 → 保持 no-auth(本地入站语义不变)。
+	ref := cred.Ref{ID: cred.Ambient}
+	switch {
+	case p.authRequired:
+		if !slices.Contains(methods, methodUserPass) {
+			_, _ = below.Write([]byte{version, methodNone})
+			return nil, nil, ErrNoAuth
+		}
+		if _, err := below.Write([]byte{version, methodUserPass}); err != nil {
+			return nil, nil, err
+		}
+		r, err := serverUserPass(below, auth)
+		if err != nil {
+			return nil, nil, err
+		}
+		ref = r
+	case slices.Contains(methods, methodNoAuth):
+		if _, err := below.Write([]byte{version, methodNoAuth}); err != nil {
+			return nil, nil, err
+		}
+	default:
 		_, _ = below.Write([]byte{version, methodNone})
 		return nil, nil, ErrNoAuth
-	}
-	if _, err := below.Write([]byte{version, methodNoAuth}); err != nil {
-		return nil, nil, err
 	}
 
 	// 请求:VER CMD RSV ATYP ADDR PORT
@@ -118,10 +186,8 @@ func (p *Proxy) serverHandshake5(below link.Stream, auth proxy.Authenticator) (l
 		return nil, nil, err
 	}
 
-	ref := cred.Ref{ID: cred.Ambient} // 本地 no-auth 入站 → Ambient(可由 by-inbound 覆盖)
-	if r, ok := auth.Auth("socks", nil); ok {
-		ref = r
-	}
+	// ref:no-auth 口为 Ambient(可由 by-inbound 覆盖);配了 users 则是子协商命中的用户。
+	// 注:UDP ASSOCIATE 走 handleUDPAssoc 自建 Request,其 Cred 归属尚未透传 ref(per-user UDP 计量后续)。
 	return below, &proxy.Request{Cred: ref, Network: endpoint.NetworkTCP, Command: cmd, Dst: dst}, nil
 }
 

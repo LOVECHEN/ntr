@@ -255,6 +255,9 @@ func (in Inbound) newFormat() bool { return len(in.Layers) == 0 && isProxyProto(
 //     config 不认识任何协议名,分拣全靠 registry.Lookup。
 func synthStack(typ string, layers []map[string]any, extra, tls map[string]any) ([]service.LayerSpec, error) {
 	if len(layers) > 0 {
+		if len(extra) > 0 { // 旧 layers 数组与新格式 inline 层块/字段混写:后者会被静默丢弃 → 直接判死
+			return nil, fmt.Errorf("旧 layers 数组不能与新格式层块/协议字段混写(多余键 %s);二选一", sortedKeysAny(extra))
+		}
 		return toLayerSpecs(layers)
 	}
 	if !isProxyProto(typ) {
@@ -263,17 +266,22 @@ func synthStack(typ string, layers []map[string]any, extra, tls map[string]any) 
 	var specs []service.LayerSpec
 	protoFields := make(map[string]any)
 	for k, v := range extra {
-		if m, isMap := v.(map[string]any); isMap {
-			if _, isLayer := registry.Lookup(k); isLayer {
-				node, err := mapToNode(m, "")
-				if err != nil {
-					return nil, fmt.Errorf("层 %q:%w", k, err)
-				}
-				specs = append(specs, service.LayerSpec{Name: k, Node: node})
-				continue
+		m, isMap := v.(map[string]any)
+		_, isLayer := registry.Lookup(k)
+		switch {
+		case isLayer && isMap:
+			node, err := mapToNode(m, "")
+			if err != nil {
+				return nil, fmt.Errorf("层 %q:%w", k, err)
 			}
+			specs = append(specs, service.LayerSpec{Name: k, Node: node})
+		case isLayer && !isMap: // 层名写成标量:该层会静默缺席(如 tls 退化明文)→ 判死
+			return nil, fmt.Errorf("层 %q 须写成块式映射(不能是标量/列表),否则该层静默缺席", k)
+		case !isLayer && isMap: // 映射值却不是注册层:十有八九是拼错的层名(relaity:)→ 判死,不静默吞成协议字段
+			return nil, fmt.Errorf("未知层块 %q:不是注册的层插件(协议专属字段应为标量,层块名请核对拼写)", k)
+		default:
+			protoFields[k] = v
 		}
-		protoFields[k] = v
 	}
 	if len(tls) > 0 {
 		node, err := mapToNode(tls, "")
@@ -842,11 +850,17 @@ func buildRouter(ctx context.Context, spec *RoutingSpec, outs map[string]endpoin
 func (f *File) Build(ctx context.Context) ([]Instance, error) {
 	outs := map[string]endpoint.Outbound{"direct": direct.Outbound{}} // 恒有 direct
 	var dnsOutboundNames []string                                     // type=dns 出站延迟到 resolver 建好再填
-	metricReg := f.Reg                                                // 计量注册表(开启时);nil = 关闭、零成本
-	if metricReg == nil && f.Metrics != nil && f.Metrics.Listen != "" {
-		metricReg = meter.NewRegistry()
+	// 注册表【常驻】:它是 BillID ↔ 数字句柄的分配权所在(跨热重载复用,id 稳定);
+	// 计量/限额是否启用另看 metrics: 块 —— metricReg 非 nil 才把 pi.Meter 挂上、才设限额。
+	reg := f.Reg
+	if reg == nil {
+		reg = meter.NewRegistry()
 	}
-	f.Reg = metricReg                      // 写回供热重载复用
+	f.Reg = reg                   // 写回供热重载复用
+	var metricReg *meter.Registry // nil = 计量关闭、零成本
+	if f.Metrics != nil && f.Metrics.Listen != "" {
+		metricReg = reg
+	}
 	globalGate, err := buildGate(f.Limits) // 全局连接闸/限速(§6.2 层1;nil=不限)
 	if err != nil {
 		return nil, fmt.Errorf("config: limits:%w", err)
@@ -877,6 +891,10 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 				return nil, fmt.Errorf("config: 出站 %q(block)未知 mode %q(仅 reject/drop)", o.Name, o.Mode)
 			}
 		case "proxy":
+			if o.newFormat() && (o.SNI != "" || o.Insecure || o.Fingerprint != "") {
+				// 这几个具名字段只被会话式出站消费;流式栈出站的 TLS 参数在 tls: 块里,写顶层会被静默忽略 → 判死
+				return nil, fmt.Errorf("config: 出站 %q(type %s):sni/insecure/client-fingerprint 须写在 tls: 层块内,顶层不生效", o.Name, o.Type)
+			}
 			layers, err := o.synthLayers() // 旧 layers 数组(垫片)或第4章 type=协议名+层块
 			if err != nil {
 				return nil, fmt.Errorf("config: 出站 %q:%w", o.Name, err)
@@ -1080,11 +1098,17 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 	if err != nil {
 		return nil, err
 	}
+	if metricReg == nil { // per-user 限额挂在计量子系统上;metrics 未开时限额会静默失效 → 判死(冻结律#6)
+		for _, b := range bindings {
+			if b.Limit != nil {
+				return nil, fmt.Errorf("config: user %q 配了 rate/max-conns/max-ips 但未启用 metrics:(per-user 限额依赖计量子系统;请加 metrics: 块或去掉限额)", b.Name)
+			}
+		}
+	}
 	bindingsByInbound := make(map[string][]principal.CredBinding, len(bindings))
 	for _, b := range bindings {
 		bindingsByInbound[b.Inbound] = append(bindingsByInbound[b.Inbound], b)
 	}
-	billIDs := make(map[string]cred.ID) // BillID → 运行时数字句柄;同 BillID(轮换平行 binding)共享一个
 
 	for i, in := range f.Inbounds {
 		in.Listen = in.listenAddr()              // 第4章 listen(host)+port 合成;旧格式 host:port 原样
@@ -1112,10 +1136,11 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		if in.newFormat() { // 第4章新格式:type=协议名(vless/trojan/snell…)+ 层块,走流式栈(同 proxy 形态)
 			typ = "proxy"
 		}
+		binds := bindingsByInbound[in.inboundName()] // 该口的顶层 users 脱糖产物(proxy/portal 共用)
 		var handler endpoint.InboundHandler
 		switch typ {
 		case "", "proxy":
-			h, base, err := f.buildProxyInbound(ctx, in, resolver, bindingsByInbound[in.inboundName()], billIDs, metricReg)
+			h, base, err := f.buildProxyInbound(ctx, in, resolver, binds, reg, metricReg != nil)
 			if err != nil {
 				return nil, err
 			}
@@ -1134,7 +1159,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		case "portal":
 			// 反向代理 Portal:复用普通代理入站建栈 + 注册用户,再包成 reverse.Portal
 			// (control-domain 区分 Bridge 控制连接与用户连接)。out 未用(Portal 覆盖 HandleStream)。
-			pin, _, err := f.buildProxyInbound(ctx, in, resolver, bindingsByInbound[in.inboundName()], billIDs, metricReg)
+			pin, _, err := f.buildProxyInbound(ctx, in, resolver, binds, reg, metricReg != nil)
 			if err != nil {
 				return nil, err
 			}
@@ -1275,6 +1300,24 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		insts = append(insts, Instance{Listen: in.Listen, Handler: handler})
 	}
 
+	// 顶层 users 的限额【按人合计】(§4.5.1 LimitRef:一个 user 一个单元,其名下各口凭据共指):
+	// 同一 user 的所有 BillID 挂到同一个共享限流单元 —— rate/max-ips/max-conns 是合计,不是每口各一份。
+	if metricReg != nil {
+		byUser := make(map[string][]cred.ID)
+		limits := make(map[string]*principal.LimitRef)
+		for _, b := range bindings {
+			if b.Limit == nil {
+				continue
+			}
+			byUser[b.Name] = append(byUser[b.Name], metricReg.IDForBill(b.BillID))
+			limits[b.Name] = b.Limit
+		}
+		for name, ids := range byUser {
+			l := limits[name]
+			metricReg.SetLimitsShared(ids, meter.Limits{MaxConns: int64(l.MaxConns), Rate: float64(l.Rate), MaxIPs: int(l.MaxIPs)})
+		}
+	}
+
 	// 给源自 inbound 的 Instance 打源配置语义哈希(热重载 diff:同 Listen 但 Hash 变 = 重启该口)。
 	inboundHash := make(map[string]string, len(f.Inbounds))
 	for _, in := range f.Inbounds {
@@ -1357,13 +1400,22 @@ func serveMetrics(ctx context.Context, listen string, reg *meter.Registry, allow
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(reg.Snapshot())
 	}))
+	// 凭据定位:优先稳定身份 bill=name@inbound(面板对账用);兼容数字 id=。
+	credID := func(req *http.Request) (cred.ID, bool) {
+		q := req.URL.Query()
+		if b := q.Get("bill"); b != "" {
+			return reg.IDByBill(b)
+		}
+		id, err := parseUint(q.Get("id"))
+		return cred.ID(id), err == nil
+	}
 	mux.HandleFunc("/disable", gate(func(w http.ResponseWriter, req *http.Request) {
-		id, err := parseUint(req.URL.Query().Get("id"))
-		if err != nil {
-			http.Error(w, "bad id", http.StatusBadRequest)
+		id, ok := credID(req)
+		if !ok {
+			http.Error(w, "bad id/bill", http.StatusBadRequest)
 			return
 		}
-		killed, ok := reg.Disable(cred.ID(id))
+		killed, ok := reg.Disable(id)
 		if !ok {
 			http.Error(w, "no such cred", http.StatusNotFound)
 			return
@@ -1371,12 +1423,12 @@ func serveMetrics(ctx context.Context, listen string, reg *meter.Registry, allow
 		writeKilled(w, killed)
 	}))
 	mux.HandleFunc("/enable", gate(func(w http.ResponseWriter, req *http.Request) {
-		id, err := parseUint(req.URL.Query().Get("id"))
-		if err != nil {
-			http.Error(w, "bad id", http.StatusBadRequest)
+		id, ok := credID(req)
+		if !ok {
+			http.Error(w, "bad id/bill", http.StatusBadRequest)
 			return
 		}
-		if !reg.Enable(cred.ID(id)) {
+		if !reg.Enable(id) {
 			http.Error(w, "no such cred", http.StatusNotFound)
 			return
 		}
@@ -1548,10 +1600,12 @@ func accessAllowed(remoteAddr string, allow []netip.Prefix) bool {
 	return false
 }
 
-// buildProxyInbound 建流式栈入站(BuildInbound + 注册凭据 + 挂每用户限额)。凭据来源二选一:
-// 顶层 users 脱糖的 bindings(第4章,优先);无则退回旧口内 in.Users(兼容垫片,脚本迁完即拆)。
-// 认证登记与限额挂载在【同一处】分叉,避免两处各判一次凭据来源、靠隐式时序耦合。
-func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver service.OutboundResolver, bindings []principal.CredBinding, billIDs map[string]cred.ID, metricReg *meter.Registry) (*service.ProxyInbound, transport.BaseTransport, error) {
+// buildProxyInbound 建流式栈入站(BuildInbound + 注册凭据)。凭据来源二选一:顶层 users 脱糖的
+// bindings(第4章,优先);无则退回旧口内 in.Users(兼容垫片,脚本迁完即拆)。
+// 数字句柄一律经 reg.IDForBill 分配(顶层 users 用 BillID;垫片用 "<口>#<序号>" 合成 bill),两条路径
+// 不再各算一套 id、跨 reload 稳定。顶层 users 的【按人合计】限额在 Build 末尾统一挂(见 applyUserLimits);
+// 垫片的每口限额仍在此处逐条设(metering 关闭而配了限额 → fail-loud)。
+func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver service.OutboundResolver, bindings []principal.CredBinding, reg *meter.Registry, metering bool) (*service.ProxyInbound, transport.BaseTransport, error) {
 	layers, err := in.synthLayers() // 旧 layers 数组(垫片)或第4章 type=协议名+层块
 	if err != nil {
 		return nil, nil, fmt.Errorf("config: 入站 %s:%w", in.inboundName(), err)
@@ -1568,24 +1622,31 @@ func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver servi
 	}
 	cc, hasCodec := handler.Proxy.(proxy.CredentialCodec)
 	if !hasCodec {
-		return handler, base, nil // 协议无 per-user 凭据(socks no-auth / mixed …):不登记、不设限
+		if len(bindings) > 0 { // 配了顶层 users 却接不上:fail-loud,绝不静默落 Ambient(冻结律#6)
+			return nil, nil, fmt.Errorf("config: 入站 %s 配了 users 但协议 %q 不支持 per-user 凭据 (E-USERS-NO-CODEC)", in.inboundName(), layers[len(layers)-1].Name)
+		}
+		return handler, base, nil // 协议无 per-user 凭据且未配 users(socks no-auth / mixed …):不登记、不设限
+	}
+	// 鉴权可选的协议(socks/http/gost):登记完凭据后告知"本口是否配了凭据"(能力发现,零协议 switch)
+	gate := func(registered int) {
+		if g, ok := handler.Proxy.(proxy.AuthGate); ok {
+			g.SetAuthRequired(registered > 0)
+		}
 	}
 	if len(bindings) > 0 {
-		// 第4章路径:每条 binding 每层 canonical(AuthKey)后登记;BillID 映射稳定数字句柄,同 BillID 共享;
-		// 该 user 的 LimitRef 在首次遇到其 BillID 时挂到计量 cell(仅 metrics 开启时)。
+		// 第4章路径:每条 binding 每层 canonical(AuthKey)后登记;id 由 reg.IDForBill(BillID) 给,同 BillID
+		// (轮换平行 binding)自然共享。canonical 键撞车(两个 principal 派生出同一鉴权键)在 Desugar 的
+		// E-KEY-DUP 之外再兜一层:auth 表已有该键且指向别的 id → 判死,绝不静默覆盖。
+		defer gate(len(bindings))
 		for _, b := range bindings {
-			id, seen := billIDs[b.BillID]
-			if !seen {
-				id = cred.UserBase + cred.ID(len(billIDs)) + 1
-				billIDs[b.BillID] = id
-				if metricReg != nil && b.Limit != nil {
-					metricReg.SetLimits(id, meter.Limits{MaxConns: int64(b.Limit.MaxConns), Rate: float64(b.Limit.Rate), MaxIPs: int(b.Limit.MaxIPs)})
-				}
-			}
+			id := reg.IDForBill(b.BillID)
 			for _, layer := range b.Layers { // 当前单层(栈顶);多层待传输层参与 auth(骨头 4)
 				key, err := cc.AuthKey(string(layer.Key))
 				if err != nil {
 					return nil, nil, fmt.Errorf("config: 入站 %s 凭据 %s:%w", in.inboundName(), b.BillID, err)
+				}
+				if prev, dup := auth.Auth(layer.Scheme, key); dup && prev.ID != id {
+					return nil, nil, fmt.Errorf("config: 入站 %s 凭据 %s 与 %s 派生出同一鉴权键 (E-KEY-DUP)", in.inboundName(), b.BillID, reg.Bill(prev.ID))
 				}
 				auth.Add(layer.Scheme, key, cred.Ref{ID: id})
 			}
@@ -1594,6 +1655,7 @@ func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver servi
 	}
 	// 兼容垫片:旧口内 users(身份 = UserBase+j+1,跨口会撞——正是第4章要修的;脚本迁完拆)
 	scheme := layers[len(layers)-1].Name
+	registered := 0
 	for j, u := range in.Users {
 		secret := userSecret(u)
 		if secret == "" {
@@ -1603,14 +1665,17 @@ func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver servi
 		if err != nil {
 			return nil, nil, fmt.Errorf("config: 入站 %s 用户 #%d:%w", in.Listen, j, err)
 		}
-		id := cred.UserBase + cred.ID(j) + 1
+		id := reg.IDForBill(in.inboundName() + "#" + strconv.Itoa(j)) // 垫片合成 bill:与顶层 users 同一分配器,不撞、跨 reload 稳定
 		auth.Add(scheme, key, cred.Ref{ID: id})
-		if metricReg != nil {
-			if lim, ok := parseUserLimits(u); ok {
-				metricReg.SetLimits(id, lim)
+		registered++
+		if lim, ok := parseUserLimits(u); ok {
+			if !metering {
+				return nil, nil, fmt.Errorf("config: 入站 %s 用户 #%d 配了限额但未启用 metrics:(限额会静默失效)", in.Listen, j)
 			}
+			reg.SetLimits(id, lim)
 		}
 	}
+	gate(registered)
 	return handler, base, nil
 }
 
