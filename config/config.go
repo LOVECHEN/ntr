@@ -242,21 +242,22 @@ func isProxyProto(name string) bool {
 // newFormat 报此口是第4章新格式:type 为注册的终端协议名,且未写旧 layers 数组。
 func (in Inbound) newFormat() bool { return len(in.Layers) == 0 && isProxyProto(in.Type) }
 
-// synthLayers 产此口的层集交 buildStack(顺序无关,compile.Order 按 Band 排、书写序不参与):
-//   - 旧格式(layers 数组):原样 toLayerSpecs —— 兼容垫片,脚本迁完即拆。
-//   - 新格式(type=协议名 + 层块):Extra 里「键是注册层插件且值为映射」→ 一层(reality:/ws:/grpc:/
-//     shadowtls:/mkcp:…);其余键(flow/version/cipher/psk…)→ 归终端协议字段;tls: 具名字段非空 → tls 层。
+// synthStack 是入站/出站共用的层集合成(第4章新格式),交 buildStack(顺序无关,compile.Order 按 Band
+// 排、书写序不参与):
+//   - 旧格式(layers 数组非空):原样 toLayerSpecs —— 兼容垫片,脚本迁完即拆。
+//   - 新格式(typ=协议名):extra 里「键是注册层插件且值为映射」→ 一层(tls:/reality:/ws:/grpc:/shadowtls:/
+//     mkcp:…);其余键(flow/version/cipher/psk…)→ 归终端协议字段;tls 参数非空 → tls 层(入站 tls: 是具名字段)。
 //     config 不认识任何协议名,分拣全靠 registry.Lookup。
-func (in Inbound) synthLayers() ([]service.LayerSpec, error) {
-	if len(in.Layers) > 0 {
-		return toLayerSpecs(in.Layers)
+func synthStack(typ string, layers []map[string]any, extra, tls map[string]any) ([]service.LayerSpec, error) {
+	if len(layers) > 0 {
+		return toLayerSpecs(layers)
 	}
-	if !isProxyProto(in.Type) {
-		return nil, fmt.Errorf("type %q 不是注册的终端协议,且未写 layers", in.Type)
+	if !isProxyProto(typ) {
+		return nil, fmt.Errorf("type %q 不是注册的终端协议,且未写 layers", typ)
 	}
 	var specs []service.LayerSpec
 	protoFields := make(map[string]any)
-	for k, v := range in.Extra {
+	for k, v := range extra {
 		if m, isMap := v.(map[string]any); isMap {
 			if _, isLayer := registry.Lookup(k); isLayer {
 				node, err := mapToNode(m, "")
@@ -269,8 +270,8 @@ func (in Inbound) synthLayers() ([]service.LayerSpec, error) {
 		}
 		protoFields[k] = v
 	}
-	if len(in.TLS) > 0 { // tls: 是 Inbound 具名字段(会话式共用),新格式下即 tls 层
-		node, err := mapToNode(in.TLS, "")
+	if len(tls) > 0 {
+		node, err := mapToNode(tls, "")
 		if err != nil {
 			return nil, fmt.Errorf("层 tls:%w", err)
 		}
@@ -278,10 +279,24 @@ func (in Inbound) synthLayers() ([]service.LayerSpec, error) {
 	}
 	node, err := mapToNode(protoFields, "")
 	if err != nil {
-		return nil, fmt.Errorf("协议 %q 字段:%w", in.Type, err)
+		return nil, fmt.Errorf("协议 %q 字段:%w", typ, err)
 	}
-	specs = append(specs, service.LayerSpec{Name: in.Type, Node: node})
+	specs = append(specs, service.LayerSpec{Name: typ, Node: node})
 	return specs, nil
+}
+
+// synthLayers 入站:tls: 是 Inbound 具名字段(会话式共用),新格式下即 tls 层。
+func (in Inbound) synthLayers() ([]service.LayerSpec, error) {
+	return synthStack(in.Type, in.Layers, in.Extra, in.TLS)
+}
+
+// newFormat 出站镜像入站:type=协议名(vless/trojan/snell…)+ server/secret + 层块 + 协议字段,未写 layers。
+// 出站没有 tls 具名字段,tls: 自然落 Extra、经 Lookup 成层;sni/insecure/指纹写在 tls: 块里。
+func (o Outbound) newFormat() bool { return len(o.Layers) == 0 && isProxyProto(o.Type) }
+
+// synthLayers 出站:同入站分拣,无具名 tls 字段。
+func (o Outbound) synthLayers() ([]service.LayerSpec, error) {
+	return synthStack(o.Type, o.Layers, o.Extra, nil)
 }
 
 // authProto 该口的 per-user 认证协议(= 栈顶协议名,供 Desugar 按栈取密钥,§4.4 规则 3)。
@@ -317,7 +332,8 @@ type Outbound struct {
 	Name        string           `yaml:"name"`
 	Type        string           `yaml:"type"`
 	Server      string           `yaml:"server"`
-	Layers      []map[string]any `yaml:"layers"`
+	Layers      []map[string]any `yaml:"layers"`  // 旧格式显式栈(兼容垫片);新格式不写
+	Extra       map[string]any   `yaml:",inline"` // 第4章新格式:未声明键 —— 层块(tls:/reality:/ws:…)与协议字段(flow…),synthLayers 分拣
 	Secret      string           `yaml:"secret"`
 	UUID        string           `yaml:"uuid"`
 	SNI         string           `yaml:"sni"`
@@ -835,7 +851,11 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		if o.Name == "" {
 			return nil, fmt.Errorf("config: 出站缺 name")
 		}
-		switch o.Type {
+		otyp := o.Type
+		if o.newFormat() { // 第4章新格式:type=协议名 + 层块,走流式栈(同 proxy 形态)
+			otyp = "proxy"
+		}
+		switch otyp {
 		case "select", "urltest", "fallback", "load-balance":
 			pendingGroups = append(pendingGroups, o) // 见出站 loop 后的第二趟
 		case "direct", "":
@@ -852,7 +872,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 				return nil, fmt.Errorf("config: 出站 %q(block)未知 mode %q(仅 reject/drop)", o.Name, o.Mode)
 			}
 		case "proxy":
-			layers, err := toLayerSpecs(o.Layers)
+			layers, err := o.synthLayers() // 旧 layers 数组(垫片)或第4章 type=协议名+层块
 			if err != nil {
 				return nil, fmt.Errorf("config: 出站 %q:%w", o.Name, err)
 			}
