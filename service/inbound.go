@@ -98,10 +98,8 @@ type ProxyInbound struct {
 	Proxy    proxy.Server
 	Auth     proxy.Authenticator
 	Out      OutboundResolver
-	Meter    *meter.Registry // 非 nil = 开启按用户计量(承 §5);nil = 关闭、零成本
-	Gates    []*meter.Gate   // 全局 + 每口连接闸/限速(承 §6.2 层1/2;可空)
-	MemGuard *meter.MemGuard // 防 OOM 软阈值拒新(承 §6.4bis;nil = 不设,AdmitOK 恒真零成本)
-	Sniff    bool            // 开启域名嗅探:IP 目标 peek 首包 SNI/Host 解真域名再分流(承 §10.4.2)
+	Admitter      // 内嵌接入唯一入口:Meter/Gates/MemGuard 字段与 AdmitConn/Admit 方法提升为本类型的成员
+	Sniff    bool // 开启域名嗅探:IP 目标 peek 首包 SNI/Host 解真域名再分流(承 §10.4.2)
 	// Fallback:回落伪装站目标 host:port(非空才开)。协议握手失败(错凭据/畸形/非协议探测)时,不 RST/报错,
 	// 而是把【握手已消费的原始字节 + 后续流】中继到该真站 —— 主动探测/直连浏览器只看到一个正常网站(抗探测)。
 	// 禁改协议线格式:回落只是握手失败后的行为,不碰任何协议帧。发生在传输层(如 TLS)之上,故 dest 收到的是
@@ -337,7 +335,7 @@ func (d streamDispatcher) DispatchStream(ctx context.Context, conn net.Conn, dst
 		_ = conn.Close()
 		return
 	}
-	s, release, err := d.h.admit(who.ID, d.src, connStream{conn}, connStream{conn}, up)
+	s, release, err := d.h.Admit(who.ID, d.src, connStream{conn}, connStream{conn}, up)
 	if err != nil {
 		return // admit 已关两端
 	}
@@ -366,7 +364,7 @@ func (h *ProxyInbound) HandleStream(ctx context.Context, s link.Stream, md *endp
 	// 计量(所有子流的字节含 mux 帧头都记到该用户,计 1 连接),再交解复用(其上多条子流各按真实目标落地)。
 	// 协议无关:任何入站(vless/trojan/ss…)只要解出该目标即为载体,与 sing-box/mihomo/Xray 互通。
 	if req.Network == endpoint.NetworkTCP && (isMuxCarrier(req.Dst) || isMuxCoolCarrier(req.Dst)) {
-		carrier, release, err := h.admit(req.Cred.ID, md.Source, hs, hs)
+		carrier, release, err := h.Admit(req.Cred.ID, md.Source, hs, hs)
 		if err != nil {
 			return err
 		}
@@ -403,73 +401,12 @@ func (h *ProxyInbound) HandleStream(ctx context.Context, s link.Stream, md *endp
 		_ = hs.Close()
 		return err
 	}
-	hs, release, err := h.admit(req.Cred.ID, md.Source, hs, hs, up)
+	hs, release, err := h.Admit(req.Cred.ID, md.Source, hs, hs, up)
 	if err != nil {
 		return err
 	}
 	defer release()
 	return relay.Relay(hs, up) // Relay 内部负责两端收尾
-}
-
-// admitConn 是接入的唯一入口(所有落地路径 —— 普通 TCP、UDP-over-stream、mux 承载、库内 mux 子流 ——
-// 都经此,不许绕):
-//  0. mem-guard 软阈值(§6.4bis.2):内存进 soft/hard 档 → 拒新(已建立连接不动);最先判,护进程存亡;
-//  1. 全局 / 每口连接闸(§6.2 层1/2,max-conns):接入 CAS,叠加顺序 全局→口,任一超即拒;
-//  2. 按用户计量 + 热开关 + 每用户限额(开启时):登记到 who 的 Cell(kill=关 closers);Disable(§6.5)/
-//     触顶(max-conns/max-ips,§6.3)→ 拒新、立即关。
-//
-// 返回本连接的计量器(nil = 计量关闭且无闸,零成本)+ release(调用方 defer:注销连接 + 放闸)。
-// 被拒返回 errAdmissionRejected,closers 已关。
-func (h *ProxyInbound) admitConn(who cred.ID, src addr.Socksaddr, closers ...interface{ Close() error }) (*meter.Meter, func(), error) {
-	closeAll := func() {
-		for _, c := range closers {
-			_ = c.Close()
-		}
-	}
-	if !h.MemGuard.AdmitOK() { // §6.4bis.2 内存软阈值:拒新(计数在 MemGuard 内);护进程最先判
-		closeAll()
-		return nil, nil, errAdmissionRejected
-	}
-	for i, g := range h.Gates {
-		if !g.TryAcquire() {
-			for _, gg := range h.Gates[:i] {
-				gg.Release()
-			}
-			closeAll()
-			return nil, nil, errAdmissionRejected
-		}
-	}
-	releaseGates := func() {
-		for _, g := range h.Gates {
-			g.Release()
-		}
-	}
-	if h.Meter != nil {
-		mm, done, ok := h.Meter.Open(who, src.Addr, closeAll)
-		if !ok {
-			releaseGates()
-			closeAll()
-			return nil, nil, errAdmissionRejected
-		}
-		return mm.WithGates(h.Gates), func() { done(); releaseGates() }, nil
-	}
-	if len(h.Gates) > 0 {
-		return meter.GateMeter(h.Gates), releaseGates, nil // 仅全局/每口限速(未开按用户计量)
-	}
-	return nil, func() {}, nil
-}
-
-// admit = admitConn + 包客户端侧流 s(Read=上行、Write=下行,稀疏累计到 who;gate 的 rate 也在稀疏点一并
-// throttle)。返回包好的流 + release。
-func (h *ProxyInbound) admit(who cred.ID, src addr.Socksaddr, s link.Stream, closers ...interface{ Close() error }) (link.Stream, func(), error) {
-	m, release, err := h.admitConn(who, src, closers...)
-	if err != nil {
-		return nil, nil, err
-	}
-	if m != nil {
-		s = meter.Wrap(s, m)
-	}
-	return s, release, nil
 }
 
 // relayPacket 走 UDP 路径:靠能力发现把握手后的 stream 适配成 PacketConn(★先适配再计量:各协议的
@@ -487,7 +424,7 @@ func (h *ProxyInbound) relayPacket(ctx context.Context, hs link.Stream, req *pro
 		_ = hs.Close()
 		return err
 	}
-	m, release, err := h.admitConn(req.Cred.ID, md.Source, clientPC)
+	m, release, err := h.AdmitConn(req.Cred.ID, md.Source, clientPC)
 	if err != nil {
 		return err // admitConn 已关 clientPC(其 Close 收尾 hs)
 	}

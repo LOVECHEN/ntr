@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/metacubex/sing-quic/hysteria2"
+	"github.com/metacubex/sing/common/auth"
 	"github.com/metacubex/sing/common/logger"
 	M "github.com/metacubex/sing/common/metadata"
 	N "github.com/metacubex/sing/common/network"
@@ -14,6 +15,10 @@ import (
 	"github.com/LOVECHEN/ntr/core/endpoint"
 	"github.com/LOVECHEN/ntr/core/relay"
 )
+
+// UserFromContext 读 hy2 库(metacubex/sing fork)在鉴权命中后经 auth.ContextWithUser 写入的用户 tag。
+// 供 config 的会话式计量 dispatch 回读身份 → 映 cred.ID(承第4章顶层 users;tag = BillID)。
+func UserFromContext(ctx context.Context) (string, bool) { return auth.UserFromContext[string](ctx) }
 
 // User 是 Hysteria2 服务端用户(名 + 密码)。
 type User struct {

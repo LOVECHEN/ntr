@@ -52,15 +52,15 @@ func NewOutbound(o Options) (*Outbound, error) {
 		NextProtos:         []string{"h3"},
 	}
 	client, err := hysteria2.NewClient(hysteria2.ClientOptions{
-		Context:       context.Background(),
-		Logger:        logger.NOP(),
+		Context:            context.Background(),
+		Logger:             logger.NOP(),
 		ServerAddress:      M.ParseSocksaddr(o.Server),
 		Password:           o.Password,
 		SalamanderPassword: o.Obfs,
 		TLSConfig:          tlsConfig,
-		SendBPS:       o.UpMbps * 1000 * 1000 / 8,
-		ReceiveBPS:    o.DownMbps * 1000 * 1000 / 8,
-		UdpMTU:        1200,
+		SendBPS:            o.UpMbps * 1000 * 1000 / 8,
+		ReceiveBPS:         o.DownMbps * 1000 * 1000 / 8,
+		UdpMTU:             1200,
 		PacketListener: qtls.PacketDialerFunc(func(context.Context, string, string, netip.AddrPort) (net.PacketConn, error) {
 			return net.ListenUDP("udp", nil) // 临时本地 UDP socket
 		}),

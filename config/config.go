@@ -337,12 +337,22 @@ func (o Outbound) synthLayers() ([]service.LayerSpec, error) {
 	return synthStack(o.Type, o.Layers, extra, nil)
 }
 
+// sessionAuthProtos 是【已接入第4章顶层 users + 计量】的会话式协议集(世界 C 逐个开通)。这些协议
+// 不走 proxy.Server/registry 泛型路径,authProto 无法经 newFormat/registry 认出,须在此显式登记 ——
+// 登记后 Desugar 会为其口产 CredBinding,build 分支据 binding 建库内多用户 + 计量 dispatch。
+// ★只登记真正接完线的协议(诚实纪律:未接的留空 → 其顶层 users 不生效,别假装)。
+var sessionAuthProtos = map[string]bool{
+	"hysteria2": true,
+}
+
 // authProto 该口的 per-user 认证协议(= 栈顶协议名,供 Desugar 按栈取密钥,§4.4 规则 3)。
-// 新格式:type 即终端协议;旧格式流式栈(空/proxy/portal):取 layers 最后一层 type。空 = 不产 binding。
-// 会话式(anytls/hysteria2/tuic…)各自持 users map、未接 cred/meter(蓝图世界 C),暂返空;
-// 多层认证(shadowtls 外层)待 Descriptor 自报 + 传输层参与 auth(蓝图骨头 4),当前单层。
+// 新格式:type 即终端协议;旧格式流式栈(空/proxy/portal):取 layers 最后一层 type;已接入的会话式:
+// 返回其 type(见 sessionAuthProtos)。空 = 不产 binding。多层认证(shadowtls 外层)待骨头 4,当前单层。
 func (in Inbound) authProto() string {
 	if in.newFormat() {
+		return in.Type
+	}
+	if sessionAuthProtos[in.Type] {
 		return in.Type
 	}
 	switch in.Type {
@@ -1235,7 +1245,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
 			continue
 		case "hysteria2":
-			inb, err := buildHy2Inbound(in, out)
+			inb, err := f.buildHy2Inbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
 			if err != nil {
 				return nil, fmt.Errorf("config: 入站 %s(hysteria2):%w", in.Listen, err)
 			}
@@ -1981,24 +1991,95 @@ func buildHy1Inbound(in Inbound, out endpoint.Outbound) (*hysteria1.Inbound, err
 	return hysteria1.NewInbound(users, in.Obfs, 0, 0, tlsConfig, out, sessionPortalDispatch(in))
 }
 
-func buildHy2Inbound(in Inbound, out endpoint.Outbound) (*hysteria2.Inbound, error) {
+// sessionUser 是会话式口从顶层 users 脱糖出的一个库内用户(Tag=BillID 供 ctx 回读映射,Secret=该层原始密钥)。
+type sessionUser struct{ Tag, Secret string }
+
+// sessionUsersFromBinds 把会话式口的 CredBinding 转成库内多用户列表 + tag→cred.ID 回读表(镜像
+// buildProxyInbound 的 UserRegistrar 分支:tag=BillID,同 BillID 多把 key 轮换加 "#n",Ref 同一)。
+// metering 关但某 binding 带 Limit → fail-loud(限额会静默失效,冻结律#6)。
+func sessionUsersFromBinds(inName string, binds []principal.CredBinding, reg *meter.Registry, metering bool) ([]sessionUser, map[string]cred.ID, error) {
+	users := make([]sessionUser, 0, len(binds))
+	refs := make(map[string]cred.ID, len(binds))
+	seen := make(map[string]int, len(binds))
+	for _, b := range binds {
+		if b.Limit != nil && !metering {
+			return nil, nil, fmt.Errorf("config: 入站 %s 用户 %q 配了限额但未启用 metrics:(限额会静默失效)", inName, b.Name)
+		}
+		id := reg.IDForBill(b.BillID)
+		for _, layer := range b.Layers {
+			tag := b.BillID
+			if n := seen[b.BillID]; n > 0 {
+				tag = fmt.Sprintf("%s#%d", b.BillID, n)
+			}
+			seen[b.BillID]++
+			users = append(users, sessionUser{Tag: tag, Secret: string(layer.Key)})
+			refs[tag] = id
+		}
+	}
+	return users, refs, nil
+}
+
+// buildSessionAdmitter 建会话式口的接入器(全局+每口连接闸 + 计量注册 + mem-guard),与流式栈 ProxyInbound
+// 同构 —— 会话式协议不内嵌 ProxyInbound,故各自持一个 service.Admitter,经 SessionDispatch 收口计量/限额。
+func buildSessionAdmitter(in Inbound, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (*service.Admitter, error) {
+	inboundGate, err := buildGate(in.Limits)
+	if err != nil {
+		return nil, fmt.Errorf("config: 入站 %s(limits):%w", in.inboundName(), err)
+	}
+	adm := &service.Admitter{Gates: nonNilGates(globalGate, inboundGate), MemGuard: memGuard}
+	if metering {
+		adm.Meter = reg
+	}
+	return adm, nil
+}
+
+// sessionDispatch:反连 portal(ControlDomain)保持原样(隧道载体不计量,不回归);否则用 service 的计量版
+// dispatch(身份回读 → Admit(闸+计量+mem-guard)→ wrap → relay)。
+func (f *File) sessionDispatch(in Inbound, out endpoint.Outbound, adm *service.Admitter, refs map[string]cred.ID, readUser func(context.Context) (string, bool)) endpoint.StreamDispatch {
+	if in.ControlDomain != "" {
+		return sessionPortalDispatch(in)
+	}
+	return service.SessionDispatch(out, adm, refs, readUser)
+}
+
+// buildHy2Inbound 建 Hysteria2 入站。顶层 users(binds 非空):tag=BillID 喂库内多用户(svc.UpdateUsers),
+// 命中后经 hysteria2.UserFromContext 回读 tag → cred.ID → SessionDispatch 计量(承世界 C)。无 binds 时退回
+// 口内 in.Users 垫片(身份落 Ambient,但连接闸 + mem-guard 仍生效)。
+func (f *File) buildHy2Inbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (*hysteria2.Inbound, error) {
 	tlsConfig, err := hysteria2.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
 	if err != nil {
 		return nil, err
 	}
+	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
+	if err != nil {
+		return nil, err
+	}
 	var users []hysteria2.User
-	for _, u := range in.Users {
-		pw, _ := u["password"].(string)
-		if pw == "" {
-			continue
+	var refs map[string]cred.ID
+	if len(binds) > 0 {
+		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
+		if err != nil {
+			return nil, err
 		}
-		name, _ := u["name"].(string)
-		users = append(users, hysteria2.User{Name: name, Password: pw})
+		refs = r
+		for _, su := range sus {
+			users = append(users, hysteria2.User{Name: su.Tag, Password: su.Secret})
+		}
+	} else {
+		for _, u := range in.Users { // 垫片:口内旧写法;身份落 Ambient
+			pw, _ := u["password"].(string)
+			if pw == "" {
+				continue
+			}
+			name, _ := u["name"].(string)
+			users = append(users, hysteria2.User{Name: name, Password: pw})
+		}
 	}
 	if len(users) == 0 {
-		return nil, fmt.Errorf("hysteria2 入站需至少一个 user{password}")
+		return nil, fmt.Errorf("hysteria2 入站需至少一个用户(顶层 users.keys.hysteria2 或口内 user{password})")
 	}
-	return hysteria2.NewInbound(users, tlsConfig, in.Obfs, out, sessionPortalDispatch(in))
+	dispatch := f.sessionDispatch(in, out, adm, refs, hysteria2.UserFromContext)
+	return hysteria2.NewInbound(users, tlsConfig, in.Obfs, out, dispatch)
 }
 
 // buildMieruInbound 建 mieru 会话入站(官方库自绑端口,用户名+口令,TCP/UDP 传输)。
