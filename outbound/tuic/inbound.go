@@ -6,6 +6,7 @@ import (
 	"net"
 
 	stuic "github.com/sagernet/sing-quic/tuic"
+	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -14,11 +15,16 @@ import (
 	"github.com/LOVECHEN/ntr/core/relay"
 )
 
-// User 是 TUIC 服务端用户(UUID + 密码)。
+// User 是 TUIC 服务端用户(库内 tag Name + UUID + 密码;复合键 = UUID+Password)。Name 用作 sing 库内
+// tag(顶层 users = BillID);缺省 = UUID。
 type User struct {
+	Name     string
 	UUID     string
 	Password string
 }
+
+// UserFromContext 读 tuic 库(sagernet/sing fork)鉴权命中后经 auth.ContextWithUser 写入的用户 tag。
+func UserFromContext(ctx context.Context) (string, bool) { return auth.UserFromContext[string](ctx) }
 
 // Inbound 是 TUIC 入站:UDP 上跑 QUIC Service,接受 + 鉴权(UUID+password)+ 解复用,
 // 每条代理流路由到出站。自管 UDP 监听(Run),不走 NTR 的 TCP 接入环。
@@ -47,7 +53,11 @@ func NewInbound(users []User, tlsConfig *cryptotls.Config, out endpoint.Outbound
 		if err != nil {
 			return nil, err
 		}
-		names = append(names, u.UUID)
+		name := u.Name // 库内 tag(顶层 users = BillID);缺省回退 UUID(垫片单用户)
+		if name == "" {
+			name = u.UUID
+		}
+		names = append(names, name)
 		uuids = append(uuids, uu)
 		pws = append(pws, u.Password)
 	}

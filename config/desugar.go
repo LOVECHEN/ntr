@@ -69,15 +69,15 @@ func Desugar(users []User, inboundNames map[string]bool, stackProtos map[string]
 			if len(protos) == 0 {
 				continue // 无认证口:不产 per-user binding(其流量归 Ambient/Unmatched)
 			}
-			layerVals := make([][]string, len(protos))
+			layerVals := make([][]credValue, len(protos))
 			missing := ""
 			for i, p := range protos {
 				ks, ok := u.Keys[p]
-				if !ok || len(ks.Values) == 0 {
+				if !ok || ks.empty() {
 					missing = p
 					break
 				}
-				layerVals[i] = ks.Values
+				layerVals[i] = ks.creds()
 			}
 			if missing != "" {
 				if explicitOn && sliceContains(u.On, ib) {
@@ -87,7 +87,7 @@ func Desugar(users []User, inboundNames map[string]bool, stackProtos map[string]
 			}
 			for i, p := range protos {
 				for _, v := range layerVals[i] {
-					k := ib + "\x00" + p + "\x00" + v
+					k := ib + "\x00" + p + "\x00" + v.dupKey()
 					if owner, dup := keyOwner[k]; dup && owner != u.Name {
 						return nil, fmt.Errorf("config: user %q 与 %q 在口 %q 的协议 %q 上用了同一把密钥 (E-KEY-DUP):鉴权无法区分、计费会串号", u.Name, owner, ib, p)
 					}
@@ -143,14 +143,14 @@ func buildLimitRef(u User) (*principal.LimitRef, error) {
 }
 
 // expandLayers 产一个口的 binding:多层 × 轮换 = 笛卡尔积(每层选一把 key),共享同一 BillID。
-// Key 放原始 secret 字节,装配期再经协议 CredentialCodec.AuthKey 派生。
-func expandLayers(u User, ib string, protos []string, layerVals [][]string, limit *principal.LimitRef) []principal.CredBinding {
-	combos := [][]string{{}}
+// 标量凭据放原始 secret 字节到 Key,复合凭据放具名字段到 Fields;装配期再由协议按需取。
+func expandLayers(u User, ib string, protos []string, layerVals [][]credValue, limit *principal.LimitRef) []principal.CredBinding {
+	combos := [][]credValue{{}}
 	for i := range protos {
-		var next [][]string
+		var next [][]credValue
 		for _, c := range combos {
 			for _, v := range layerVals[i] {
-				nc := make([]string, len(c)+1)
+				nc := make([]credValue, len(c)+1)
 				copy(nc, c)
 				nc[len(c)] = v
 				next = append(next, nc)
@@ -163,7 +163,11 @@ func expandLayers(u User, ib string, protos []string, layerVals [][]string, limi
 	for _, combo := range combos {
 		layers := make([]principal.AuthLayer, len(protos))
 		for i, p := range protos {
-			layers[i] = principal.AuthLayer{Scheme: p, Key: []byte(combo[i])}
+			if combo[i].fields != nil {
+				layers[i] = principal.AuthLayer{Scheme: p, Fields: combo[i].fields}
+			} else {
+				layers[i] = principal.AuthLayer{Scheme: p, Key: []byte(combo[i].scalar)}
+			}
 		}
 		out = append(out, principal.CredBinding{
 			Inbound: ib,

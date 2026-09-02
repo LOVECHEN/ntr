@@ -345,6 +345,7 @@ var sessionAuthProtos = map[string]bool{
 	"hysteria2": true,
 	"hysteria1": true,
 	"anytls":    true,
+	"tuic":      true,
 }
 
 // authProto 该口的 per-user 认证协议(= 栈顶协议名,供 Desugar 按栈取密钥,§4.4 规则 3)。
@@ -1255,7 +1256,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
 			continue
 		case "tuic":
-			inb, err := buildTuicInbound(in, out)
+			inb, err := f.buildTuicInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
 			if err != nil {
 				return nil, fmt.Errorf("config: 入站 %s(tuic):%w", in.Listen, err)
 			}
@@ -2034,8 +2035,13 @@ func (f *File) buildHy1Inbound(in Inbound, out endpoint.Outbound, binds []princi
 	return hysteria1.NewInbound(users, in.Obfs, 0, 0, tlsConfig, out, sessionPortalDispatch(in), admit)
 }
 
-// sessionUser 是会话式口从顶层 users 脱糖出的一个库内用户(Tag=BillID 供 ctx 回读映射,Secret=该层原始密钥)。
-type sessionUser struct{ Tag, Secret string }
+// sessionUser 是会话式口从顶层 users 脱糖出的一个库内用户(Tag=BillID 供 ctx 回读映射)。标量协议用
+// Secret(该层原始密钥);复合键协议(tuic/ssh…)用 Fields(具名字段 uuid/password/…)。二者互斥。
+type sessionUser struct {
+	Tag    string
+	Secret string
+	Fields map[string]string
+}
 
 // sessionUsersFromBinds 把会话式口的 CredBinding 转成库内多用户列表 + tag→cred.ID 回读表(镜像
 // buildProxyInbound 的 UserRegistrar 分支:tag=BillID,同 BillID 多把 key 轮换加 "#n",Ref 同一)。
@@ -2055,7 +2061,7 @@ func sessionUsersFromBinds(inName string, binds []principal.CredBinding, reg *me
 				tag = fmt.Sprintf("%s#%d", b.BillID, n)
 			}
 			seen[b.BillID]++
-			users = append(users, sessionUser{Tag: tag, Secret: string(layer.Key)})
+			users = append(users, sessionUser{Tag: tag, Secret: string(layer.Key), Fields: layer.Fields})
 			refs[tag] = id
 		}
 	}
@@ -2142,25 +2148,51 @@ func buildMieruInbound(in Inbound, out endpoint.Outbound) (*mieru.Inbound, error
 	return mieru.NewInbound(users, in.Transport, out, sessionPortalDispatch(in))
 }
 
-// buildTuicInbound 建 TUIC 会话入站(证书 + UUID/password 用户 + 绑定出站)。
-func buildTuicInbound(in Inbound, out endpoint.Outbound) (*tuic.Inbound, error) {
+// buildTuicInbound 建 TUIC 会话入站。TUIC 是【复合键】(uuid+password):顶层 users 用结构化 keys
+// `keys.tuic: {uuid, password}`,tag=BillID 喂库内多用户,命中后 tuic.UserFromContext 回读 → cred.ID →
+// SessionDispatch 计量。无 binds 退回口内 in.Users 垫片(身份 Ambient,闸/mem-guard 仍生效)。
+func (f *File) buildTuicInbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (*tuic.Inbound, error) {
 	tlsConfig, err := anytls.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
 	if err != nil {
 		return nil, err
 	}
+	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
+	if err != nil {
+		return nil, err
+	}
 	var users []tuic.User
-	for _, u := range in.Users {
-		uuid, _ := u["uuid"].(string)
-		pw, _ := u["password"].(string)
-		if uuid == "" {
-			continue
+	var refs map[string]cred.ID
+	if len(binds) > 0 {
+		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
+		if err != nil {
+			return nil, err
 		}
-		users = append(users, tuic.User{UUID: uuid, Password: pw})
+		refs = r
+		for _, su := range sus {
+			if su.Fields == nil {
+				return nil, fmt.Errorf("config: 入站 %s 的 tuic 需结构化 keys{uuid,password}(复合键),不能用标量", in.inboundName())
+			}
+			uuid := su.Fields["uuid"]
+			if uuid == "" {
+				return nil, fmt.Errorf("config: 入站 %s 用户 %s 的 keys.tuic 缺 uuid", in.inboundName(), su.Tag)
+			}
+			users = append(users, tuic.User{Name: su.Tag, UUID: uuid, Password: su.Fields["password"]})
+		}
+	} else {
+		for _, u := range in.Users {
+			uuid, _ := u["uuid"].(string)
+			if uuid == "" {
+				continue
+			}
+			pw, _ := u["password"].(string)
+			users = append(users, tuic.User{UUID: uuid, Password: pw})
+		}
 	}
 	if len(users) == 0 {
-		return nil, fmt.Errorf("tuic 入站需至少一个 user{uuid,password}")
+		return nil, fmt.Errorf("tuic 入站需至少一个用户(顶层 users.keys.tuic{uuid,password} 或口内 user{uuid,password})")
 	}
-	return tuic.NewInbound(users, tlsConfig, out, sessionPortalDispatch(in))
+	dispatch := f.sessionDispatch(in, out, adm, refs, tuic.UserFromContext)
+	return tuic.NewInbound(users, tlsConfig, out, dispatch)
 }
 
 // buildShadowquicInbound 建 ShadowQUIC 入站(JLS PSK 用户 + sni)。sni 从 tls.sni 取(JLS ServerName,

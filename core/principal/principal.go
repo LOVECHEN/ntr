@@ -31,7 +31,10 @@ const (
 // Desugar 不认识任何协议,派生不在它手里。
 type AuthLayer struct {
 	Scheme string // 协议/传输插件注册名(= Authenticator.Auth 的 scheme)
-	Key    []byte // 脱糖期 = 原始 secret;装配期经 CredentialCodec.AuthKey 派生成鉴权键
+	Key    []byte // 标量凭据:脱糖期 = 原始 secret;装配期经 CredentialCodec.AuthKey 派生成鉴权键
+	// Fields 是【复合键】的具名字段(如 tuic 的 {uuid,password}、ssh 的 {password,public-key}),
+	// 与 Key 互斥:标量凭据用 Key,复合凭据用 Fields。装配期由协议侧按需取字段(见各 build<P>Inbound)。
+	Fields map[string]string
 }
 
 // CredBinding 是一条脱糖产物:(inbound, 有序 auth 层) → 计费槽。脱糖的原子单位。

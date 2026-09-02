@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 
 	yaml "gopkg.in/yaml.v3"
 )
@@ -66,33 +68,95 @@ func (u User) AllowsAllInbounds() bool {
 	return false
 }
 
-// KeySpec 是 keys 下一个条目的值,两种【全块式】形态(无行内花括号):
+// KeySpec 是 keys 下一个条目的值,三种【全块式】形态(无行内花括号):
 //
-//	单层单值:  vless: 550e8400-...          → Values=[uuid]
-//	单层轮换:  vless:                        → Values=[uuid1,uuid2](零断连过渡,§4.8.1)
+//	标量单值:  vless: 550e8400-...          → Values=[uuid]
+//	标量轮换:  vless:                        → Values=[uuid1,uuid2](零断连过渡,§4.8.1)
 //	             - uuid1
 //	             - uuid2
+//	结构化(复合键,如 tuic uuid+password / ssh user+password):
+//	           tuic:                          → Maps=[{uuid:...,password:...}]
+//	             uuid: 550e8400-...
+//	             password: pw
+//	结构化轮换:tuic:                          → Maps=[{...},{...}]
+//	             - {uuid: ..., password: ...}  # 块式:一个 - 一组
 //
-// 键 = 协议名(§4.4 规则 1:密钥属于"人×协议",一个协议一把)。多层口(如 shadowtls+snell)
-// 消费该 user 的多把平铺密钥(keys.shadowtls + keys.snell),由【口的栈】按栈序(外→内)
-// 自动取(§4.4 规则 3),绝不在 keys 里嵌套 —— 密钥怎么写 ⊥ 密钥被谁用。config 层不认识
-// 任何协议名,键交给对应插件认领、scheme 由插件 Descriptor 自报,核心零 switch。
+// 键 = 协议名(§4.4 规则 1:密钥属于"人×协议",一个协议一把;复合键 = 该协议的一组具名字段)。多层口
+// (如 shadowtls+snell)消费该 user 的多把平铺密钥,由【口的栈】按栈序(外→内)自动取(§4.4 规则 3),
+// 绝不在 keys 里嵌套【口名/层】—— 结构化形态是【单个协议凭据的具名字段】(uuid/password…),不是层嵌套。
+// config 层不认识任何协议名,字段交给对应插件按需取,核心零 switch。
 type KeySpec struct {
-	Values []string // 标量→len 1;块式列表(轮换)→多值
+	Values []string            // 标量凭据:标量→len 1;块式列表(轮换)→多值
+	Maps   []map[string]string // 结构化复合凭据:映射→len 1;块式映射列表(轮换)→多值
 }
 
-// UnmarshalYAML 接受标量(单值)或块式序列(轮换列表)。映射(多层嵌套)已废 —— 多层组合
-// 由口的栈表达、用 on 控制访问,不在 keys 里嵌套。
+// UnmarshalYAML 接受标量(单值)、块式序列(标量轮换 或 结构化轮换)、映射(单个结构化复合键)。
 func (k *KeySpec) UnmarshalYAML(node *yaml.Node) error {
 	switch node.Kind {
 	case yaml.ScalarNode:
 		k.Values = []string{node.Value}
-	case yaml.SequenceNode:
-		if err := node.Decode(&k.Values); err != nil {
+	case yaml.MappingNode: // 结构化复合键(单组):tuic: {uuid, password}
+		var m map[string]string
+		if err := node.Decode(&m); err != nil {
 			return err
 		}
+		k.Maps = []map[string]string{m}
+	case yaml.SequenceNode: // 轮换:元素全为标量 → Values;全为映射 → Maps;混写报错
+		if len(node.Content) == 0 {
+			return nil
+		}
+		if node.Content[0].Kind == yaml.MappingNode {
+			if err := node.Decode(&k.Maps); err != nil {
+				return err
+			}
+		} else {
+			if err := node.Decode(&k.Values); err != nil {
+				return err
+			}
+		}
 	default:
-		return fmt.Errorf("config: keys 的值须为标量或块式列表(轮换);多层组合由口的栈决定、用 on 控制,不在 keys 里嵌套")
+		return fmt.Errorf("config: keys 的值须为标量、块式列表(轮换)或映射(复合键的具名字段);不在 keys 里嵌套口名/层")
 	}
 	return nil
+}
+
+// credValue 是一把 key 的值:标量(scalar)或结构化具名字段(fields,复合键)。Desugar 与装配期共用。
+type credValue struct {
+	scalar string
+	fields map[string]string
+}
+
+// creds 把 KeySpec 展平成有序 credValue 列表(标量在前、结构化在后;通常一个 KeySpec 只用一种形态)。
+func (k KeySpec) creds() []credValue {
+	out := make([]credValue, 0, len(k.Values)+len(k.Maps))
+	for _, v := range k.Values {
+		out = append(out, credValue{scalar: v})
+	}
+	for _, m := range k.Maps {
+		out = append(out, credValue{fields: m})
+	}
+	return out
+}
+
+// empty 报告该协议是否没配任何凭据。
+func (k KeySpec) empty() bool { return len(k.Values) == 0 && len(k.Maps) == 0 }
+
+// dupKey 是 credValue 的规范化去重键(E-KEY-DUP 用):标量原样;结构化按字段名排序拼 "k=v"。
+func (c credValue) dupKey() string {
+	if c.fields == nil {
+		return c.scalar
+	}
+	ks := make([]string, 0, len(c.fields))
+	for k := range c.fields {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	var b strings.Builder
+	for _, k := range ks {
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(c.fields[k])
+		b.WriteByte('\x00')
+	}
+	return b.String()
 }
