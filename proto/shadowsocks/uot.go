@@ -30,7 +30,13 @@ var (
 	_ proxy.Server           = (*uotProxy)(nil)
 	_ proxy.PacketConnClient = (*uotProxy)(nil)
 	_ proxy.PacketServer     = (*uotProxy)(nil)
+	_ proxy.UserRegistrar    = (*uotProxy)(nil)
 )
+
+// RegisterUsers 透传给 inner(UoT 只改出站 UDP 承载,不碰服务端鉴权)。
+func (u *uotProxy) RegisterUsers(users []proxy.RegisteredUser) error {
+	return u.inner.RegisterUsers(users)
+}
 
 func (u *uotProxy) ClientHandshake(ctx context.Context, below link.Stream, key []byte, dst addr.Socksaddr) (link.Stream, error) {
 	return u.inner.ClientHandshake(ctx, below, key, dst)

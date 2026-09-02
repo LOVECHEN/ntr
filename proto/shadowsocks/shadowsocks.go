@@ -50,7 +50,40 @@ func Parse(n *spec.Node) (Config, error) {
 type Proxy struct {
 	cfg     Config
 	method  shadowsocks.Method  // 客户端
-	service shadowsocks.Service // 服务端(共享,含 replay filter)
+	service shadowsocks.Service // 服务端(共享,含 replay filter);RegisterUsers 后换成 MultiService(EIH 多用户)
+	users   userRefs            // 顶层 users:tag → 归属(经 UserRegistrar 注入;空 = 单用户口)
+}
+
+var _ proxy.UserRegistrar = (*Proxy)(nil)
+
+// RegisterUsers 实现 proxy.UserRegistrar(第4章顶层 users 接入):仅 2022-* 方法支持多用户 —— SS-2022 的
+// 身份是加密的 EIH,线上无明文 key,匹配只能在 sing 的 MultiService 内部完成:口的 password: 作服务端
+// iPSK,每个用户的 keys.shadowsocks 作其 uPSK(base64,长度按 method 校验),命中后以 tag 回读映射。
+// 经典 method(aes-256-gcm/chacha20…)无多用户机制 → 单 principal 豁免,配了顶层 users 直接报错。
+func (p *Proxy) RegisterUsers(users []proxy.RegisteredUser) error {
+	if !strings.HasPrefix(p.cfg.Method, "2022-") {
+		return fmt.Errorf("shadowsocks: method %q 无多用户机制(仅 2022-* 支持 EIH),此口不能接顶层 users —— 一口一密码即一 BillID", p.cfg.Method)
+	}
+	if p.cfg.Password == "" {
+		return fmt.Errorf("shadowsocks: 2022 多用户口须在口上写 password:(服务端 iPSK),用户各自的 uPSK 写在顶层 users.keys.shadowsocks")
+	}
+	ms, err := shadowaead_2022.NewMultiServiceWithPassword[string](p.cfg.Method, p.cfg.Password, 300, captureHandler{}, nil)
+	if err != nil {
+		return fmt.Errorf("shadowsocks: 建多用户 service 失败:%w", err)
+	}
+	tags := make([]string, len(users))
+	pws := make([]string, len(users))
+	var refs userRefs
+	for i, u := range users {
+		tags[i], pws[i] = u.Tag, u.Secret
+		refs.set(u.Tag, u.Ref)
+	}
+	if err := ms.UpdateUsersWithPasswords(tags, pws); err != nil {
+		return fmt.Errorf("shadowsocks: 注册顶层 users:%w", err)
+	}
+	p.service = ms
+	p.users = refs
+	return nil
 }
 
 // Build 构造 Proxy(建客户端 Method + 服务端 Service)。按 method 前缀分派两代:
@@ -68,8 +101,12 @@ func Build(_ context.Context, cfg Config, _ any) (any, error) {
 		if cm, err = shadowaead_2022.NewWithPassword(method, cfg.Password, nil); err != nil {
 			return nil, fmt.Errorf("shadowsocks: 客户端 method 失败:%w", err)
 		}
-		if svc, err = shadowaead_2022.NewServiceWithPassword(method, cfg.Password, 300, captureHandler{}, nil); err != nil {
-			return nil, fmt.Errorf("shadowsocks: 服务端 service 失败:%w", err)
+		// password 含 ":" = 多段 PSK(iPSK:uPSK,2022 多用户【客户端】写法):只作出站,不建服务端
+		// (服务端多用户经 RegisterUsers 用口的单段 iPSK + 顶层 users 的 uPSK 建 MultiService)。
+		if !strings.Contains(cfg.Password, ":") {
+			if svc, err = shadowaead_2022.NewServiceWithPassword(method, cfg.Password, 300, captureHandler{}, nil); err != nil {
+				return nil, fmt.Errorf("shadowsocks: 服务端 service 失败:%w", err)
+			}
 		}
 	} else {
 		if cm, err = shadowaead.New(method, nil, cfg.Password); err != nil {
@@ -97,8 +134,12 @@ func (p *Proxy) ClientHandshake(_ context.Context, below link.Stream, _ []byte, 
 }
 
 // toSing / toNTR:两边 Socksaddr 字段同构({Addr,Port,Fqdn}),直转。
-func toSing(a addr.Socksaddr) M.Socksaddr { return M.Socksaddr{Addr: a.Addr, Port: a.Port, Fqdn: a.Fqdn} }
-func toNTR(a M.Socksaddr) addr.Socksaddr { return addr.Socksaddr{Addr: a.Addr, Port: a.Port, Fqdn: a.Fqdn} }
+func toSing(a addr.Socksaddr) M.Socksaddr {
+	return M.Socksaddr{Addr: a.Addr, Port: a.Port, Fqdn: a.Fqdn}
+}
+func toNTR(a M.Socksaddr) addr.Socksaddr {
+	return addr.Socksaddr{Addr: a.Addr, Port: a.Port, Fqdn: a.Fqdn}
+}
 
 // streamWrap 把 sing 的 net.Conn 抬成 link.Stream(补 Unwrap)。
 type streamWrap struct {

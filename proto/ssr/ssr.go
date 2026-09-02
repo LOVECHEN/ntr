@@ -25,11 +25,11 @@ import (
 	"github.com/LOVECHEN/ntr/core/link"
 	"github.com/LOVECHEN/ntr/core/proxy"
 
+	"github.com/LOVECHEN/ntr/core/spec"
 	"github.com/LOVECHEN/ntr/internal/ssr/obfs"
 	"github.com/LOVECHEN/ntr/internal/ssr/protocol"
 	"github.com/LOVECHEN/ntr/internal/ssr/shadowstream"
 	sscore "github.com/LOVECHEN/ntr/internal/ssr/sscore"
-	"github.com/LOVECHEN/ntr/core/spec"
 )
 
 var _ proxy.Client = (*Proxy)(nil)

@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/LOVECHEN/ntr/addr"
+	"github.com/LOVECHEN/ntr/core/cred"
 	"github.com/LOVECHEN/ntr/core/endpoint"
 	"github.com/LOVECHEN/ntr/core/link"
 	"github.com/LOVECHEN/ntr/core/proxy"
@@ -317,11 +318,15 @@ func (h *ProxyInbound) Handshake(ctx context.Context, s link.Stream, md *endpoin
 }
 
 // streamDispatcher 实现 proxy.StreamDispatcher:把一条已解密的 mux 子流按其真实目标解析出站 →
-// 拨 → 双向中继。供 vmess 等"库内解复用"协议经 ctx 调用(每子流一 goroutine,见 vmess server.go)。
-type streamDispatcher struct{ resolver OutboundResolver }
+// 拨 → 接入闸 + 按 who 计量 → 双向中继。供 vmess 等"库内解复用"协议经 ctx 调用(每子流一 goroutine,
+// 见 vmess server.go)。承载对核心不可见,故一子流 = 一连接(max-conns 按子流计),字节记到 who。
+type streamDispatcher struct {
+	h   *ProxyInbound
+	src addr.Socksaddr // 承载连接的对端(max-ips 键)
+}
 
-func (d streamDispatcher) DispatchStream(ctx context.Context, conn net.Conn, dst addr.Socksaddr) {
-	out, err := d.resolver.Resolve(ctx, dst)
+func (d streamDispatcher) DispatchStream(ctx context.Context, conn net.Conn, dst addr.Socksaddr, who cred.Ref) {
+	out, err := d.h.Out.Resolve(ctx, dst)
 	if err != nil {
 		_ = conn.Close()
 		return
@@ -331,14 +336,19 @@ func (d streamDispatcher) DispatchStream(ctx context.Context, conn net.Conn, dst
 		_ = conn.Close()
 		return
 	}
-	_ = relay.Relay(connStream{conn}, up)
+	s, release, err := d.h.admit(who.ID, d.src, connStream{conn}, connStream{conn}, up)
+	if err != nil {
+		return // admit 已关两端
+	}
+	defer release()
+	_ = relay.Relay(s, up)
 }
 
 // HandleStream:握手 → 解析出站 → 拨 → 双向中继。全程不看协议/传输是什么,只认接口。
 func (h *ProxyInbound) HandleStream(ctx context.Context, s link.Stream, md *endpoint.Metadata) error {
 	// 注入 mux 子流中继器:供【传输库内部自解复用 mux】的协议(vmess)把每条子流交回核心中继
 	// (它够不到出站解析器,故经 ctx 递数据式能力;其余协议忽略)。见 core/proxy/dispatcher.go。
-	ctx = proxy.WithStreamDispatcher(ctx, streamDispatcher{resolver: h.Out})
+	ctx = proxy.WithStreamDispatcher(ctx, streamDispatcher{h: h, src: md.Source})
 	hs, req, err := h.Handshake(ctx, s, md)
 	if err != nil {
 		var fb errFallback
@@ -346,23 +356,28 @@ func (h *ProxyInbound) HandleStream(ctx context.Context, s link.Stream, md *endp
 			return h.doFallback(ctx, fb.rec) // 握手失败 → 按 ALPN/path 选伪装站中继(抗探测)
 		}
 		if errors.Is(err, proxy.ErrHandled) {
-			return nil // 协议已在内部把整条连接(所有 mux 子流)中继完毕
+			return nil // 协议已在内部把整条连接(所有 mux 子流)接入 + 计量 + 中继完毕(经 streamDispatcher)
 		}
 		return err
 	}
 
-	// mux 承载连接:握手目标 == sing-mux 魔术域名 → 交解复用(其上多条子流各按真实目标落地)。
-	// 协议无关:任何入站(vless/trojan/ss…)只要解出该目标即为 mux 载体,与 sing-box/mihomo 互通。
-	if req.Network == endpoint.NetworkTCP && isMuxCarrier(req.Dst) {
-		return handleMuxCarrier(ctx, hs, h.Out)
-	}
-	// Mux.cool 承载连接:握手目标 == Xray 魔术目标 v1.mux.cool:9527 → 交 muxcool.ServerWorker 解复用。
-	if req.Network == endpoint.NetworkTCP && isMuxCoolCarrier(req.Dst) {
-		return handleMuxCoolCarrier(ctx, hs, h.Out)
+	// mux 承载连接(握手目标 == sing-mux 魔术域名 / Xray 的 v1.mux.cool:9527)→ 先按【整条承载】过接入闸 +
+	// 计量(所有子流的字节含 mux 帧头都记到该用户,计 1 连接),再交解复用(其上多条子流各按真实目标落地)。
+	// 协议无关:任何入站(vless/trojan/ss…)只要解出该目标即为载体,与 sing-box/mihomo/Xray 互通。
+	if req.Network == endpoint.NetworkTCP && (isMuxCarrier(req.Dst) || isMuxCoolCarrier(req.Dst)) {
+		carrier, release, err := h.admit(req.Cred.ID, md.Source, hs, hs)
+		if err != nil {
+			return err
+		}
+		defer release()
+		if isMuxCarrier(req.Dst) {
+			return handleMuxCarrier(ctx, carrier, h.Out)
+		}
+		return handleMuxCoolCarrier(ctx, carrier, h.Out)
 	}
 
 	if req.Network == endpoint.NetworkUDP { // 归一化网络判 UDP,不看协议私有 Command
-		return h.relayPacket(ctx, hs, req)
+		return h.relayPacket(ctx, hs, req, md)
 	}
 
 	// 域名嗅探:目标只是 IP 时,peek 首包从 SNI/Host 解出真域名 → 覆盖路由目标(命中 domain/geosite/rule-set);
@@ -387,48 +402,75 @@ func (h *ProxyInbound) HandleStream(ctx context.Context, s link.Stream, md *endp
 		_ = hs.Close()
 		return err
 	}
-	// 全局 / 每口连接闸(§6.2 层1/2,max-conns):接入 CAS,叠加顺序 全局→口,任一超即拒。
+	hs, release, err := h.admit(req.Cred.ID, md.Source, hs, hs, up)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return relay.Relay(hs, up) // Relay 内部负责两端收尾
+}
+
+// admitConn 是接入的唯一入口(所有落地路径 —— 普通 TCP、UDP-over-stream、mux 承载、库内 mux 子流 ——
+// 都经此,不许绕):
+//  1. 全局 / 每口连接闸(§6.2 层1/2,max-conns):接入 CAS,叠加顺序 全局→口,任一超即拒;
+//  2. 按用户计量 + 热开关 + 每用户限额(开启时):登记到 who 的 Cell(kill=关 closers);Disable(§6.5)/
+//     触顶(max-conns/max-ips,§6.3)→ 拒新、立即关。
+//
+// 返回本连接的计量器(nil = 计量关闭且无闸,零成本)+ release(调用方 defer:注销连接 + 放闸)。
+// 被拒返回 errAdmissionRejected,closers 已关。
+func (h *ProxyInbound) admitConn(who cred.ID, src addr.Socksaddr, closers ...interface{ Close() error }) (*meter.Meter, func(), error) {
+	closeAll := func() {
+		for _, c := range closers {
+			_ = c.Close()
+		}
+	}
 	for i, g := range h.Gates {
 		if !g.TryAcquire() {
 			for _, gg := range h.Gates[:i] {
 				gg.Release()
 			}
-			_ = hs.Close()
-			_ = up.Close()
-			return errAdmissionRejected
+			closeAll()
+			return nil, nil, errAdmissionRejected
 		}
+	}
+	releaseGates := func() {
+		for _, g := range h.Gates {
+			g.Release()
+		}
+	}
+	if h.Meter != nil {
+		mm, done, ok := h.Meter.Open(who, src.Addr, closeAll)
+		if !ok {
+			releaseGates()
+			closeAll()
+			return nil, nil, errAdmissionRejected
+		}
+		return mm.WithGates(h.Gates), func() { done(); releaseGates() }, nil
 	}
 	if len(h.Gates) > 0 {
-		defer func() {
-			for _, g := range h.Gates {
-				g.Release()
-			}
-		}()
+		return meter.GateMeter(h.Gates), releaseGates, nil // 仅全局/每口限速(未开按用户计量)
 	}
-	// 按用户计量 + 热开关 + 每用户限额(开启时):登记连接(kill=断两端);Disable/触顶 → 拒新、立即关。
-	// 包客户端侧流,Read=上行、Write=下行,稀疏累计到 req.Cred.ID 的 Cell;gate 的 rate 也在稀疏点一并 throttle。
-	var m *meter.Meter
-	if h.Meter != nil {
-		mm, done, ok := h.Meter.Open(req.Cred.ID, md.Source.Addr, func() { _ = hs.Close(); _ = up.Close() })
-		if !ok { // 停用(§6.5)/ 用户触顶(max-conns/max-ips,§6.3)→ 拒新
-			_ = hs.Close()
-			_ = up.Close()
-			return errAdmissionRejected
-		}
-		defer done()
-		m = mm.WithGates(h.Gates)
-	} else if len(h.Gates) > 0 {
-		m = meter.GateMeter(h.Gates) // 仅全局/每口限速(未开按用户计量)
-	}
-	if m != nil {
-		hs = meter.Wrap(hs, m)
-	}
-	return relay.Relay(hs, up) // Relay 内部负责两端收尾
+	return nil, func() {}, nil
 }
 
-// relayPacket 走 UDP 路径:靠能力发现把握手后的 stream 适配成 PacketConn,拨 UDP 出站,
-// 双向搬 datagram。协议不支持 UDP-over-stream(无 PacketConnServer 能力)则大声报。
-func (h *ProxyInbound) relayPacket(ctx context.Context, hs link.Stream, req *proxy.Request) error {
+// admit = admitConn + 包客户端侧流 s(Read=上行、Write=下行,稀疏累计到 who;gate 的 rate 也在稀疏点一并
+// throttle)。返回包好的流 + release。
+func (h *ProxyInbound) admit(who cred.ID, src addr.Socksaddr, s link.Stream, closers ...interface{ Close() error }) (link.Stream, func(), error) {
+	m, release, err := h.admitConn(who, src, closers...)
+	if err != nil {
+		return nil, nil, err
+	}
+	if m != nil {
+		s = meter.Wrap(s, m)
+	}
+	return s, release, nil
+}
+
+// relayPacket 走 UDP 路径:靠能力发现把握手后的 stream 适配成 PacketConn(★先适配再计量:各协议的
+// ServerPacketConn 要对 hs 做本协议类型断言,不能先包 meter),接入闸 + 按用户计量(datagram 级:
+// ReadPacket=上行、WritePacket=下行),拨 UDP 出站,双向搬 datagram。协议不支持 UDP-over-stream(无
+// PacketConnServer 能力)则大声报。
+func (h *ProxyInbound) relayPacket(ctx context.Context, hs link.Stream, req *proxy.Request, md *endpoint.Metadata) error {
 	pcs, ok := h.Proxy.(proxy.PacketConnServer)
 	if !ok {
 		_ = hs.Close()
@@ -439,7 +481,15 @@ func (h *ProxyInbound) relayPacket(ctx context.Context, hs link.Stream, req *pro
 		_ = hs.Close()
 		return err
 	}
+	m, release, err := h.admitConn(req.Cred.ID, md.Source, clientPC)
+	if err != nil {
+		return err // admitConn 已关 clientPC(其 Close 收尾 hs)
+	}
+	defer release()
 	defer clientPC.Close()
+	if m != nil {
+		clientPC = meter.WrapPacket(clientPC, m)
+	}
 	// udpNAT 按 per-packet dst 分发到多条单目标出站:单目标协议(VLESS)退化为 1 条,多目标
 	// (Trojan,每包自带地址)则每目标 1 条。取代原来的单条 DialPacket(req.Dst)+RelayPacket。
 	return udpNAT(ctx, clientPC, h.Out)

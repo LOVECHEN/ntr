@@ -90,16 +90,16 @@ type erased struct {
 	build            func(ctx context.Context, cfg any, below any) (any, error)
 }
 
-func (e *erased) Name() string                          { return e.name }
-func (e *erased) Display() string                       { return e.display }
-func (e *erased) Band() Band                            { return e.band }
-func (e *erased) In() []Sort                            { return e.in }
-func (e *erased) Out() Sort                             { return e.out }
-func (e *erased) Requires() []cap.ID                    { return e.requires }
-func (e *erased) RequiresAdjacent() []cap.ID            { return e.requiresAdjacent }
-func (e *erased) Provides() []cap.ID                    { return e.provides }
-func (e *erased) Reload() ReloadClass                   { return e.reload }
-func (e *erased) Parse(n *spec.Node) (any, error)       { return e.parse(n) }
+func (e *erased) Name() string                    { return e.name }
+func (e *erased) Display() string                 { return e.display }
+func (e *erased) Band() Band                      { return e.band }
+func (e *erased) In() []Sort                      { return e.in }
+func (e *erased) Out() Sort                       { return e.out }
+func (e *erased) Requires() []cap.ID              { return e.requires }
+func (e *erased) RequiresAdjacent() []cap.ID      { return e.requiresAdjacent }
+func (e *erased) Provides() []cap.ID              { return e.provides }
+func (e *erased) Reload() ReloadClass             { return e.reload }
+func (e *erased) Parse(n *spec.Node) (any, error) { return e.parse(n) }
 func (e *erased) Build(ctx context.Context, cfg, below any) (any, error) {
 	return e.build(ctx, cfg, below)
 }

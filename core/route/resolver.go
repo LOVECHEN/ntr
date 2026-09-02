@@ -11,11 +11,11 @@ import (
 type Strategy uint8
 
 const (
-	StratBoth      Strategy = iota // A + AAAA 都要
-	StratPreferV4                  // 优先 IPv4
-	StratPreferV6                  // 优先 IPv6
-	StratV4Only                    // 仅 IPv4
-	StratV6Only                    // 仅 IPv6
+	StratBoth     Strategy = iota // A + AAAA 都要
+	StratPreferV4                 // 优先 IPv4
+	StratPreferV6                 // 优先 IPv6
+	StratV4Only                   // 仅 IPv4
+	StratV6Only                   // 仅 IPv6
 )
 
 // Message 是一整份 DNS 线报文(RFC 1035 wire)。Exchange 整报文进出用它;解析细节留在 dns/ 内部,

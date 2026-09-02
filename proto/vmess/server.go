@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/sing/common/auth"
 	M "github.com/metacubex/sing/common/metadata"
 	N "github.com/metacubex/sing/common/network"
 
@@ -42,6 +43,36 @@ type result struct {
 	wg         sync.WaitGroup // 追踪所有在途子流中继
 	// 无 dispatcher 时的 TCP 单流捕获兜底(理论上 service 恒注入,故一般不走):
 	conn net.Conn
+	// 归属:顶层 users 经 UserRegistrar 注入的 tag → cred 表;命中即填 cred(缺省 Ambient)。
+	refs userRefs
+	cred cred.Ref
+}
+
+// userRefs 是顶层 users 的 tag → 归属表。sing-vmess 命中 authID 用户后以 auth.ContextWithUser(ctx, tag)
+// 回调 handler,这里按 tag 映回 cred.Ref —— 多用户匹配在 sing 内部,NTR 只做"回读 + 映射"。
+type userRefs struct{ m map[string]cred.Ref }
+
+func (u *userRefs) set(tag string, ref cred.Ref) {
+	if u.m == nil {
+		u.m = make(map[string]cred.Ref)
+	}
+	u.m[tag] = ref
+}
+
+func (u userRefs) lookup(ctx context.Context) (cred.Ref, bool) {
+	tag, ok := auth.UserFromContext[string](ctx)
+	if !ok {
+		return cred.Ref{}, false
+	}
+	r, ok := u.m[tag]
+	return r, ok
+}
+
+// resolveCred 在回调里(持 r.mu)按 ctx 里 sing 给的 tag 定归属。
+func (r *result) resolveCred(ctx context.Context) {
+	if ref, ok := r.refs.lookup(ctx); ok {
+		r.cred = ref
+	}
 }
 
 // markReady 关 ready(幂等,持锁调用)。
@@ -68,17 +99,18 @@ func (captureHandler) NewConnection(ctx context.Context, conn net.Conn, md M.Met
 		return nil
 	}
 	r.mu.Lock()
+	r.resolveCred(ctx)
 	if r.dispatcher != nil {
 		if !r.dispatched {
 			r.dispatched = true
 			close(r.dispStart)
 		}
 		r.wg.Add(1)
-		d, dst := r.dispatcher, md.Destination
+		d, dst, who := r.dispatcher, md.Destination, r.cred // who:本子流归属(sing 已鉴出的 tag → BillID)
 		r.mu.Unlock()
 		go func() {
 			defer r.wg.Done()
-			d.DispatchStream(ctx, conn, toNTR(dst)) // 后台双向中继本子流,直到收尾
+			d.DispatchStream(ctx, conn, toNTR(dst), who) // 后台接入 + 计量 + 双向中继本子流,直到收尾
 		}()
 		return nil
 	}
@@ -100,6 +132,7 @@ func (captureHandler) NewPacketConnection(ctx context.Context, pc N.PacketConn, 
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.resolveCred(ctx)
 	if r.captured {
 		_ = pc.Close()
 		return errMuxUDPUnsupported
@@ -125,6 +158,8 @@ func (p *Proxy) ServerHandshake(ctx context.Context, below link.Stream, _ proxy.
 		ready:      make(chan struct{}),
 		dispStart:  make(chan struct{}),
 		dispatcher: proxy.StreamDispatcherFrom(ctx), // service 注入:有则 TCP 子流走后台派发(支持并发 mux)
+		refs:       p.users,
+		cred:       cred.Ref{ID: cred.Ambient},
 	}
 	cctx := context.WithValue(ctx, resultKey{}, r)
 	// 捕获前设 deadline:畸形/半开流永不回调时,读超时使 NewConnection 出错返回 → 不泄漏。
@@ -173,11 +208,11 @@ func (p *Proxy) captureResult(below link.Stream, r *result) (link.Stream, *proxy
 	r.mu.Unlock()
 	if pc != nil {
 		return &packetCarrier{Stream: below, pc: pc},
-			&proxy.Request{Cred: cred.Ref{ID: cred.Ambient}, Network: endpoint.NetworkUDP, Dst: toNTR(dst)}, nil
+			&proxy.Request{Cred: r.cred, Network: endpoint.NetworkUDP, Dst: toNTR(dst)}, nil
 	}
 	if conn == nil {
 		return nil, nil, errors.New("vmess: 未捕获到连接")
 	}
 	return &streamWrap{Conn: conn, below: below},
-		&proxy.Request{Cred: cred.Ref{ID: cred.Ambient}, Network: endpoint.NetworkTCP, Dst: toNTR(dst)}, nil
+		&proxy.Request{Cred: r.cred, Network: endpoint.NetworkTCP, Dst: toNTR(dst)}, nil
 }

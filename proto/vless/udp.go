@@ -81,7 +81,7 @@ func (c *packetConn) WritePacket(b *buf.Buffer, _ addr.Socksaddr) error {
 	return err
 }
 
-func (c *packetConn) Close() error                       { return c.stream.Close() }
-func (c *packetConn) LocalAddr() net.Addr                { return c.stream.LocalAddr() }
-func (c *packetConn) SetDeadline(t time.Time) error      { return c.stream.SetDeadline(t) }
-func (c *packetConn) Unwrap() any                        { return c.stream }
+func (c *packetConn) Close() error                  { return c.stream.Close() }
+func (c *packetConn) LocalAddr() net.Addr           { return c.stream.LocalAddr() }
+func (c *packetConn) SetDeadline(t time.Time) error { return c.stream.SetDeadline(t) }
+func (c *packetConn) Unwrap() any                   { return c.stream }

@@ -96,4 +96,4 @@ func TestVMessUDPRoundTrip(t *testing.T) {
 type unexpectedErr []byte
 
 func (e unexpectedErr) Error() string { return "unexpected payload: " + string(e) }
-func errUnexpected(b []byte) error     { return unexpectedErr(append([]byte(nil), b...)) }
+func errUnexpected(b []byte) error    { return unexpectedErr(append([]byte(nil), b...)) }

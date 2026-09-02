@@ -16,6 +16,7 @@ import (
 	"io"
 
 	"github.com/LOVECHEN/ntr/addr"
+	"github.com/LOVECHEN/ntr/core/cred"
 	"github.com/LOVECHEN/ntr/core/link"
 	"github.com/LOVECHEN/ntr/core/proxy"
 	"github.com/LOVECHEN/ntr/core/spec"
@@ -26,7 +27,29 @@ import (
 var (
 	_ proxy.Server           = (*Proxy)(nil)
 	_ proxy.PacketConnServer = (*Proxy)(nil)
+	_ proxy.CredentialCodec  = (*Proxy)(nil) // per-user 凭据 "user:pass",socks/http 两路共用同一份
+	_ proxy.AuthGate         = (*Proxy)(nil) // 转发给两个子插件
 )
+
+// mixed 自身没有线格式,per-user 凭据由被分派的 socks/http 各自读线上的 user:pass;但装配侧把凭据登记在
+// 本口 Authenticator 的 scheme 是 "mixed"(口的终端协议名)。aliasAuth 把子插件查的 "socks"/"http" 映回
+// "mixed",一份 "user:pass" 两个协议都认 —— 不改子插件、不改线格式、核心零 switch。
+type aliasAuth struct{ inner proxy.Authenticator }
+
+func (a aliasAuth) Auth(_ string, key []byte) (cred.Ref, bool) { return a.inner.Auth("mixed", key) }
+
+func (*Proxy) ClientKey(secret string) ([]byte, error) { return []byte(secret), nil }
+func (*Proxy) AuthKey(secret string) ([]byte, error)   { return []byte(secret), nil }
+
+// SetAuthRequired 转发:配了 users → socks 只收 RFC1929、http 缺/错 407;没配 → 两路都 no-auth。
+func (p *Proxy) SetAuthRequired(required bool) {
+	if g, ok := p.socks.(proxy.AuthGate); ok {
+		g.SetAuthRequired(required)
+	}
+	if g, ok := p.http.(proxy.AuthGate); ok {
+		g.SetAuthRequired(required)
+	}
+}
 
 const (
 	socks4Version = 0x04
@@ -81,11 +104,12 @@ func (p *Proxy) ServerHandshake(ctx context.Context, below link.Stream, auth pro
 		return nil, nil, err
 	}
 	st := &peekStream{Stream: below, br: br}
+	aa := aliasAuth{inner: auth} // 子插件查 "socks"/"http" → 本口登记的 "mixed" 凭据
 	switch head[0] {
 	case socks4Version, socks5Version:
-		return p.socks.ServerHandshake(ctx, st, auth)
+		return p.socks.ServerHandshake(ctx, st, aa)
 	default: // HTTP 方法首字母(CONNECT/GET/POST…)一律交给 http 插件
-		return p.http.ServerHandshake(ctx, st, auth)
+		return p.http.ServerHandshake(ctx, st, aa)
 	}
 }
 

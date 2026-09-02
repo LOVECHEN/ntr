@@ -8,7 +8,7 @@ import (
 
 func TestCredBindPreAuthThenPromote(t *testing.T) {
 	m := &Metadata{}
-	m.BindCred(cred.Ref{ID: cred.Unmatched}) // pre-auth 期
+	m.BindCred(cred.Ref{ID: cred.Unmatched})    // pre-auth 期
 	m.BindCred(cred.Ref{ID: cred.UserBase + 5}) // 鉴权完成追认一次 —— 允许
 	if m.CredID() != cred.UserBase+5 {
 		t.Fatalf("promoted cred = %d, want %d", m.CredID(), cred.UserBase+5)

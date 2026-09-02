@@ -307,9 +307,18 @@ func (in Inbound) synthLayers() ([]service.LayerSpec, error) {
 // 出站没有 tls 具名字段,tls: 自然落 Extra、经 Lookup 成层;sni/insecure/指纹写在 tls: 块里。
 func (o Outbound) newFormat() bool { return len(o.Layers) == 0 && isProxyProto(o.Type) }
 
-// synthLayers 出站:同入站分拣,无具名 tls 字段。
+// synthLayers 出站:同入站分拣,无具名 tls 字段。uuid 是 Outbound 的具名字段(会话式 tuic 用),yaml 具名
+// 优先于 inline 会把它截胡 —— 流式新格式下它其实是终端协议字段(vmess 的 uuid),这里转交给协议 Node。
 func (o Outbound) synthLayers() ([]service.LayerSpec, error) {
-	return synthStack(o.Type, o.Layers, o.Extra, nil)
+	extra := o.Extra
+	if o.UUID != "" && len(o.Layers) == 0 {
+		extra = make(map[string]any, len(o.Extra)+1)
+		for k, v := range o.Extra {
+			extra[k] = v
+		}
+		extra["uuid"] = o.UUID
+	}
+	return synthStack(o.Type, o.Layers, extra, nil)
 }
 
 // authProto 该口的 per-user 认证协议(= 栈顶协议名,供 Desugar 按栈取密钥,§4.4 规则 3)。
@@ -1620,18 +1629,39 @@ func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver servi
 	for _, r := range in.Fallbacks {
 		handler.Fallbacks = append(handler.Fallbacks, service.FallbackRule{SNI: r.SNI, ALPN: r.ALPN, Path: r.Path, Dest: r.Dest, Xver: r.Xver})
 	}
+	// 鉴权可选的协议(socks/http/gost/mixed):登记完凭据后告知"本口是否配了凭据"(能力发现,零协议 switch)
+	gate := func(registered int) {
+		if g, ok := handler.Proxy.(proxy.AuthGate); ok {
+			g.SetAuthRequired(registered > 0)
+		}
+	}
+	// 线上无明文 key 的协议(vmess / ss2022):走 UserRegistrar,把凭据整批交给协议库内部做多用户匹配。
+	if ur, ok := handler.Proxy.(proxy.UserRegistrar); ok && len(bindings) > 0 {
+		users := make([]proxy.RegisteredUser, 0, len(bindings))
+		seenTag := make(map[string]int, len(bindings))
+		for _, b := range bindings {
+			id := reg.IDForBill(b.BillID)
+			for _, layer := range b.Layers {
+				tag := b.BillID
+				if n := seenTag[b.BillID]; n > 0 { // 轮换:同 BillID 多把 key,Tag 加后缀保持唯一、Ref 同一
+					tag = fmt.Sprintf("%s#%d", b.BillID, n)
+				}
+				seenTag[b.BillID]++
+				users = append(users, proxy.RegisteredUser{Tag: tag, Secret: string(layer.Key), Ref: cred.Ref{ID: id}})
+			}
+		}
+		if err := ur.RegisterUsers(users); err != nil {
+			return nil, nil, fmt.Errorf("config: 入站 %s 注册顶层 users:%w", in.inboundName(), err)
+		}
+		gate(len(bindings))
+		return handler, base, nil
+	}
 	cc, hasCodec := handler.Proxy.(proxy.CredentialCodec)
 	if !hasCodec {
 		if len(bindings) > 0 { // 配了顶层 users 却接不上:fail-loud,绝不静默落 Ambient(冻结律#6)
 			return nil, nil, fmt.Errorf("config: 入站 %s 配了 users 但协议 %q 不支持 per-user 凭据 (E-USERS-NO-CODEC)", in.inboundName(), layers[len(layers)-1].Name)
 		}
 		return handler, base, nil // 协议无 per-user 凭据且未配 users(socks no-auth / mixed …):不登记、不设限
-	}
-	// 鉴权可选的协议(socks/http/gost):登记完凭据后告知"本口是否配了凭据"(能力发现,零协议 switch)
-	gate := func(registered int) {
-		if g, ok := handler.Proxy.(proxy.AuthGate); ok {
-			g.SetAuthRequired(registered > 0)
-		}
 	}
 	if len(bindings) > 0 {
 		// 第4章路径:每条 binding 每层 canonical(AuthKey)后登记;id 由 reg.IDForBill(BillID) 给,同 BillID

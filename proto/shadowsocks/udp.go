@@ -2,6 +2,7 @@ package shadowsocks
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"time"
@@ -111,6 +112,9 @@ const (
 
 // ServePacket 实现 proxy.PacketServer:在 pc 上跑 SS UDP 入站读环,阻塞至 ctx 取消 / socket 关闭。
 func (p *Proxy) ServePacket(ctx context.Context, pc net.PacketConn, sink func(link.PacketConn)) error {
+	if p.service == nil {
+		return errors.New("shadowsocks: password 为 iPSK:uPSK 多段(客户端写法),此口不能作 UDP 入站")
+	}
 	bind := &singBind{pc: pc}
 	sctx := context.WithValue(ctx, udpSinkKey{}, sink)
 	go func() { <-ctx.Done(); _ = pc.Close() }() // ctx 取消 → 关 socket 解阻塞读
@@ -146,11 +150,11 @@ func (b *singBind) WritePacket(buffer *singbuf.Buffer, destination M.Socksaddr) 
 	return err
 }
 func (b *singBind) ReadPacket(*singbuf.Buffer) (M.Socksaddr, error) { return M.Socksaddr{}, io.EOF }
-func (b *singBind) Close() error                       { return nil } // socket 生命周期在 ServePacket,不由 bind 关
-func (b *singBind) LocalAddr() net.Addr                { return b.pc.LocalAddr() }
-func (b *singBind) SetDeadline(time.Time) error        { return nil }
-func (b *singBind) SetReadDeadline(time.Time) error    { return nil }
-func (b *singBind) SetWriteDeadline(time.Time) error   { return nil }
+func (b *singBind) Close() error                                    { return nil } // socket 生命周期在 ServePacket,不由 bind 关
+func (b *singBind) LocalAddr() net.Addr                             { return b.pc.LocalAddr() }
+func (b *singBind) SetDeadline(time.Time) error                     { return nil }
+func (b *singBind) SetReadDeadline(time.Time) error                 { return nil }
+func (b *singBind) SetWriteDeadline(time.Time) error                { return nil }
 
 // newServerPacketConn 把 sing 的已解密 natConn 桥成 NTR link.PacketConn(多目标)。
 func newServerPacketConn(pc N.PacketConn) *serverPacketConn {

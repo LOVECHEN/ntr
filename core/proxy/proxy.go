@@ -97,3 +97,19 @@ type CredentialCodec interface {
 type AuthGate interface {
 	SetAuthRequired(required bool)
 }
+
+// RegisteredUser 是交给 UserRegistrar 的一条 per-user 凭据:Tag 是稳定标签(= BillID,轮换时带 "#n" 后缀
+// 保持唯一),Secret 是该协议的原始凭据(uuid / PSK …),Ref 是命中后要填进 Request.Cred 的归属。
+type RegisteredUser struct {
+	Tag    string
+	Secret string
+	Ref    cred.Ref
+}
+
+// UserRegistrar 是可选能力(与 CredentialCodec 二选一):线上【没有明文 key】的协议(VMess 的 authID 是
+// 时间加密、SS-2022 的 EIH 是加密身份头)走不了 Authenticator 的 (scheme,key) 精确匹配 —— 多用户匹配
+// 只能在协议库内部完成。装配侧把该口的全部 per-user 凭据一次性交给协议,协议按 Tag 建多用户服务,
+// 握手命中后把 Tag 映回 Ref 填进 Request.Cred。核心仍零协议 switch:只多一个能力分支。
+type UserRegistrar interface {
+	RegisterUsers(users []RegisteredUser) error
+}

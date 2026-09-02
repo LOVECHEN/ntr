@@ -18,11 +18,11 @@ import (
 
 // 编译期错误(对应设计里的 E-* 诊断)。
 var (
-	ErrEmptyStack     = errors.New("compile: empty stack")                                    // 空栈
-	ErrBandConflict   = errors.New("compile: two layers occupy the same Band")                // E-BAND-CONFLICT
-	ErrShapeAdjacency = errors.New("compile: shape mismatch between adjacent layers")         // E-LAYER-ORDER
+	ErrEmptyStack     = errors.New("compile: empty stack")                                      // 空栈
+	ErrBandConflict   = errors.New("compile: two layers occupy the same Band")                  // E-BAND-CONFLICT
+	ErrShapeAdjacency = errors.New("compile: shape mismatch between adjacent layers")           // E-LAYER-ORDER
 	ErrCapAdjacency   = errors.New("compile: RequiresAdjacent not provided by immediate lower") // E-CAP-ADJACENCY
-	ErrCapMissing     = errors.New("compile: Requires not provided by any lower layer")        // E-CAP-MISSING
+	ErrCapMissing     = errors.New("compile: Requires not provided by any lower layer")         // E-CAP-MISSING
 )
 
 // Order 把一组层描述符按 Band 升序排成确定性栈(底→顶)并做邻接校验。
