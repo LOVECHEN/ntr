@@ -35,14 +35,31 @@ func udpNAT(ctx context.Context, client link.PacketConn, resolver OutboundResolv
 		if err != nil {
 			return err
 		}
-		c, err := n.conn(dst)
+		// 首包嗅探(protocol 规则):对【新目标】识别应用协议(当前 STUN)→ 供路由按 protocol 拦截
+		// (如 WebRTC srflx 的 STUN 探测,不靠端口/域名)。已建目标沿用其首次路由,不再重嗅。
+		proto := ""
+		if !n.known(dst) {
+			proto = sniffPacket(b.Bytes()).String()
+		}
+		c, err := n.conn(dst, proto)
 		if err != nil {
-			continue // 单个目标建连/超限失败不拖垮整条关联(其余目标继续)
+			continue // 单个目标建连/超限失败(含被 protocol 规则路由到 block)不拖垮整条关联(其余目标继续)
 		}
 		if err := c.WritePacket(b, dst); err != nil {
 			continue
 		}
 	}
+}
+
+// known 报告 dst 是否已建出站(full-cone 下全会话共享,任意目标即已知)。
+func (n *udpNat) known(dst addr.Socksaddr) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.shared != nil {
+		return true
+	}
+	_, ok := n.conns[dst.String()]
+	return ok
 }
 
 type udpNat struct {
@@ -56,7 +73,8 @@ type udpNat struct {
 }
 
 // conn 取/建 dst 对应的单目标出站(仅 forward 单 goroutine 调用),首建时起反向 goroutine。
-func (n *udpNat) conn(dst addr.Socksaddr) (link.PacketConn, error) {
+// proto 是首包嗅探出的应用协议(供 protocol 规则;仅新目标首建时非空)。
+func (n *udpNat) conn(dst addr.Socksaddr, proto string) (link.PacketConn, error) {
 	key := dst.String()
 	n.mu.Lock()
 	if n.shared != nil { // full-cone:全会话一个 socket,任意目标复用
@@ -74,8 +92,9 @@ func (n *udpNat) conn(dst addr.Socksaddr) (link.PacketConn, error) {
 	}
 	n.mu.Unlock()
 
-	// UDP 路由:带 network="udp"(供 network 维度规则),源暂不反查进程(UDP process 规则后续)。
-	out, err := resolveOut(n.ctx, n.resolver, dst, netip.AddrPort{}, "udp")
+	// UDP 路由:带 network="udp"(供 network 维度规则)+ 嗅探 proto(供 protocol 规则,如 stun→block),
+	// 源暂不反查进程(UDP process 规则后续)。
+	out, err := resolveOut(withSniffedProto(n.ctx, proto), n.resolver, dst, netip.AddrPort{}, "udp")
 	if err != nil {
 		return nil, err
 	}

@@ -41,7 +41,24 @@ const (
 	SniffTLS             // ClientHello SNI
 	SniffHTTP            // Host 头
 	SniffQUIC            // QUIC Initial(第 11 章 §11.2)
+	SniffSTUN            // STUN 绑定报文(WebRTC/ICE;magic cookie 0x2112A442)—— 供 protocol 规则拦截防真实 IP 泄漏
 )
+
+// String 返回协议的小写名(供 routing 的 protocol 维度按名匹配;SniffNone → "")。
+func (p SniffProto) String() string {
+	switch p {
+	case SniffTLS:
+		return "tls"
+	case SniffHTTP:
+		return "http"
+	case SniffQUIC:
+		return "quic"
+	case SniffSTUN:
+		return "stun"
+	default:
+		return ""
+	}
+}
 
 // SniffFail 是嗅探失败原因(绝不静默:失败也要可见)。
 type SniffFail uint8

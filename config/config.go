@@ -129,6 +129,7 @@ type RuleSpec struct {
 	IPCIDR        []string `yaml:"ip-cidr"`        // CIDR(仅对 IP 目标)
 	Port          []uint16 `yaml:"port"`           // 目标端口
 	Network       []string `yaml:"network"`        // 传输层网络(tcp/udp)
+	Protocol      []string `yaml:"protocol"`       // 嗅探应用协议(tls/http/quic/stun;需入站开 sniff)—— 如 [stun] 拦 WebRTC 防真实 IP 泄漏
 	GeoIP         []string `yaml:"geoip"`          // geoip 国码(如 [CN,US];仅对 IP 目标;需 routing.geoip-path)
 	GeoSite       []string `yaml:"geosite"`        // geosite 类目(如 [google,cn];仅对域名目标;需 routing.geosite-path)
 	RuleSet       []string `yaml:"rule-set"`       // 引用 rule-providers 里的规则集名(按其 behavior 判域名/IP)
@@ -861,6 +862,7 @@ func buildRouter(ctx context.Context, spec *RoutingSpec, outs map[string]endpoin
 			IPCIDR:        rs.IPCIDR,
 			Port:          rs.Port,
 			Network:       rs.Network,
+			Protocol:      rs.Protocol,
 			GeoIP:         geoSets,
 			GeoSite:       siteSets,
 			ProcessName:   rs.ProcessName,

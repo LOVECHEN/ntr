@@ -25,26 +25,26 @@ type RuleRouter struct {
 	Finder rule.ProcessFinder              // 源→进程反查(nil=禁用 process 规则)
 }
 
-// Resolve 实现 OutboundResolver:纯 dst 路由(无源上下文,process 规则不参与)。
-func (r RuleRouter) Resolve(_ context.Context, dst addr.Socksaddr) (endpoint.Outbound, error) {
-	return r.route(dst, netip.AddrPort{}, "tcp")
+// Resolve 实现 OutboundResolver:纯 dst 路由(无源上下文,process 规则不参与)。ctx 可带嗅探协议(protocol 规则)。
+func (r RuleRouter) Resolve(ctx context.Context, dst addr.Socksaddr) (endpoint.Outbound, error) {
+	return r.route(dst, netip.AddrPort{}, "tcp", sniffedProtoFrom(ctx))
 }
 
-// ResolveConn 实现 ConnResolver:带 client 源地址,供 process 规则反查发起进程。
-func (r RuleRouter) ResolveConn(_ context.Context, dst addr.Socksaddr, src netip.AddrPort, network string) (endpoint.Outbound, error) {
-	return r.route(dst, src, network)
+// ResolveConn 实现 ConnResolver:带 client 源地址(供 process 规则)+ ctx 里的嗅探协议(供 protocol 规则)。
+func (r RuleRouter) ResolveConn(ctx context.Context, dst addr.Socksaddr, src netip.AddrPort, network string) (endpoint.Outbound, error) {
+	return r.route(dst, src, network, sniffedProtoFrom(ctx))
 }
 
-// route 是共用核心:fake-ip 换域名 → RouteConn(dst+src+finder) → 目标名 → Outs 查表。
+// route 是共用核心:fake-ip 换域名 → RouteConn(dst+src+proto+finder) → 目标名 → Outs 查表。
 // 未知目标名 = 配置错误(编译期本应挡住,此处兜底报错而非静默直连,守「绝不静默误路由」)。
-func (r RuleRouter) route(dst addr.Socksaddr, src netip.AddrPort, network string) (endpoint.Outbound, error) {
+func (r RuleRouter) route(dst addr.Socksaddr, src netip.AddrPort, network, proto string) (endpoint.Outbound, error) {
 	routeDst := dst
 	if r.Fake != nil && dst.IsIP() {
 		if domain, ok := r.Fake(dst.Addr); ok {
 			routeDst = addr.FromFqdn(domain, dst.Port) // 伪 IP → 域名:既用于路由,也用于拨号
 		}
 	}
-	target := r.Engine.RouteConn(routeDst, src, network, r.Finder)
+	target := r.Engine.RouteConn(routeDst, src, network, proto, r.Finder)
 	out, ok := r.Outs[target]
 	if !ok {
 		return nil, fmt.Errorf("route: 规则命中目标出站 %q 未在 outbounds 定义", target)

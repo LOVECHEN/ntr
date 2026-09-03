@@ -6,12 +6,33 @@ package service
 // 只读一次首包、带超时(绝不与「你先发我先发」的对端互等死锁);解不出就大声记 fail、按原 dst 走。
 
 import (
+	"context"
+	"encoding/binary"
 	"strings"
 	"time"
 
 	"github.com/LOVECHEN/ntr/core/endpoint"
 	"github.com/LOVECHEN/ntr/core/link"
 )
+
+// sniffProtoKey 把嗅探出的应用协议名(小写,如 "stun"/"tls")经 ctx 递给路由解析器 —— 让 protocol 维度
+// 规则(routing.rules[].protocol)对【流】与【UDP datagram】统一生效,而 OutboundResolver/ConnResolver
+// 的签名不必为此加参(纯 dst/src/network 之外的软信息走 ctx,与 StreamDispatcher 注入同源)。
+type sniffProtoKey struct{}
+
+// withSniffedProto 把协议名放进 ctx(空名不放,零成本)。
+func withSniffedProto(ctx context.Context, proto string) context.Context {
+	if proto == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, sniffProtoKey{}, proto)
+}
+
+// sniffedProtoFrom 取出注入的嗅探协议名(无则 "")。
+func sniffedProtoFrom(ctx context.Context) string {
+	p, _ := ctx.Value(sniffProtoKey{}).(string)
+	return p
+}
 
 const (
 	sniffPeekMax = 4096                   // 首包 peek 上限(TLS ClientHello 常 < 2KB;HTTP 首部通常更小)
@@ -37,7 +58,33 @@ func sniff(s link.Stream, timeout time.Duration) (endpoint.SniffProto, string, l
 	if host, ok := parseHTTPHost(data); ok {
 		return endpoint.SniffHTTP, host, replay, endpoint.SniffFailNone
 	}
+	if isSTUN(data) { // STUN-over-TCP(罕见但完整):无域名,仅供 protocol 规则拦截
+		return endpoint.SniffSTUN, "", replay, endpoint.SniffFailNone
+	}
 	return endpoint.SniffNone, "", replay, endpoint.SniffFailNoMatch
+}
+
+// sniffPacket 对一份 UDP datagram 识别应用协议(不 peek、不阻塞:UDP 首包即完整报文)。当前识别 STUN
+// (WebRTC/ICE 的 srflx 探测报文)—— 供 protocol 规则拦掉「任何形式 WebRTC → 任何 STUN 地址」,不靠端口/域名/IP
+// 名单(对位 sing-box 的 STUN sniffer;xray/mihomo 均无)。识别不出返回 SniffNone。
+func sniffPacket(datagram []byte) endpoint.SniffProto {
+	if isSTUN(datagram) {
+		return endpoint.SniffSTUN
+	}
+	return endpoint.SniffNone
+}
+
+// isSTUN 判定一份报文是否为 STUN(RFC 5389):≥20 字节头 + 魔术 cookie 0x2112A442(bytes[4:8])+ 消息长度
+// 字段(bytes[2:4])与实际长度自洽。魔术 cookie 是协议级铁证,不依赖端口(STUN 可跑任意端口含 443)。
+// 与 sing-box common/sniff/stun.go 同判据,线级一致。
+func isSTUN(b []byte) bool {
+	if len(b) < 20 {
+		return false
+	}
+	if binary.BigEndian.Uint32(b[4:8]) != 0x2112A442 {
+		return false
+	}
+	return len(b) >= 20+int(binary.BigEndian.Uint16(b[2:4]))
 }
 
 // parseTLSSNI 从 TLS ClientHello 解 server_name(SNI)。手解 record→handshake→extensions(免依赖 crypto/tls 内部)。

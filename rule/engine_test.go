@@ -263,25 +263,25 @@ func TestRouteProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if g := e.RouteConn(dst, src, "tcp", fakeFinder{"curl", "/usr/bin/curl", true}); g != "proxy" {
+	if g := e.RouteConn(dst, src, "tcp", "", fakeFinder{"curl", "/usr/bin/curl", true}); g != "proxy" {
 		t.Errorf("process-name 命中=%q 期望 proxy", g)
 	}
 	// 进程名不同 → default
-	if g := e.RouteConn(dst, src, "tcp", fakeFinder{"wget", "/usr/bin/wget", true}); g != "direct" {
+	if g := e.RouteConn(dst, src, "tcp", "", fakeFinder{"wget", "/usr/bin/wget", true}); g != "direct" {
 		t.Errorf("进程名不匹配=%q 期望 direct", g)
 	}
 	// finder=nil → process 规则不参与 → default
-	if g := e.RouteConn(dst, src, "tcp", nil); g != "direct" {
+	if g := e.RouteConn(dst, src, "tcp", "", nil); g != "direct" {
 		t.Errorf("finder nil=%q 期望 direct", g)
 	}
 	// finder ok=false(查不到进程)→ 不命中 → default
-	if g := e.RouteConn(dst, src, "tcp", fakeFinder{"", "", false}); g != "direct" {
+	if g := e.RouteConn(dst, src, "tcp", "", fakeFinder{"", "", false}); g != "direct" {
 		t.Errorf("finder ok=false=%q 期望 direct", g)
 	}
 
 	// process-path 命中
 	e2, _ := Compile([]Rule{{ProcessPath: []string{"/opt/app/bin/foo"}, To: "vpn"}}, "direct")
-	if g := e2.RouteConn(dst, src, "tcp", fakeFinder{"foo", "/opt/app/bin/foo", true}); g != "vpn" {
+	if g := e2.RouteConn(dst, src, "tcp", "", fakeFinder{"foo", "/opt/app/bin/foo", true}); g != "vpn" {
 		t.Errorf("process-path 命中=%q 期望 vpn", g)
 	}
 
@@ -290,7 +290,7 @@ func TestRouteProcess(t *testing.T) {
 		{ProcessName: []string{"curl"}, To: "byproc"},
 		{Domain: []string{"example.com"}, To: "bydomain"},
 	}, "direct")
-	if g := e3.RouteConn(dst, src, "tcp", fakeFinder{"curl", "/usr/bin/curl", true}); g != "byproc" {
+	if g := e3.RouteConn(dst, src, "tcp", "", fakeFinder{"curl", "/usr/bin/curl", true}); g != "byproc" {
 		t.Errorf("process 在前应赢=%q 期望 byproc", g)
 	}
 	// domain 规则(ord0)在前,进程也匹配(ord1)→ domain 赢
@@ -298,7 +298,7 @@ func TestRouteProcess(t *testing.T) {
 		{Domain: []string{"example.com"}, To: "bydomain"},
 		{ProcessName: []string{"curl"}, To: "byproc"},
 	}, "direct")
-	if g := e4.RouteConn(dst, src, "tcp", fakeFinder{"curl", "/usr/bin/curl", true}); g != "bydomain" {
+	if g := e4.RouteConn(dst, src, "tcp", "", fakeFinder{"curl", "/usr/bin/curl", true}); g != "bydomain" {
 		t.Errorf("domain 在前应赢=%q 期望 bydomain", g)
 	}
 
@@ -392,10 +392,10 @@ func TestRouteLogical(t *testing.T) {
 		Op: "and", To: "viaproc",
 		Sub: []Rule{{ProcessName: []string{"curl"}}, {Port: []uint16{443}}},
 	}}, "direct")
-	if g := eProc.RouteConn(g443, src, "tcp", ff); g != "viaproc" {
+	if g := eProc.RouteConn(g443, src, "tcp", "", ff); g != "viaproc" {
 		t.Errorf("AND+process 命中=%q 期望 viaproc", g)
 	}
-	if g := eProc.RouteConn(g443, src, "tcp", fakeFinder{"wget", "/usr/bin/wget", true}); g != "direct" {
+	if g := eProc.RouteConn(g443, src, "tcp", "", fakeFinder{"wget", "/usr/bin/wget", true}); g != "direct" {
 		t.Errorf("AND+process 进程不符=%q 期望 direct", g)
 	}
 	// 纯 dst Route(无 finder):process 子规则不命中 → AND 失败 → default

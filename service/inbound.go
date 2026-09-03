@@ -381,6 +381,7 @@ func (h *ProxyInbound) HandleStream(ctx context.Context, s link.Stream, md *endp
 
 	// 域名嗅探:目标只是 IP 时,peek 首包从 SNI/Host 解出真域名 → 覆盖路由目标(命中 domain/geosite/rule-set);
 	// replay 流保住已读的首包字节交给下游 relay,零丢失。已带域名的目标不嗅(省一次 peek)。
+	// 同时把嗅探出的应用协议(tls/http/stun…)经 ctx 递给路由,供 protocol 维度规则(如 stun→block)。
 	if h.Sniff && req.Dst.IsIP() {
 		proto, domain, replay, fail := sniff(hs, sniffTimeout)
 		md.SetSniff(proto, domain, fail)
@@ -388,6 +389,7 @@ func (h *ProxyInbound) HandleStream(ctx context.Context, s link.Stream, md *endp
 		if domain != "" {
 			req.Dst = addr.FromFqdn(domain, req.Dst.Port)
 		}
+		ctx = withSniffedProto(ctx, proto.String())
 	}
 
 	// process 规则:用最外层 client 连接的源地址(s,非 sniff 包装后的 hs)反查发起进程。

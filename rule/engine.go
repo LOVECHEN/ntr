@@ -50,6 +50,7 @@ type Rule struct {
 	IPCIDR        []string    // CIDR 前缀(仅对 IP 目标)
 	Port          []uint16    // 目标端口
 	Network       []string    // 传输层网络(tcp/udp)
+	Protocol      []string    // 嗅探出的应用协议(tls/http/quic/stun;由 sniffer 识别,不靠端口/域名)
 	GeoIP         []IPSet     // geoip 国码集合(仅对 IP 目标;由 config 从 mmdb 建好传入)
 	GeoSite       []DomainSet // geosite 域名集合(仅对域名目标;由 config 从 geosite.dat 建好传入)
 	ProcessName   []string    // 发起进程可执行名(basename,精确;仅对本机入站有意义)
@@ -70,7 +71,7 @@ func (r *Rule) dimCount() int {
 	n := 0
 	for _, nonEmpty := range []bool{
 		len(r.Domain) > 0, len(r.DomainSuffix) > 0, len(r.DomainKeyword) > 0,
-		len(r.IPCIDR) > 0, len(r.Port) > 0, len(r.Network) > 0, len(r.GeoIP) > 0, len(r.GeoSite) > 0,
+		len(r.IPCIDR) > 0, len(r.Port) > 0, len(r.Network) > 0, len(r.Protocol) > 0, len(r.GeoIP) > 0, len(r.GeoSite) > 0,
 		len(r.ProcessName) > 0, len(r.ProcessPath) > 0,
 	} {
 		if nonEmpty {
@@ -109,6 +110,7 @@ type Engine struct {
 	geosite  []siteEntry       // geosite 集合,逐个 MatchDomain 取 min(仅域名目标)
 	ports    map[uint16]uint32 // 端口 -> min ord
 	netw     map[string]uint32 // 网络 tcp/udp -> min ord
+	protocol map[string]uint32 // 嗅探协议 tls/http/quic/stun -> min ord
 	procName map[string]uint32 // 进程 basename -> min ord
 	procPath map[string]uint32 // 进程完整路径 -> min ord
 	hasProc  bool              // 是否有 process 规则(无则 RouteConn 跳过进程反查,省 I/O)
@@ -128,6 +130,7 @@ type evalCtx struct {
 	dst      addr.Socksaddr
 	src      netip.AddrPort
 	network  string
+	proto    string // 嗅探出的应用协议(tls/http/quic/stun;供 protocol 子规则)
 	finder   ProcessFinder
 	procDone bool
 	procName string
@@ -159,6 +162,7 @@ func Compile(rules []Rule, def string) (*Engine, error) {
 		suffix:   map[string]uint32{},
 		ports:    map[uint16]uint32{},
 		netw:     map[string]uint32{},
+		protocol: map[string]uint32{},
 		procName: map[string]uint32{},
 		procPath: map[string]uint32{},
 	}
@@ -205,6 +209,9 @@ func Compile(rules []Rule, def string) (*Engine, error) {
 				return nil, fmt.Errorf("rule[%d]: network %q 须为 tcp/udp", i, nw)
 			}
 			putMin(e.netw, nw, ord)
+		}
+		for _, pr := range r.Protocol {
+			putMin(e.protocol, strings.ToLower(pr), ord)
 		}
 		for _, gs := range r.GeoIP {
 			e.geoip = append(e.geoip, geoEntry{gs, ord})
@@ -332,6 +339,12 @@ func matchLeaf(r *Rule, c *evalCtx) bool {
 	if slices.Contains(r.Port, dst.Port) {
 		return true
 	}
+	if c.network != "" && slices.Contains(r.Network, c.network) {
+		return true
+	}
+	if c.proto != "" && slices.Contains(r.Protocol, c.proto) {
+		return true
+	}
 	if len(r.ProcessName) > 0 || len(r.ProcessPath) > 0 {
 		if name, path, ok := c.proc(); ok {
 			if slices.Contains(r.ProcessName, name) || slices.Contains(r.ProcessPath, path) {
@@ -345,7 +358,7 @@ func matchLeaf(r *Rule, c *evalCtx) bool {
 // Route 对目标 dst 返回派发出站名(命中规则的 To,或 default)。无 network / 源上下文,network 与
 // 组合/进程里需要源的部分不参与匹配;带 network 请用 RouteConn。
 func (e *Engine) Route(dst addr.Socksaddr) string {
-	return e.RouteConn(dst, netip.AddrPort{}, "", nil)
+	return e.RouteConn(dst, netip.AddrPort{}, "", "", nil)
 }
 
 // HasProcess 报告是否配了 process 规则(上游据此决定是否需要源侧进程反查)。
@@ -354,12 +367,12 @@ func (e *Engine) HasProcess() bool { return e.hasProc }
 // RouteConn 带源上下文路由:先匹配 dst 侧维度,再(仅当有 process 规则且 finder 非 nil)据 src+network
 // 反查发起进程,把 process 命中并入 min-ordinal。finder 为 nil 或无 process 规则时等价 Route(dst)。
 // 进程反查有 I/O 成本,故仅在 hasProc 时触发、admission 期一次、离字节路径。
-func (e *Engine) RouteConn(dst addr.Socksaddr, src netip.AddrPort, network string, finder ProcessFinder) string {
-	best := e.dimsBest(dst, network)
+func (e *Engine) RouteConn(dst addr.Socksaddr, src netip.AddrPort, network, proto string, finder ProcessFinder) string {
+	best := e.dimsBest(dst, network, proto)
 	// 顶层 process 叶子规则:走 map 索引(快)。组合规则里的 process 子规则走 evalCtx.proc()。
 	var ctx *evalCtx
 	if (e.hasProc || e.hasLogical) && finder != nil && src.IsValid() {
-		ctx = &evalCtx{dst: dst, src: src, network: network, finder: finder}
+		ctx = &evalCtx{dst: dst, src: src, network: network, proto: proto, finder: finder}
 	}
 	if e.hasProc && ctx != nil {
 		if name, path, ok := ctx.proc(); ok {
@@ -373,7 +386,7 @@ func (e *Engine) RouteConn(dst addr.Socksaddr, src netip.AddrPort, network strin
 	}
 	if e.hasLogical {
 		if ctx == nil { // 无源(纯 dst 路由):组合规则里的 process 子规则将不命中
-			ctx = &evalCtx{dst: dst, src: src, network: network, finder: finder}
+			ctx = &evalCtx{dst: dst, src: src, network: network, proto: proto, finder: finder}
 		}
 		for i := range e.logical {
 			if e.logical[i].ord < best && e.logical[i].eval(ctx) {
@@ -387,11 +400,16 @@ func (e *Engine) RouteConn(dst addr.Socksaddr, src netip.AddrPort, network strin
 	return e.targets[best]
 }
 
-// dimsBest 返回 dst 侧各维度(含 network)命中的最小 ord(ordNone=未命中)。Route/RouteConn 共用。
-func (e *Engine) dimsBest(dst addr.Socksaddr, network string) uint32 {
+// dimsBest 返回 dst 侧各维度(含 network、嗅探 protocol)命中的最小 ord(ordNone=未命中)。Route/RouteConn 共用。
+func (e *Engine) dimsBest(dst addr.Socksaddr, network, proto string) uint32 {
 	best := ordNone
 	if network != "" {
 		if o, ok := e.netw[network]; ok && o < best {
+			best = o
+		}
+	}
+	if proto != "" {
+		if o, ok := e.protocol[proto]; ok && o < best {
 			best = o
 		}
 	}
