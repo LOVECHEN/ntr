@@ -320,17 +320,27 @@ func (o Outbound) newFormat() bool { return isProxyProto(o.Type) }
 // Node。对 CredentialCodec 协议(vless/trojan…)节点多一个 uuid/secret 键无害(它们不 Get 该键、用传入 key)。
 func (o Outbound) synthLayers() ([]service.LayerSpec, error) {
 	extra := o.Extra
-	if o.UUID != "" || o.Secret != "" {
-		extra = make(map[string]any, len(o.Extra)+2)
+	// uuid/secret/protocol 是 Outbound 具名字段(tuic 的 uuid、各协议 secret、connect-ip 的 :protocol),
+	// yaml 具名优先会把它们从 inline Extra 里截胡 —— 但对「凭据/参数须落协议 Node」的流式协议(vmess 的
+	// uuid、mtproto/ssr 的 secret、ssr 的 protocol=auth_chain_a…),这里转交进 Node(值已在 extra 的不覆盖)。
+	if o.UUID != "" || o.Secret != "" || o.Protocol != "" {
+		extra = make(map[string]any, len(o.Extra)+3)
 		for k, v := range o.Extra {
 			extra[k] = v
 		}
 		if o.UUID != "" {
-			extra["uuid"] = o.UUID
+			if _, ok := extra["uuid"]; !ok {
+				extra["uuid"] = o.UUID
+			}
 		}
 		if o.Secret != "" {
 			if _, ok := extra["secret"]; !ok {
 				extra["secret"] = o.Secret
+			}
+		}
+		if o.Protocol != "" {
+			if _, ok := extra["protocol"]; !ok {
+				extra["protocol"] = o.Protocol
 			}
 		}
 	}
