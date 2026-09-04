@@ -12,10 +12,14 @@ docker run -d --name ${PFX}target --network $NET traefik/whoami >/dev/null 2>&1
 sleep 1
 cat > $D/_vmm_srv.yaml <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: vmess, uuid: "$UUID"}]
+  - name: vm-in
+    type: vmess
+    listen: 0.0.0.0:10000
+    uuid: "$UUID"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
 cat > $D/_vmm_cli.json <<J
 {"log":{"loglevel":"warning"},"inbounds":[{"port":1080,"listen":"0.0.0.0","protocol":"socks","settings":{"udp":true}}],"outbounds":[{"protocol":"vmess","settings":{"vnext":[{"address":"${PFX}s","port":10000,"users":[{"id":"$UUID","alterId":0,"security":"auto"}]}]},"streamSettings":{"security":"none"},"mux":{"enabled":true,"concurrency":8}}]}

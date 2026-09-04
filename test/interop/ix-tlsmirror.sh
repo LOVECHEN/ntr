@@ -43,14 +43,25 @@ run_mi_ready(){ local i; for i in 1 2 3; do docker rm -f "$1" >/dev/null 2>&1; r
 pullr(){ local o i; for i in 1 2 3 4 5 6; do o=$(pull "$1"); echo "$o"|grep -q Hostname && { echo "$o"; return; }; sleep 2; done; echo "$o"; }
 chk(){ echo "$1" | grep -q Hostname && echo PASS || echo FAIL; }
 
-# 参数化特性:$1=标签 $2=NTR 层附加键 $3=mihomo 客户端 tlsmirror-opts 附加 $4=mihomo 服务端 tlsmirror-config 附加 $5=是否含自环 $6=诱骗后端 env(如 DECOY_TLS12=1)
+# 参数化特性:$1=标签 $2=NTR tlsmirror 块附加行(块式,6 空格缩进,空=无) $3=mihomo 客户端 tlsmirror-opts 附加 $4=mihomo 服务端 tlsmirror-config 附加 $5=是否含自环 $6=诱骗后端 env(如 DECOY_TLS12=1)
 feat(){
   local name="$1" ntrkv="$2" miopt="$3" misrv="$4" selfloop="${5:-}" decoyenv="${6:-}"
   # A: mihomo vmess+tlsmirror 客户端 → NTR 服务端
   setup "$decoyenv"
   cat > $D/_s.yaml <<Y
-inbounds: [{listen: 0.0.0.0:10000, layers: [{type: tlsmirror, dest: "${PFX}decoy:443", primary-key: "$KEY"$ntrkv}, {type: vmess, uuid: "$UUID"}], outbound: direct}]
-outbounds: [{name: direct, type: direct}]
+inbounds:
+  - name: vm-in
+    type: vmess
+    listen: 0.0.0.0:10000
+    tlsmirror:
+      dest: "${PFX}decoy:443"
+      primary-key: "$KEY"
+$ntrkv
+    uuid: "$UUID"
+    outbound: direct
+outbounds:
+  - name: direct
+    type: direct
 Y
   run_ntr_ready ${PFX}s $D/_s.yaml
   cat > $D/_c.yaml <<Y
@@ -72,23 +83,58 @@ listeners:
 Y
   run_mi_ready ${PFX}s $D/_s.yaml
   cat > $D/_c.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:10000", layers: [{type: tlsmirror, sni: decoy.example.com, insecure: true, primary-key: "$KEY"$ntrkv}, {type: vmess, uuid: "$UUID"}]}
+  - name: up
+    type: vmess
+    server: "${PFX}s:10000"
+    uuid: "$UUID"
+    tlsmirror:
+      sni: decoy.example.com
+      insecure: true
+      primary-key: "$KEY"
+$ntrkv
 Y
   run_ntr_ready ${PFX}c $D/_c.yaml
   echo "  [$name B. NTR 客户端 → mihomo 服务端]  $(chk "$(pullr ${PFX}c)")"
   docker rm -f ${PFX}s ${PFX}c >/dev/null 2>&1
   if [ -n "$selfloop" ]; then
     cat > $D/_s.yaml <<Y
-inbounds: [{listen: 0.0.0.0:10000, layers: [{type: tlsmirror, dest: "${PFX}decoy:443", primary-key: "$KEY"$ntrkv}, {type: vmess, uuid: "$UUID"}], outbound: direct}]
-outbounds: [{name: direct, type: direct}]
+inbounds:
+  - name: vm-in
+    type: vmess
+    listen: 0.0.0.0:10000
+    tlsmirror:
+      dest: "${PFX}decoy:443"
+      primary-key: "$KEY"
+$ntrkv
+    uuid: "$UUID"
+    outbound: direct
+outbounds:
+  - name: direct
+    type: direct
 Y
     run_ntr_ready ${PFX}s $D/_s.yaml
     cat > $D/_c.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:10000", layers: [{type: tlsmirror, sni: decoy.example.com, insecure: true, primary-key: "$KEY"$ntrkv}, {type: vmess, uuid: "$UUID"}]}
+  - name: up
+    type: vmess
+    server: "${PFX}s:10000"
+    uuid: "$UUID"
+    tlsmirror:
+      sni: decoy.example.com
+      insecure: true
+      primary-key: "$KEY"
+$ntrkv
 Y
     run_ntr_ready ${PFX}c $D/_c.yaml
     echo "  [$name C. NTR↔NTR 自环]  $(chk "$(pullr ${PFX}c)")"
@@ -96,7 +142,7 @@ Y
 }
 
 feat "default"   ""              ""                                      ""                                      yes
-feat "tls12-explicit-nonce" ", explicit-nonce: true" ", explicit-nonce-ciphersuites: $SUITES" ", explicit-nonce-ciphersuites: $SUITES" "" "DECOY_TLS12=1"
-feat "padding"   ", padding: true"   ", transport-layer-padding: {enabled: true}"   ", transport-layer-padding: {enabled: true}"
-feat "watermark" ", watermark: true" ", sequence-watermarking-enabled: true"        ", sequence-watermarking-enabled: true"
+feat "tls12-explicit-nonce" "      explicit-nonce: true" ", explicit-nonce-ciphersuites: $SUITES" ", explicit-nonce-ciphersuites: $SUITES" "" "DECOY_TLS12=1"
+feat "padding"   "      padding: true"   ", transport-layer-padding: {enabled: true}"   ", transport-layer-padding: {enabled: true}"
+feat "watermark" "      watermark: true" ", sequence-watermarking-enabled: true"        ", sequence-watermarking-enabled: true"
 cleanup; echo DONE

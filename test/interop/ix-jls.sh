@@ -13,17 +13,36 @@ run_mi(){ docker run -d --name $1 --network $NET -v $2:/root/.config/mihomo/conf
 pull(){ docker run --rm --network $NET curlimages/curl:latest -s --max-time 8 -x socks5h://$1:1080 http://${PFX}target/ 2>&1; }
 ntr_srv(){ cat > $1 <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: jls, username: $U, password: $PW, dest: "example.com:443"}, {type: vless}]
-    users: [{uuid: "$UUID"}]
+  - name: vless-in
+    type: vless
+    listen: 0.0.0.0:10000
+    jls:
+      username: $U
+      password: $PW
+      dest: "example.com:443"
+    users:
+      - uuid: "$UUID"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
 }
 ntr_cli(){ cat > $1 <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "$2:10000", secret: "$UUID", layers: [{type: jls, username: $U, password: $PW, sni: example.com}, {type: vless}]}
+  - name: up
+    type: vless
+    server: "$2:10000"
+    secret: "$UUID"
+    jls:
+      username: $U
+      password: $PW
+      sni: example.com
 Y
 }
 mi_cli(){ cat > $1 <<Y

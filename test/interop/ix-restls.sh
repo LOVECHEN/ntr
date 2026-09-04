@@ -20,23 +20,37 @@ pull(){ docker run --rm --network $NET curlimages/curl:latest -s --max-time 12 -
 # NTR restls+ss 服务端
 cat > $D/_rtls_srv.yaml <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers:
-      - {type: restls, server-name: "$HOST", password: "$RPW", restls-script: "$SCRIPT"}
-      - {type: shadowsocks, method: $M, password: "$SSPW"}
+  - name: srv-in
+    type: shadowsocks
+    listen: 0.0.0.0:10000
+    restls:
+      server-name: "$HOST"
+      password: "$RPW"
+      restls-script: "$SCRIPT"
+    method: $M
+    password: "$SSPW"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
 # NTR restls+ss 客户端
 cat > $D/_rtls_cli.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
   - name: up
-    type: proxy
+    type: shadowsocks
     server: "${PFX}s:10000"
-    layers:
-      - {type: restls, server-name: "$HOST", password: "$RPW", restls-script: "$SCRIPT"}
-      - {type: shadowsocks, method: $M, password: "$SSPW"}
+    restls:
+      server-name: "$HOST"
+      password: "$RPW"
+      restls-script: "$SCRIPT"
+    method: $M
+    password: "$SSPW"
 Y
 # mihomo restls+ss 客户端
 cat > $D/_rtls_mihomo.yaml <<Y

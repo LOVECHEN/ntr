@@ -23,8 +23,18 @@ J
 docker run -d --name ${PFX}sbs --network $NET -v $D/_atu_sbs.json:/c.json:ro -v $D/atcert.pem:/cert.pem:ro -v $D/atkey.pem:/key.pem:ro ghcr.io/sagernet/sing-box:latest run -c /c.json >/dev/null 2>&1
 sleep 2
 cat > $D/_atu_ntrc.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: at}]
-outbounds: [{name: at, type: anytls, server: "${PFX}sbs:8443", secret: "$PW", sni: example.com, insecure: true}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: at
+outbounds:
+  - name: at
+    type: anytls
+    server: "${PFX}sbs:8443"
+    secret: "$PW"
+    sni: example.com
+    insecure: true
 Y
 docker run -d --name ${PFX}ntrc --network $NET -v $NTR:/ntr:ro -v $D/_atu_ntrc.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 wait_log ${PFX}ntrc "监听于" 15
@@ -35,12 +45,18 @@ docker rm -f ${PFX}sbs ${PFX}ntrc >/dev/null 2>&1
 # ── ② sing-box anytls-udp 客户端 → NTR anytls 服务端 ──
 cat > $D/_atu_ntrs.yaml <<Y
 inbounds:
-  - listen: 0.0.0.0:8443
+  - name: srv-in
     type: anytls
-    users: [{password: "$PW"}]
-    tls: {cert-file: /cert.pem, key-file: /key.pem}
+    listen: 0.0.0.0:8443
+    users:
+      - password: "$PW"
+    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
 docker run -d --name ${PFX}ntrs --network $NET -v $NTR:/ntr:ro -v $D/_atu_ntrs.yaml:/c.yaml:ro -v $D/atcert.pem:/cert.pem:ro -v $D/atkey.pem:/key.pem:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 wait_log ${PFX}ntrs "监听于" 15

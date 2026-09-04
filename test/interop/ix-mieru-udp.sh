@@ -33,9 +33,17 @@ Y
   docker run -d --name ${PFX}s --network $NET -v $D/_miu_msrv.yaml:/root/.config/mihomo/config.yaml:ro metacubex/mihomo:latest >/dev/null 2>&1
   cat > $D/_miu_ntr.yaml <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: mieru, server: "${PFX}s:10818", transport: $t, user: $U, secret: "$P"}
+  - name: up
+    type: mieru
+    server: "${PFX}s:10818"
+    transport: $t
+    user: $U
+    secret: "$P"
 Y
   docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v $D/_miu_ntr.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
   sleep 3; probe ${PFX}c:1080 "A-udp-$t"
@@ -45,12 +53,17 @@ Y
 dir_B(){ local t=$1
   cat > $D/_miu_nsrv.yaml <<Y
 inbounds:
-  - listen: 0.0.0.0:10818
+  - name: srv-in
+    listen: 0.0.0.0:10818
     type: mieru
     transport: $t
-    users: [{name: $U, password: "$P"}]
+    users:
+      - name: $U
+        password: "$P"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
   docker run -d --name ${PFX}s --network $NET -v $NTR:/ntr:ro -v $D/_miu_nsrv.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
   cat > $D/_miu_mcli.yaml <<Y

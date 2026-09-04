@@ -21,8 +21,8 @@ func layerNames(ls []service.LayerSpec) string {
 	return strings.Join(ns, ",")
 }
 
-// TestSynthLayersNewFormat:第4章新格式(type=协议名 + 层块 + 协议专属字段 + listen/port)与等价旧格式
-// (layers 数组)产出相同层集;层块顺序无关(compile.Order 按 Band 排)。config 零 switch 协议名 —— 全靠 registry。
+// TestSynthLayersNewFormat:第4章格式(type=协议名 + 层块 + 协议专属字段 + listen/port)产出正确层集;
+// 层块顺序无关(compile.Order 按 Band 排)。config 零 switch 协议名 —— 全靠 registry。
 func TestSynthLayersNewFormat(t *testing.T) {
 	const newFmt = `
 inbounds:
@@ -34,36 +34,18 @@ inbounds:
     reality:
       dest: www.microsoft.com:443
       private-key: k
-      short-id:
-        - "01ab"
+      short-id: "01ab"
     ws:
       path: /ray
 `
-	const oldFmt = `
-inbounds:
-  - listen: 0.0.0.0:2053
-    layers:
-      - type: reality
-        dest: www.microsoft.com:443
-        private-key: k
-        short-id:
-          - "01ab"
-      - type: ws
-        path: /ray
-      - type: vless
-        flow: xtls-rprx-vision
-`
-	var nf, of File
+	var nf File
 	if err := yaml.Unmarshal([]byte(newFmt), &nf); err != nil {
 		t.Fatalf("新格式解析: %v", err)
-	}
-	if err := yaml.Unmarshal([]byte(oldFmt), &of); err != nil {
-		t.Fatalf("旧格式解析: %v", err)
 	}
 
 	in := nf.Inbounds[0]
 	if !in.newFormat() {
-		t.Fatal("应识别为新格式(type=vless 是注册的 Proxy 协议且无 layers)")
+		t.Fatal("应识别为新格式(type=vless 是注册的 Proxy 协议)")
 	}
 	if got := in.listenAddr(); got != "0.0.0.0:2053" {
 		t.Errorf("listen+port 合成错: %q", got)
@@ -72,7 +54,7 @@ inbounds:
 		t.Errorf("口名错: %q", got)
 	}
 	if got := in.authProto(); got != "vless" {
-		t.Errorf("authProto 应为 vless(新格式 type 即终端协议): %q", got)
+		t.Errorf("authProto 应为 vless(type 即终端协议): %q", got)
 	}
 	// Extra 应吸收了 flow(标量)/reality/ws(映射)
 	if _, ok := in.Extra["reality"]; !ok {
@@ -84,22 +66,10 @@ inbounds:
 
 	ns, err := in.synthLayers()
 	if err != nil {
-		t.Fatalf("新格式 synthLayers: %v", err)
-	}
-	os_, err := of.Inbounds[0].synthLayers()
-	if err != nil {
-		t.Fatalf("旧格式 synthLayers: %v", err)
-	}
-	if layerNames(ns) != layerNames(os_) {
-		t.Errorf("新旧格式层集不等:\n 新=%s\n 旧=%s", layerNames(ns), layerNames(os_))
+		t.Fatalf("synthLayers: %v", err)
 	}
 	if layerNames(ns) != "reality,vless,ws" {
 		t.Errorf("层集应为 reality,vless,ws: %s", layerNames(ns))
-	}
-
-	// 旧格式不应被判为新格式(垫片路径)
-	if of.Inbounds[0].newFormat() {
-		t.Error("旧格式(有 layers)不应判为新格式")
 	}
 }
 

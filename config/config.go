@@ -199,21 +199,20 @@ type Bridge struct {
 	Pool          int    `yaml:"pool"`           // 维持的隧道数(默认 1)
 }
 
-// Inbound 是一个入站:监听地址 + 底→顶层栈 + 用户 + 路由到哪个出站。
-// Type 空/"proxy" = 流式栈模型;"anytls" 等 = 会话式协议(不走栈)。
+// Inbound 是一个入站:监听地址 + type=协议名/形态 + 层块 + 用户 + 路由到哪个出站。
+// type 直接写终端协议名(vless/trojan/snell…)或形态(tun/tproxy/tunnel/redirect/connect-ip/会话式);
+// 反连 portal = type 写承载协议名 + mode: portal(见 Mode)。层用命名块(tls:/reality:/ws:…),不再有 layers 数组。
 type Inbound struct {
 	Name          string           `yaml:"name"`    // 口名(第4章):users[].on/off 引用它,BillID=<user>@<口名>;缺省用 listen 兜底
-	Listen        string           `yaml:"listen"`  // 旧格式 host:port;第4章写 host(缺省 0.0.0.0)配 port
-	Port          uint16           `yaml:"port"`    // 第4章:监听端口;非零时 listen 只写 host
-	Type          string           `yaml:"type"`    // 第4章:协议名(vless/trojan/snell…,由 registry 判定)或形态(tun/tproxy/portal/会话式)
-	Extra         map[string]any   `yaml:",inline"` // 第4章新格式:所有未声明键 —— 层块(reality:/ws:/shadowtls:…)与协议专属字段(flow/version…),synthLayers 分拣
-	Layers        []map[string]any `yaml:"layers"`
+	Listen        string           `yaml:"listen"`  // host(缺省 0.0.0.0)配 port;也接受 host:port 合写
+	Port          uint16           `yaml:"port"`    // 监听端口;非零时 listen 只写 host
+	Type          string           `yaml:"type"`    // 协议名(vless/trojan/snell…,由 registry 判定)或形态(tun/tproxy/tunnel/redirect/connect-ip/会话式)
+	Extra         map[string]any   `yaml:",inline"` // 第4章新格式:所有未声明键 —— 层块(reality:/ws:/shadowtls:…)与协议专属字段(flow/version/mode…),synthLayers 分拣;mode: portal 亦在此(见 isPortal)
 	Users         []map[string]any `yaml:"users"`
 	TLS           map[string]any   `yaml:"tls"`
-	Obfs          string           `yaml:"obfs"` // hysteria1 salamander 混淆口令(可空)
 	Outbound      string           `yaml:"outbound"`
 	Sniff         bool             `yaml:"sniff"`          // 开启域名嗅探:IP 目标 peek 首包 SNI/Host 解真域名再分流(承 §10.4.2)
-	ControlDomain string           `yaml:"control-domain"` // type=portal:Bridge 连接的注册域(默认 reverse.ntr)
+	ControlDomain string           `yaml:"control-domain"` // mode=portal:Bridge 连接的注册域(默认 reverse.ntr)
 	AssignAddress string           `yaml:"assign-address"` // type=connect-ip:下发给客户端的隧道内地址(CIDR)
 	MTU           int              `yaml:"mtu"`            // type=connect-ip / type=tun
 	Transport     string           `yaml:"transport"`      // type=mieru:mieru 传输协议 TCP/UDP(默认 TCP)
@@ -261,24 +260,16 @@ func isProxyProto(name string) bool {
 	return ok && d.Band() == registry.BandProxy
 }
 
-// newFormat 报此口是第4章新格式:type 为注册的终端协议名,且未写旧 layers 数组。
-func (in Inbound) newFormat() bool { return len(in.Layers) == 0 && isProxyProto(in.Type) }
+// newFormat 报此口是第4章格式:type 为注册的终端协议名(vless/trojan/snell…)。
+func (in Inbound) newFormat() bool { return isProxyProto(in.Type) }
 
-// synthStack 是入站/出站共用的层集合成(第4章新格式),交 buildStack(顺序无关,compile.Order 按 Band
-// 排、书写序不参与):
-//   - 旧格式(layers 数组非空):原样 toLayerSpecs —— 兼容垫片,脚本迁完即拆。
-//   - 新格式(typ=协议名):extra 里「键是注册层插件且值为映射」→ 一层(tls:/reality:/ws:/grpc:/shadowtls:/
-//     mkcp:…);其余键(flow/version/cipher/psk…)→ 归终端协议字段;tls 参数非空 → tls 层(入站 tls: 是具名字段)。
-//     config 不认识任何协议名,分拣全靠 registry.Lookup。
-func synthStack(typ string, layers []map[string]any, extra, tls map[string]any) ([]service.LayerSpec, error) {
-	if len(layers) > 0 {
-		if len(extra) > 0 { // 旧 layers 数组与新格式 inline 层块/字段混写:后者会被静默丢弃 → 直接判死
-			return nil, fmt.Errorf("旧 layers 数组不能与新格式层块/协议字段混写(多余键 %s);二选一", sortedKeysAny(extra))
-		}
-		return toLayerSpecs(layers)
-	}
+// synthStack 是入站/出站共用的层集合成(第4章:type=协议名 + 命名层块),交 buildStack(顺序无关,
+// compile.Order 按 Band 排、书写序不参与):extra 里「键是注册层插件且值为映射」→ 一层(tls:/reality:/ws:/
+// grpc:/shadowtls:/mkcp:…);其余键(flow/version/cipher/psk…)→ 归终端协议字段;tls 参数非空 → tls 层
+// (入站 tls: 是具名字段)。config 不认识任何协议名,分拣全靠 registry.Lookup。
+func synthStack(typ string, extra, tls map[string]any) ([]service.LayerSpec, error) {
 	if !isProxyProto(typ) {
-		return nil, fmt.Errorf("type %q 不是注册的终端协议,且未写 layers", typ)
+		return nil, fmt.Errorf("type %q 不是注册的终端协议 —— 入站请直接写协议名(vless/trojan/snell…),层用命名块(tls:/reality:/ws:…);反连 portal 写 type=承载协议 + mode: portal;不再支持 type: proxy / layers 数组", typ)
 	}
 	var specs []service.LayerSpec
 	protoFields := make(map[string]any)
@@ -286,17 +277,16 @@ func synthStack(typ string, layers []map[string]any, extra, tls map[string]any) 
 		m, isMap := v.(map[string]any)
 		_, isLayer := registry.Lookup(k)
 		switch {
-		case isLayer && isMap:
+		case isLayer && isMap: // 映射值 + 注册层名 → 一层(tls:/reality:/ws:/obfs: 的 {mode,host}…)
 			node, err := mapToNode(m, "")
 			if err != nil {
 				return nil, fmt.Errorf("层 %q:%w", k, err)
 			}
 			specs = append(specs, service.LayerSpec{Name: k, Node: node})
-		case isLayer && !isMap: // 层名写成标量:该层会静默缺席(如 tls 退化明文)→ 判死
-			return nil, fmt.Errorf("层 %q 须写成块式映射(不能是标量/列表),否则该层静默缺席", k)
 		case !isLayer && isMap: // 映射值却不是注册层:十有八九是拼错的层名(relaity:)→ 判死,不静默吞成协议字段
 			return nil, fmt.Errorf("未知层块 %q:不是注册的层插件(协议专属字段应为标量,层块名请核对拼写)", k)
-		default:
+		default: // 标量 → 终端协议字段;即便键名与某层同名(如 ssr 的 obfs: plain / protocol: origin),标量一律归协议字段
+			// (层永远是映射块;这样 ssr 的 obfs 协议字段与 simple-obfs 传输层块 obfs:{mode,host} 靠值形状区分)
 			protoFields[k] = v
 		}
 	}
@@ -315,27 +305,36 @@ func synthStack(typ string, layers []map[string]any, extra, tls map[string]any) 
 	return specs, nil
 }
 
-// synthLayers 入站:tls: 是 Inbound 具名字段(会话式共用),新格式下即 tls 层。
+// synthLayers 入站:tls: 是 Inbound 具名字段(会话式共用),第4章下即 tls 层。
 func (in Inbound) synthLayers() ([]service.LayerSpec, error) {
-	return synthStack(in.Type, in.Layers, in.Extra, in.TLS)
+	return synthStack(in.Type, in.Extra, in.TLS)
 }
 
-// newFormat 出站镜像入站:type=协议名(vless/trojan/snell…)+ server/secret + 层块 + 协议字段,未写 layers。
+// newFormat 出站镜像入站:type=协议名(vless/trojan/snell…)+ server/secret + 层块 + 协议字段。
 // 出站没有 tls 具名字段,tls: 自然落 Extra、经 Lookup 成层;sni/insecure/指纹写在 tls: 块里。
-func (o Outbound) newFormat() bool { return len(o.Layers) == 0 && isProxyProto(o.Type) }
+func (o Outbound) newFormat() bool { return isProxyProto(o.Type) }
 
-// synthLayers 出站:同入站分拣,无具名 tls 字段。uuid 是 Outbound 的具名字段(会话式 tuic 用),yaml 具名
-// 优先于 inline 会把它截胡 —— 流式新格式下它其实是终端协议字段(vmess 的 uuid),这里转交给协议 Node。
+// synthLayers 出站:同入站分拣,无具名 tls 字段。uuid/secret 是 Outbound 的具名字段(会话式 tuic 的
+// uuid、各协议的 secret),yaml 具名优先会把它们截胡 —— 但对「凭据须落协议 Node」的流式协议(vmess 的
+// uuid、mtproto/ssr 的 secret,其 ClientHandshake 忽略传入 key、从节点 n.Get 读),这里把具名字段转交进
+// Node。对 CredentialCodec 协议(vless/trojan…)节点多一个 uuid/secret 键无害(它们不 Get 该键、用传入 key)。
 func (o Outbound) synthLayers() ([]service.LayerSpec, error) {
 	extra := o.Extra
-	if o.UUID != "" && len(o.Layers) == 0 {
-		extra = make(map[string]any, len(o.Extra)+1)
+	if o.UUID != "" || o.Secret != "" {
+		extra = make(map[string]any, len(o.Extra)+2)
 		for k, v := range o.Extra {
 			extra[k] = v
 		}
-		extra["uuid"] = o.UUID
+		if o.UUID != "" {
+			extra["uuid"] = o.UUID
+		}
+		if o.Secret != "" {
+			if _, ok := extra["secret"]; !ok {
+				extra["secret"] = o.Secret
+			}
+		}
 	}
-	return synthStack(o.Type, o.Layers, extra, nil)
+	return synthStack(o.Type, extra, nil)
 }
 
 // sessionAuthProtos 是【已接入第4章顶层 users + 计量】的会话式协议集(世界 C 逐个开通)。这些协议
@@ -349,9 +348,9 @@ var sessionAuthProtos = map[string]bool{
 	"tuic":      true,
 }
 
-// authProto 该口的 per-user 认证协议(= 栈顶协议名,供 Desugar 按栈取密钥,§4.4 规则 3)。
-// 新格式:type 即终端协议;旧格式流式栈(空/proxy/portal):取 layers 最后一层 type;已接入的会话式:
-// 返回其 type(见 sessionAuthProtos)。空 = 不产 binding。多层认证(shadowtls 外层)待骨头 4,当前单层。
+// authProto 该口的 per-user 认证协议(= 终端协议名,供 Desugar 按协议取密钥,§4.4 规则 3)。
+// 第4章:type 即终端协议(含 mode=portal 的 portal,其承载协议就是 type);已接入的会话式返回其 type
+//(见 sessionAuthProtos)。空 = 不产 binding。多层认证(shadowtls 外层)待骨头 4,当前单层。
 func (in Inbound) authProto() string {
 	if in.newFormat() {
 		return in.Type
@@ -359,15 +358,27 @@ func (in Inbound) authProto() string {
 	if sessionAuthProtos[in.Type] {
 		return in.Type
 	}
-	switch in.Type {
-	case "", "proxy", "portal":
-		if n := len(in.Layers); n > 0 {
-			if t, _ := in.Layers[n-1]["type"].(string); t != "" {
-				return t
-			}
-		}
-	}
 	return ""
+}
+
+// isPortal 报此口是反连 portal:mode: portal(承载协议=type,注册域取 control-domain)。mode 走 Extra
+// (与 snell 的 mode: default/unshaped/… 同键但值不重叠:portal 值专用,协议 mode 值另一组)。
+func (in Inbound) isPortal() bool {
+	m, _ := in.Extra["mode"].(string)
+	return m == "portal"
+}
+
+// obfsPassword 读 hysteria1/hysteria2 的 salamander 混淆口令(标量 obfs:)。与 simple-obfs 传输层块
+// (obfs: 映射)同键但值形状不重叠:会话式协议读标量、simple-obfs 的 map 走 synthStack 成层。
+func (in Inbound) obfsPassword() string { s, _ := in.Extra["obfs"].(string); return s }
+func (o Outbound) obfsPassword() string { s, _ := o.Extra["obfs"].(string); return s }
+
+// portalControl 反连 portal 的注册域:空则回落默认 reverse.ntr(须与 Bridge 一致)。
+func portalControl(cd string) string {
+	if cd == "" {
+		return reverse.DefaultControlDomain
+	}
+	return cd
 }
 
 // FallbackSpec 是一条多站回落规则(对齐 xray fallbacks 的 name/alpn/path/dest)。
@@ -384,12 +395,10 @@ type Outbound struct {
 	Name        string           `yaml:"name"`
 	Type        string           `yaml:"type"`
 	Server      string           `yaml:"server"`
-	Layers      []map[string]any `yaml:"layers"`  // 旧格式显式栈(兼容垫片);新格式不写
 	Extra       map[string]any   `yaml:",inline"` // 第4章新格式:未声明键 —— 层块(tls:/reality:/ws:…)与协议字段(flow…),synthLayers 分拣
 	Secret      string           `yaml:"secret"`
 	UUID        string           `yaml:"uuid"`
 	SNI         string           `yaml:"sni"`
-	Obfs        string           `yaml:"obfs"` // hysteria1 salamander 混淆口令(可空)
 	Insecure    bool             `yaml:"insecure"`
 	FullCone    bool             `yaml:"full-cone"`          // type=direct:UDP 用 unconnected 单端口(endpoint-independent = full-cone NAT)
 	Dialer      string           `yaml:"dialer"`             // relay 多跳/dialerProxy:底层连接经此具名 stream 出站(多级链天然支持)
@@ -986,13 +995,13 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			}
 			outs[o.Name] = up
 		case "hysteria1":
-			up, err := hysteria1.NewOutbound(hysteria1.Options{Server: o.Server, Password: o.Secret, Obfs: o.Obfs, SNI: o.SNI, Insecure: o.Insecure})
+			up, err := hysteria1.NewOutbound(hysteria1.Options{Server: o.Server, Password: o.Secret, Obfs: o.obfsPassword(), SNI: o.SNI, Insecure: o.Insecure})
 			if err != nil {
 				return nil, fmt.Errorf("config: 出站 %q(hysteria1):%w", o.Name, err)
 			}
 			outs[o.Name] = up
 		case "hysteria2":
-			up, err := hysteria2.NewOutbound(hysteria2.Options{Server: o.Server, Password: o.Secret, SNI: o.SNI, Insecure: o.Insecure, Obfs: o.Obfs})
+			up, err := hysteria2.NewOutbound(hysteria2.Options{Server: o.Server, Password: o.Secret, SNI: o.SNI, Insecure: o.Insecure, Obfs: o.obfsPassword()})
 			if err != nil {
 				return nil, fmt.Errorf("config: 出站 %q(hysteria2):%w", o.Name, err)
 			}
@@ -1184,10 +1193,10 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		}
 
 		typ := in.Type
-		if in.newFormat() { // 第4章新格式:type=协议名(vless/trojan/snell…)+ 层块,走流式栈(同 proxy 形态)
+		if in.newFormat() { // 第4章:type=协议名(vless/trojan/snell…)+ 层块,走流式栈(内部派发标记 proxy)
 			typ = "proxy"
 		}
-		binds := bindingsByInbound[in.inboundName()] // 该口的顶层 users 脱糖产物(proxy/portal 共用)
+		binds := bindingsByInbound[in.inboundName()] // 该口的顶层 users 脱糖产物(普通口/portal 共用)
 		var handler endpoint.InboundHandler
 		switch typ {
 		case "", "proxy":
@@ -1196,7 +1205,11 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 				return nil, err
 			}
 			h.MemGuard = memGuard // §6.4bis 软阈值拒新(nil 时零成本)
-			if base != nil {      // UDP-base(mkcp):自管 UDP 监听 + KCP accept,accept 出的流交 HandleStream
+			switch {
+			case in.isPortal():
+				// 反连 Portal:type=承载协议 + mode: portal;control-domain 区分 Bridge 控制连接与用户连接。
+				handler = &reverse.Portal{HS: h, Control: portalControl(in.ControlDomain)}
+			case base != nil: // UDP-base(mkcp):自管 UDP 监听 + KCP accept,accept 出的流交 HandleStream
 				listen := in.Listen
 				insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error {
 					ln, err := base.ListenBase(ctx, listen)
@@ -1206,17 +1219,9 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 					return service.ServeBase(ctx, ln, h)
 				}})
 				continue
+			default:
+				handler = h
 			}
-			handler = h
-		case "portal":
-			// 反向代理 Portal:复用普通代理入站建栈 + 注册用户,再包成 reverse.Portal
-			// (control-domain 区分 Bridge 控制连接与用户连接)。out 未用(Portal 覆盖 HandleStream)。
-			pin, _, err := f.buildProxyInbound(ctx, in, resolver, binds, reg, metricReg != nil)
-			if err != nil {
-				return nil, err
-			}
-			pin.MemGuard = memGuard // §6.4bis 软阈值拒新(nil 时零成本)
-			handler = &reverse.Portal{HS: pin, Control: in.ControlDomain}
 		case "anytls":
 			h, err := f.buildAnytlsInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
 			if err != nil {
@@ -2050,10 +2055,10 @@ func (f *File) buildHy1Inbound(in Inbound, out endpoint.Outbound, binds []princi
 		return nil, fmt.Errorf("hysteria1 入站需至少一个用户(顶层 users.keys.hysteria1 或口内 user{password})")
 	}
 	var admit endpoint.AdmitHook
-	if in.ControlDomain == "" { // 反连 portal 口不计量(隧道载体),与 hy2/anytls 一致
+	if !in.isPortal() { // 反连 portal 口不计量(隧道载体),与 hy2/anytls 一致
 		admit = service.SessionAdmit(adm, refs, hysteria1.UserFromContext)
 	}
-	return hysteria1.NewInbound(users, in.Obfs, 0, 0, tlsConfig, out, sessionPortalDispatch(in), admit)
+	return hysteria1.NewInbound(users, in.obfsPassword(), 0, 0, tlsConfig, out, sessionPortalDispatch(in), admit)
 }
 
 // sessionUser 是会话式口从顶层 users 脱糖出的一个库内用户(Tag=BillID 供 ctx 回读映射)。标量协议用
@@ -2103,10 +2108,10 @@ func buildSessionAdmitter(in Inbound, reg *meter.Registry, globalGate *meter.Gat
 	return adm, nil
 }
 
-// sessionDispatch:反连 portal(ControlDomain)保持原样(隧道载体不计量,不回归);否则用 service 的计量版
+// sessionDispatch:反连 portal(mode=portal)保持原样(隧道载体不计量,不回归);否则用 service 的计量版
 // dispatch(身份回读 → Admit(闸+计量+mem-guard)→ wrap → relay)。
 func (f *File) sessionDispatch(in Inbound, out endpoint.Outbound, adm *service.Admitter, refs map[string]cred.ID, readUser func(context.Context) (string, bool)) endpoint.StreamDispatch {
-	if in.ControlDomain != "" {
+	if in.isPortal() {
 		return sessionPortalDispatch(in)
 	}
 	return service.SessionDispatch(out, adm, refs, readUser)
@@ -2149,7 +2154,7 @@ func (f *File) buildHy2Inbound(in Inbound, out endpoint.Outbound, binds []princi
 		return nil, fmt.Errorf("hysteria2 入站需至少一个用户(顶层 users.keys.hysteria2 或口内 user{password})")
 	}
 	dispatch := f.sessionDispatch(in, out, adm, refs, hysteria2.UserFromContext)
-	return hysteria2.NewInbound(users, tlsConfig, in.Obfs, out, dispatch)
+	return hysteria2.NewInbound(users, tlsConfig, in.obfsPassword(), out, dispatch)
 }
 
 // buildMieruInbound 建 mieru 会话入站(官方库自绑端口,用户名+口令,TCP/UDP 传输)。
@@ -2235,13 +2240,13 @@ func buildShadowquicInbound(in Inbound, out endpoint.Outbound) (*shadowquic.Inbo
 }
 
 // sessionPortalDispatch:会话式协议(anytls/hy1/hy2/tuic —— 自管监听、每流已握手)作 reverse portal
-// 时的每流派发。in.ControlDomain 非空 → 建一个 Portal(隧道池)并返回其 Dispatch 适配(会话式反连
+// 时的每流派发。mode=portal → 建一个 Portal(隧道池)并返回其 Dispatch 适配(会话式反连
 // UDP 后置,传 nil);否则 nil(走默认 relay 到出站)。★协议本身一行不改,只在此接线注入。
 func sessionPortalDispatch(in Inbound) endpoint.StreamDispatch {
-	if in.ControlDomain == "" {
+	if !in.isPortal() {
 		return nil
 	}
-	portal := &reverse.Portal{Control: in.ControlDomain}
+	portal := &reverse.Portal{Control: portalControl(in.ControlDomain)}
 	return func(ctx context.Context, s link.Stream, dst addr.Socksaddr, network endpoint.Network) error {
 		return portal.Dispatch(ctx, s, dst, network, nil)
 	}
@@ -2261,26 +2266,6 @@ func fileOrStr(m map[string]any, key string) string {
 		}
 	}
 	return ""
-}
-
-// toLayerSpecs 把 YAML 层列表转成 service.LayerSpec(type→注册表名,其余键→spec.Node)。
-func toLayerSpecs(layers []map[string]any) ([]service.LayerSpec, error) {
-	if len(layers) == 0 {
-		return nil, fmt.Errorf("layers 为空")
-	}
-	specs := make([]service.LayerSpec, 0, len(layers))
-	for _, l := range layers {
-		typ, _ := l["type"].(string)
-		if typ == "" {
-			return nil, fmt.Errorf("某层缺 type")
-		}
-		node, err := mapToNode(l, "type")
-		if err != nil {
-			return nil, fmt.Errorf("层 %q:%w", typ, err)
-		}
-		specs = append(specs, service.LayerSpec{Name: typ, Node: node})
-	}
-	return specs, nil
 }
 
 // mapToNode 把配置 map 转成 spec 映射节点(排除 skip 键;`xxx-file` 键读文件注入到 `xxx`)。

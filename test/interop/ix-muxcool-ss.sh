@@ -18,10 +18,15 @@ pull(){ docker run --rm --network $NET curlimages/curl:latest -s --max-time 8 -x
 # A. NTR ss 服务端 <- xray ss+mux 客户端
 cat > $D/_mcs_ntrsrv.yaml <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: shadowsocks, method: $M, password: "$PW"}]
+  - name: ss-in
+    type: shadowsocks
+    listen: 0.0.0.0:10000
+    method: $M
+    password: "$PW"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
 cat > $D/_mcs_xraycli.json <<J
 {"log":{"loglevel":"warning"},"inbounds":[{"port":1080,"listen":"0.0.0.0","protocol":"socks","settings":{"udp":true}}],"outbounds":[{"protocol":"shadowsocks","settings":{"servers":[{"address":"${PFX}s","port":10000,"method":"$M","password":"$PW"}]},"mux":{"enabled":true,"concurrency":8}}]}
@@ -39,9 +44,18 @@ cat > $D/_mcs_xraysrv.json <<J
 J
 cat > $D/_mcs_ntrcli.yaml <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:10000", layers: [{type: shadowsocks, method: $M, password: "$PW"}], mux: {protocol: cool}}
+  - name: up
+    type: shadowsocks
+    server: "${PFX}s:10000"
+    method: $M
+    password: "$PW"
+    mux:
+      protocol: cool
 Y
 xray ${PFX}s $D/_mcs_xraysrv.json; sleep 2
 ntr  ${PFX}c $D/_mcs_ntrcli.yaml;  sleep 2

@@ -16,13 +16,19 @@ sleep 1
 # ---- 服务端(hy2, obfs=salamander) ----
 ntr_srv(){ cat > $D/_hy2s_nsrv.yaml <<Y
 inbounds:
-  - listen: 0.0.0.0:8443
+  - name: hy2-in
     type: hysteria2
-    tls: {cert-file: /cert.pem, key-file: /key.pem}
+    listen: 0.0.0.0:8443
+    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
     obfs: "$OBFS"
-    users: [{password: "$PW"}]
+    users:
+      - password: "$PW"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
   docker run -d --name ${PFX}s --network $NET -v $NTR:/ntr:ro -v $D/_hy2s_nsrv.yaml:/c.yaml:ro -v $D/_hy2s_cert.pem:/cert.pem:ro -v $D/_hy2s_key.pem:/key.pem:ro alpine /ntr -config /c.yaml >/dev/null 2>&1; }
 singbox_srv(){ cat > $D/_hy2s_sbsrv.json <<J
@@ -41,9 +47,18 @@ Y
 # ---- 客户端(socks 1080 → hy2 出站)----
 ntr_cli(){ cat > $D/_hy2s_ncli.yaml <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: hysteria2, server: "${PFX}s:8443", secret: "$PW", sni: example.com, insecure: true, obfs: "$OBFS"}
+  - name: up
+    type: hysteria2
+    server: "${PFX}s:8443"
+    secret: "$PW"
+    sni: example.com
+    insecure: true
+    obfs: "$OBFS"
 Y
   docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v $D/_hy2s_ncli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1; }
 singbox_cli(){ cat > $D/_hy2s_sbcli.json <<J

@@ -23,18 +23,33 @@ ntr(){  docker run -d --name $1 --network $NET -v $NTR:/ntr:ro -v $2:/c.yaml:ro 
 # NTR 客户端:tunnel(udp):6000 → 固定 U:5353,经 mux.cool(vless)出站到 ${PFX}s
 cat > $D/_mcu_ntrcli.yaml <<Y
 inbounds:
-  - {listen: 0.0.0.0:6000, type: tunnel, target: "$U:5353", network: [udp], outbound: up}
+  - name: udp-in
+    type: tunnel
+    listen: 0.0.0.0:6000
+    target: "$U:5353"
+    network:
+      - udp
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:10000", secret: "$UUID", layers: [{type: vless}], mux: {protocol: cool}}
+  - name: up
+    type: vless
+    server: "${PFX}s:10000"
+    secret: "$UUID"
+    mux:
+      protocol: cool
 Y
 # NTR vless 服务端
 cat > $D/_mcu_ntrsrv.yaml <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: vless}]
-    users: [{uuid: "$UUID"}]
+  - name: srv-in
+    type: vless
+    listen: 0.0.0.0:10000
+    users:
+      - uuid: "$UUID"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
 # xray vless 服务端
 cat > $D/_mcu_xraysrv.json <<J

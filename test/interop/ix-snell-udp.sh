@@ -15,18 +15,30 @@ runudp(){ docker run --rm --network $NET -e CLI=$1 -e ECHO=${PFX}echo -v $D/sock
 # NTR snell 服务端
 ntr_srv(){ cat > "$2" <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: snell, psk: $PSK, version: $1}]
+  - name: snell-in
+    type: snell
+    listen: 0.0.0.0:10000
+    psk: $PSK
+    version: $1
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
 }
 # NTR snell 客户端(socks 入站 UDP -> snell 出站)
 ntr_cli(){ cat > "$2" <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:10000", layers: [{type: snell, psk: $PSK, version: $1}]}
+  - name: up
+    type: snell
+    server: "${PFX}s:10000"
+    psk: $PSK
+    version: $1
 Y
 }
 # mihomo snell 客户端(mixed 入站 UDP -> snell 代理 udp:true)

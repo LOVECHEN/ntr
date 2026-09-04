@@ -25,8 +25,13 @@ echo "whoami W=$W (alias fake.test)"
 # 网关 P:socks → direct(docker DNS 解析 fake.test → W)
 cat > $D/_tf_gw.yaml <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}
-outbounds: [{name: direct, type: direct}]
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
+outbounds:
+  - name: direct
+    type: direct
 Y
 docker run -d --name ${PFX}gw --network $NET -v $NTR:/ntr:ro -v $D/_tf_gw.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 1
@@ -38,24 +43,34 @@ cat > $D/_tf_tun.yaml <<Y
 dns:
   enabled: true
   nameservers:
-    - {tag: up1, address: "udp://1.1.1.1:53", detour: up}
+    - tag: up1
+      address: "udp://1.1.1.1:53"
+      detour: up
   fake-ip:
     enabled: true
     inet4-range: 198.18.0.0/15
 inbounds:
-  - type: tun
+  - name: tun-in
+    type: tun
     if-name: ntr-tun0
-    address: [10.9.9.1/24]
+    address:
+      - 10.9.9.1/24
     mtu: 1500
-    dns-hijack: ["any:53"]
+    dns-hijack:
+      - "any:53"
     outbound: up
 routing:
   default: up
   rules:
-    - {domain-suffix: [fake.test], to: up}
+    - domain-suffix:
+        - fake.test
+      to: up
 outbounds:
-  - {name: up, type: proxy, server: "$GWIP:1080", layers: [{type: socks}]}
-  - {name: direct, type: direct}
+  - name: up
+    type: socks
+    server: "$GWIP:1080"
+  - name: direct
+    type: direct
 Y
 docker run -d --name ${PFX}tun --network $NET --cap-add NET_ADMIN --device /dev/net/tun -e NTR_DEBUG=1 \
   -v $NTR:/ntr:ro -v $D/_tf_tun.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1

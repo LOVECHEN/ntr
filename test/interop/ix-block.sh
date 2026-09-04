@@ -12,9 +12,14 @@ run_case(){ # $1=mode $2=期望(fail|timeout)
   local mode=$1 expect=$2
   cat > $D/_blk.yaml <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: b}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: b
 outbounds:
-  - {name: b, type: block, mode: $mode}
+  - name: b
+    type: block
+    mode: $mode
 Y
   docker rm -f ${PFX}ntr >/dev/null 2>&1
   docker run -d --name ${PFX}ntr --network $NET -v $NTR:/ntr:ro -v $D/_blk.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1

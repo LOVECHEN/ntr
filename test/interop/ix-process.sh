@@ -20,14 +20,21 @@ sleep 1
 # NTR:socks 入站 + process-name 规则
 cat > $D/_proc.yaml <<'Y'
 inbounds:
-  - {listen: 127.0.0.1:1080, layers: [{type: socks}], outbound: direct}
+  - name: s5-in
+    type: socks
+    listen: 127.0.0.1:1080
+    outbound: direct
 outbounds:
-  - {name: direct, type: direct}
-  - {name: block, type: block}
+  - name: direct
+    type: direct
+  - name: block
+    type: block
 routing:
   default: direct
   rules:
-    - {process-name: [blocked-app], to: block}
+    - process-name:
+        - blocked-app
+      to: block
 Y
 
 # 主容器内编排脚本(NTR 后台 + 改名 curl + 两次探测)。socks5h:域名交 NTR 解析,分流后 direct 才连靶机。

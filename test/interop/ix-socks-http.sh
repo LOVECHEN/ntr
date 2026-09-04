@@ -72,7 +72,7 @@ judge(){ if echo "$1"|grep -q "Hostname:"; then ok "$2"; else no "$2 :: $(echo "
 # =========================================================================
 t_socks5_server(){
   echo "── [1] SOCKS5 server (对端→NTR) ──"
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}\noutbounds: [{name: direct, type: direct}]\n' > ix-s5srv.yaml
+  printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: direct\noutbounds:\n  - name: direct\n    type: direct\n' > ix-s5srv.yaml
   ntr_up ixh-s5srv ix-s5srv.yaml
   sleep 1
   # baseline: 真 curl socks5h
@@ -108,8 +108,8 @@ t_socks5_client(){
   echo "── [2] SOCKS5 client (NTR socks 出站 → 上游 socks) ──"
   # NTR SOCKS5 出站(proxy.Client,601f42b:SOCKS5 出站 + UDP ASSOCIATE):NTR 作 socks 客户端连
   # 上游 socks 服务端(复用 [1] 的 ixh-s5srv)→ 落地。socks 出站已实现,此处正向验证其可用。
-  docker ps --format '{{.Names}}'|grep -q '^ixh-s5srv$' || { printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}\noutbounds: [{name: direct, type: direct}]\n' > ix-s5srv.yaml; ntr_up ixh-s5srv ix-s5srv.yaml; sleep 1; }
-  printf 'inbounds:\n  - {listen: 0.0.0.0:2080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "ixh-s5srv:1080", layers: [{type: socks}]}\n' > ix-s5cli.yaml
+  docker ps --format '{{.Names}}'|grep -q '^ixh-s5srv$' || { printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: direct\noutbounds:\n  - name: direct\n    type: direct\n' > ix-s5srv.yaml; ntr_up ixh-s5srv ix-s5srv.yaml; sleep 1; }
+  printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:2080\n    outbound: up\noutbounds:\n  - name: up\n    type: socks\n    server: "ixh-s5srv:1080"\n' > ix-s5cli.yaml
   ntr_up ixh-s5cli ix-s5cli.yaml; sleep 1
   judge "$(docker run --rm --network $NET $CURL -s --max-time 10 -x socks5h://ixh-s5cli:2080 http://ixh-whoami/ 2>&1)" "NTR socks 出站 → 上游 NTR socks 入站 → whoami"
 }
@@ -120,7 +120,7 @@ t_socks5_client(){
 t_socks4(){
   echo "── [3] SOCKS4/4a server ──"
   # 复用 [1] 的 ixh-s5srv(socks 入站同时支持 4/4a/5)
-  docker ps --format '{{.Names}}'|grep -q '^ixh-s5srv$' || { printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}\noutbounds: [{name: direct, type: direct}]\n' > ix-s5srv.yaml; ntr_up ixh-s5srv ix-s5srv.yaml; sleep 1; }
+  docker ps --format '{{.Names}}'|grep -q '^ixh-s5srv$' || { printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: direct\noutbounds:\n  - name: direct\n    type: direct\n' > ix-s5srv.yaml; ntr_up ixh-s5srv ix-s5srv.yaml; sleep 1; }
   # curl --socks4a(域名交代理解析 = 4a)
   judge "$(docker run --rm --network $NET $CURL -s --max-time 10 --socks4a ixh-s5srv:1080 http://ixh-whoami/ 2>&1)" "curl socks4a → NTR"
   # curl --socks4(本地解析域名成 IP 再发 = socks4 纯 IP)
@@ -140,7 +140,7 @@ t_socks4(){
 t_http(){
   echo "── [4] HTTP proxy 双向 ──"
   # 4A: NTR http 入站(server)
-  printf 'inbounds:\n  - {listen: 0.0.0.0:8080, layers: [{type: http}], outbound: direct}\noutbounds: [{name: direct, type: direct}]\n' > ix-httpsrv.yaml
+  printf 'inbounds:\n  - name: http-in\n    type: http\n    listen: 0.0.0.0:8080\n    outbound: direct\noutbounds:\n  - name: direct\n    type: direct\n' > ix-httpsrv.yaml
   ntr_up ixh-httpsrv ix-httpsrv.yaml; sleep 1
   judge "$(docker run --rm --network $NET $CURL -s --max-time 10 -x http://ixh-httpsrv:8080 http://ixh-whoami/ 2>&1)" "curl http(forward) → NTR"
   judge "$(docker run --rm --network $NET $CURL -s --max-time 10 -p -x http://ixh-httpsrv:8080 http://ixh-whoami/ 2>&1)" "curl http(CONNECT -p) → NTR"
@@ -169,21 +169,21 @@ t_http(){
   printf '{"inbounds":[{"port":8080,"listen":"0.0.0.0","protocol":"http"}],"outbounds":[{"protocol":"freedom"}]}\n' > ix-xr-hs.json
   docker rm -f ixh-xr-hs >/dev/null 2>&1
   docker run -d --name ixh-xr-hs --network $NET -v $D/ix-xr-hs.json:/c.json:ro ghcr.io/xtls/xray-core:latest -c /c.json >/dev/null 2>&1
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "ixh-xr-hs:8080", secret: "", layers: [{type: http}]}\n' > ix-ntr-hc-xr.yaml
+  printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: http\n    server: "ixh-xr-hs:8080"\n    secret: ""\n' > ix-ntr-hc-xr.yaml
   ntr_up ixh-ntr-hc-xr ix-ntr-hc-xr.yaml; sleep 1
   judge "$(docker run --rm --network $NET $CURL -s --max-time 10 -x socks5h://ixh-ntr-hc-xr:1080 http://ixh-whoami/ 2>&1)" "NTR http-out → xray http-in"
   # mihomo http 入站(listener)
   printf 'log-level: warning\nlisteners:\n  - {name: hin, type: http, port: 8080, listen: 0.0.0.0}\n' > ix-mh-hs.yaml
   docker rm -f ixh-mh-hs >/dev/null 2>&1
   docker run -d --name ixh-mh-hs --network $NET -v $D/ix-mh-hs.yaml:/root/.config/mihomo/config.yaml:ro metacubex/mihomo:latest >/dev/null 2>&1
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "ixh-mh-hs:8080", secret: "", layers: [{type: http}]}\n' > ix-ntr-hc-mh.yaml
+  printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: http\n    server: "ixh-mh-hs:8080"\n    secret: ""\n' > ix-ntr-hc-mh.yaml
   ntr_up ixh-ntr-hc-mh ix-ntr-hc-mh.yaml; sleep 2
   judge "$(docker run --rm --network $NET $CURL -s --max-time 10 -x socks5h://ixh-ntr-hc-mh:1080 http://ixh-whoami/ 2>&1)" "NTR http-out → mihomo http-in"
   # sing-box http 入站
   printf '{"inbounds":[{"type":"http","listen":"::","listen_port":8080}],"outbounds":[{"type":"direct"}]}\n' > ix-sb-hs.json
   docker rm -f ixh-sb-hs >/dev/null 2>&1
   docker run -d --name ixh-sb-hs --network $NET -v $D/ix-sb-hs.json:/c.json:ro ghcr.io/sagernet/sing-box:latest -c /c.json run >/dev/null 2>&1
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "ixh-sb-hs:8080", secret: "", layers: [{type: http}]}\n' > ix-ntr-hc-sb.yaml
+  printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: http\n    server: "ixh-sb-hs:8080"\n    secret: ""\n' > ix-ntr-hc-sb.yaml
   ntr_up ixh-ntr-hc-sb ix-ntr-hc-sb.yaml; sleep 1
   judge "$(docker run --rm --network $NET $CURL -s --max-time 10 -x socks5h://ixh-ntr-hc-sb:1080 http://ixh-whoami/ 2>&1)" "NTR http-out → sing-box http-in"
   docker rm -f ixh-xr-hs ixh-mh-hs ixh-sb-hs ixh-ntr-hc-xr ixh-ntr-hc-mh ixh-ntr-hc-sb >/dev/null 2>&1
@@ -194,7 +194,7 @@ t_http(){
 # =========================================================================
 t_mixed(){
   echo "── [5] mixed 入站(同端口)──"
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1090, layers: [{type: mixed}], outbound: direct}\noutbounds: [{name: direct, type: direct}]\n' > ix-mixed.yaml
+  printf 'inbounds:\n  - name: mixed-in\n    type: mixed\n    listen: 0.0.0.0:1090\n    outbound: direct\noutbounds:\n  - name: direct\n    type: direct\n' > ix-mixed.yaml
   ntr_up ixh-mixed ix-mixed.yaml; sleep 1
   judge "$(docker run --rm --network $NET $CURL -s --max-time 10 -x socks5h://ixh-mixed:1090 http://ixh-whoami/ 2>&1)" "mixed: curl socks5h"
   judge "$(docker run --rm --network $NET $CURL -s --max-time 10 --socks4a ixh-mixed:1090 http://ixh-whoami/ 2>&1)" "mixed: curl socks4a"
@@ -214,11 +214,11 @@ t_mixed(){
 # =========================================================================
 t_udp(){
   echo "── [6] SOCKS5 UDP ASSOCIATE ──"
-  docker ps --format '{{.Names}}'|grep -q '^ixh-s5srv$' || { printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}\noutbounds: [{name: direct, type: direct}]\n' > ix-s5srv.yaml; ntr_up ixh-s5srv ix-s5srv.yaml; sleep 1; }
+  docker ps --format '{{.Names}}'|grep -q '^ixh-s5srv$' || { printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: direct\noutbounds:\n  - name: direct\n    type: direct\n' > ix-s5srv.yaml; ntr_up ixh-s5srv ix-s5srv.yaml; sleep 1; }
   out=$(docker run --rm --network $NET -v $D/ix-socksudp.py:/t.py:ro python:3-alpine python /t.py ixh-s5srv ixh-echo 2>&1)
   if echo "$out"|grep -q "GOT b'PINGUDP"; then ok "socks UDP ASSOCIATE (curl-py → NTR → udpecho)"; else no "socks UDP ASSOCIATE :: $out"; fi
   # mixed 入站也测 UDP(mixed→socks 分派)
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: mixed}], outbound: direct}\noutbounds: [{name: direct, type: direct}]\n' > ix-mxudp.yaml
+  printf 'inbounds:\n  - name: mixed-in\n    type: mixed\n    listen: 0.0.0.0:1080\n    outbound: direct\noutbounds:\n  - name: direct\n    type: direct\n' > ix-mxudp.yaml
   ntr_up ixh-mxudp ix-mxudp.yaml; sleep 1
   out=$(docker run --rm --network $NET -v $D/ix-socksudp.py:/t.py:ro python:3-alpine python /t.py ixh-mxudp ixh-echo 2>&1)
   if echo "$out"|grep -q "GOT b'PINGUDP"; then ok "mixed UDP ASSOCIATE (→ socks 分派)"; else no "mixed UDP ASSOCIATE :: $out"; fi

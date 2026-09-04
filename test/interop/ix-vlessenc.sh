@@ -24,11 +24,19 @@ echo "keys ok"; sleep 1
 ntr_srv(){ local secs=0; [ "$2" = 1 ] && secs=600
   cat > $D/_venc_nsrv.yaml <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: vlessenc, key: "$PRIV", mode: $1, seconds: $secs}, {type: vless}]
-    users: [{uuid: "$UUID"}]
+  - name: venc-in
+    type: vless
+    listen: 0.0.0.0:10000
+    vlessenc:
+      key: "$PRIV"
+      mode: $1
+      seconds: $secs
+    users:
+      - uuid: "$UUID"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
   docker run -d --name ${PFX}s --network $NET -v $NTR:/ntr:ro -v $D/_venc_nsrv.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1; }
 xray_srv(){ local s2="0"; [ "$2" = 1 ] && s2="600"
@@ -40,9 +48,19 @@ J
 ntr_cli(){ local z=false; [ "$2" = 1 ] && z=true
   cat > $D/_venc_ncli.yaml <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:10000", secret: "$UUID", layers: [{type: vlessenc, key: "$PUB", mode: $1, zero-rtt: $z}, {type: vless}]}
+  - name: up
+    type: vless
+    server: "${PFX}s:10000"
+    secret: "$UUID"
+    vlessenc:
+      key: "$PUB"
+      mode: $1
+      zero-rtt: $z
 Y
   docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v $D/_venc_ncli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1; }
 xray_cli(){ local rtt=1rtt; [ "$2" = 1 ] && rtt=0rtt

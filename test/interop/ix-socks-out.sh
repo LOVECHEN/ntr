@@ -15,9 +15,14 @@ sleep 1
 # NTR 客户端:socks 入站 :1080 -> socks 出站到真服务端 $1:10000
 ntr_cli(){ cat > "$2" <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "$1:10000", layers: [{type: socks}]}
+  - name: up
+    type: socks
+    server: "$1:10000"
 Y
 }
 # 真服务端:socks 入站(no-auth,含 UDP)-> direct/freedom

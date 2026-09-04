@@ -92,29 +92,63 @@ dirB(){ # $1=label $2=combo $3=peername $4=peerver $5=ntrsrv_cfg $6=peer_cli_cfg
 # ---- NTR 服务端(固定,不含占位)----
 cat > n-vm-srv.yaml <<EOF
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: tls, cert-file: /cert.pem, key-file: /key.pem}, {type: vmess, uuid: "$UUID"}]
+  - name: vm-in
+    type: vmess
+    listen: 0.0.0.0:10000
+    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
+    uuid: "$UUID"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 EOF
 cat > n-tj-srv.yaml <<EOF
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: tls, cert-file: /cert.pem, key-file: /key.pem}, {type: trojan}]
-    users: [{password: "$PW"}]
+  - name: tj-in
+    type: trojan
+    listen: 0.0.0.0:10000
+    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
+    users:
+      - password: "$PW"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 EOF
 # ---- NTR 客户端模板 ----
 cat > n-vm-cli.yaml.tpl <<EOF
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "@SRV@:10000", layers: [{type: tls, sni: example.com, insecure: true}, {type: vmess, uuid: "$UUID"}]}
+  - name: up
+    type: vmess
+    server: "@SRV@:10000"
+    uuid: "$UUID"
+    tls:
+      sni: example.com
+      insecure: true
 EOF
 cat > n-tj-cli.yaml.tpl <<EOF
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "@SRV@:10000", secret: "$PW", layers: [{type: tls, sni: example.com, insecure: true}, {type: trojan}]}
+  - name: up
+    type: trojan
+    server: "@SRV@:10000"
+    secret: "$PW"
+    tls:
+      sni: example.com
+      insecure: true
 EOF
 
 # ---- xray 服务端(不含占位:监听 10000,freedom 出站)----

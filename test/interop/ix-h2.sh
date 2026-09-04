@@ -13,18 +13,34 @@ sleep 1
 
 ntr_srv(){ cat > "$1" <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: h2, path: $P, method: PUT}, {type: vless}]
-    users: [{uuid: "$UUID"}]
+  - name: vless-in
+    type: vless
+    listen: 0.0.0.0:10000
+    h2:
+      path: $P
+      method: PUT
+    users:
+      - uuid: "$UUID"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
 }
 ntr_cli(){ cat > "$1" <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:10000", secret: "$UUID", layers: [{type: h2, path: $P, host: example.com}, {type: vless}]}
+  - name: up
+    type: vless
+    server: "${PFX}s:10000"
+    secret: "$UUID"
+    h2:
+      path: $P
+      host: example.com
 Y
 }
 singbox_srv(){ cat > "$1" <<J

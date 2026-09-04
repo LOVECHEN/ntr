@@ -14,14 +14,33 @@ pull(){ docker run --rm --network $NET curlimages/curl:latest -s --max-time 8 -x
 chk(){ echo "$1" | grep -q Hostname && echo PASS || echo FAIL; }
 ntr_srv(){ cat > $1 <<Y
 inbounds:
-  - {listen: 0.0.0.0:10000, type: shadowquic, tls: {sni: example.com}, users: [{username: $U, password: $PW}], outbound: direct}
-outbounds: [{name: direct, type: direct}]
+  - name: sq-in
+    type: shadowquic
+    listen: 0.0.0.0:10000
+    tls:
+      sni: example.com
+    users:
+      - username: $U
+        password: $PW
+    outbound: direct
+outbounds:
+  - name: direct
+    type: direct
 Y
 }
 ntr_cli(){ cat > $1 <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: shadowquic, server: "$2:10000", user: $U, secret: $PW, sni: example.com}
+  - name: up
+    type: shadowquic
+    server: "$2:10000"
+    user: $U
+    secret: $PW
+    sni: example.com
 Y
 }
 mi_cli(){ cat > $1 <<Y

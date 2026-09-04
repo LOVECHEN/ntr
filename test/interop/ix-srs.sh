@@ -20,18 +20,32 @@ docker run --rm -v $D:/w -w /w $SB rule-set compile --output _ip.srs _sip.json >
 [ -s "$D/_dom.srs" ] && [ -s "$D/_ip.srs" ] || { echo "  [sing-box 生成 .srs 失败]  FAIL"; echo DONE; exit 0; }
 cleanup; docker network create $NET >/dev/null 2>&1
 cat > $D/_srs.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
 outbounds:
-  - {name: direct, type: direct}
-  - {name: block, type: block}
+  - name: direct
+    type: direct
+  - name: block
+    type: block
 routing:
   default: direct
   rule-providers:
-    - {name: sdom, behavior: domain, path: /dom.srs}
-    - {name: sip, behavior: ipcidr, path: /ip.srs}
+    - name: sdom
+      behavior: domain
+      path: /dom.srs
+    - name: sip
+      behavior: ipcidr
+      path: /ip.srs
   rules:
-    - {rule-set: [sdom], to: block}
-    - {rule-set: [sip], to: block}
+    - rule-set:
+        - sdom
+      to: block
+    - rule-set:
+        - sip
+      to: block
 Y
 docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v $D/_srs.yaml:/c.yaml:ro -v $D/_dom.srs:/dom.srs:ro -v $D/_ip.srs:/ip.srs:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 if ! wait_log ${PFX}c "监听于" 20; then echo "  [NTR 加载 .srs 失败]  FAIL"; docker logs ${PFX}c 2>&1|tail -4|sed 's/^/  NTR:/'; cleanup; echo DONE; exit 0; fi

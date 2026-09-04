@@ -31,12 +31,17 @@ Y
 ntr_srv(){ local f=$D/_mi_nsrv.yaml t=$1
   cat > "$f" <<Y
 inbounds:
-  - listen: 0.0.0.0:10818
+  - name: srv-in
+    listen: 0.0.0.0:10818
     type: mieru
     transport: $t
-    users: [{name: $U, password: "$P"}]
+    users:
+      - name: $U
+        password: "$P"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
   docker rm -f ${PFX}s >/dev/null 2>&1
   docker run -d --name ${PFX}s --network $NET -v $NTR:/ntr:ro -v "$f":/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
@@ -46,9 +51,17 @@ Y
 ntr_cli(){ local f=$D/_mi_ncli.yaml t=$1
   cat > "$f" <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: mieru, server: "${PFX}s:10818", transport: $t, user: $U, secret: "$P"}
+  - name: up
+    type: mieru
+    server: "${PFX}s:10818"
+    transport: $t
+    user: $U
+    secret: "$P"
 Y
   docker rm -f ${PFX}c >/dev/null 2>&1
   docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v "$f":/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1

@@ -18,10 +18,23 @@ pull(){ docker run --rm --network $NET curlimages/curl:latest -s --max-time 12 -
 pullr(){ local o i; for i in 1 2 3 4 5 6; do o=$(pull "$1"); echo "$o"|grep -q Hostname && { echo "$o"; return; }; sleep 2; done; echo "$o"; }
 chk(){ echo "$1" | grep -q Hostname && echo PASS || echo FAIL; }
 setup(){ cleanup; docker network create $NET >/dev/null 2>&1; docker run -d --name ${PFX}target --network $NET traefik/whoami >/dev/null 2>&1; sleep 1; }
-NTR_SRV='inbounds: [{listen: 0.0.0.0:10000, layers: [{type: gost}], outbound: direct}]
-outbounds: [{name: direct, type: direct}]'
-NTR_CLI='inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
-outbounds: [{name: up, type: proxy, server: "SRV:10000", layers: [{type: gost}]}]'
+NTR_SRV='inbounds:
+  - name: gost-in
+    type: gost
+    listen: 0.0.0.0:10000
+    outbound: direct
+outbounds:
+  - name: direct
+    type: direct'
+NTR_CLI='inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
+outbounds:
+  - name: up
+    type: gost
+    server: "SRV:10000"'
 
 # A: mihomo gost-relay 客户端 → NTR gost 服务端
 setup

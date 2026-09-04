@@ -13,11 +13,22 @@ sleep 1
 
 # ① select 组:default=direct
 cat > $D/_grp1.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: grp}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: grp
 outbounds:
-  - {name: grp, type: select, default: direct, outbounds: [direct, blk]}
-  - {name: direct, type: direct}
-  - {name: blk, type: block}
+  - name: grp
+    type: select
+    default: direct
+    outbounds:
+      - direct
+      - blk
+  - name: direct
+    type: direct
+  - name: blk
+    type: block
 Y
 docker run -d --name ${PFX}c1 --network $NET -v $NTR:/ntr:ro -v $D/_grp1.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 wait_log ${PFX}c1 "监听于" 15
@@ -27,11 +38,27 @@ docker rm -f ${PFX}c1 >/dev/null 2>&1
 
 # ② fallback 组:首成员 dead(TEST-NET 192.0.2.1 不可达)→ 探测标死 → 选 direct
 cat > $D/_grp2.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: fb}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: fb
 outbounds:
-  - {name: fb, type: fallback, interval: 3s, outbounds: [dead, direct]}
-  - {name: dead, type: proxy, server: "192.0.2.1:9", secret: "x", layers: [{type: tls, sni: a, insecure: true}, {type: trojan}]}
-  - {name: direct, type: direct}
+  - name: fb
+    type: fallback
+    interval: 3s
+    outbounds:
+      - dead
+      - direct
+  - name: dead
+    type: trojan
+    server: "192.0.2.1:9"
+    secret: "x"
+    tls:
+      sni: a
+      insecure: true
+  - name: direct
+    type: direct
 Y
 docker run -d --name ${PFX}c2 --network $NET -v $NTR:/ntr:ro -v $D/_grp2.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 wait_log ${PFX}c2 "监听于" 15

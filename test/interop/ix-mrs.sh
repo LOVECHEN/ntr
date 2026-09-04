@@ -16,18 +16,32 @@ docker run --rm -v $D:/w $MIHOMO convert-ruleset ipcidr text /w/_mip.txt /w/_ip.
 [ -s "$D/_dom.mrs" ] && [ -s "$D/_ip.mrs" ] || { echo "  [mihomo 生成 .mrs 失败]  FAIL"; echo DONE; exit 0; }
 cleanup; docker network create $NET >/dev/null 2>&1
 cat > $D/_mrs.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
 outbounds:
-  - {name: direct, type: direct}
-  - {name: block, type: block}
+  - name: direct
+    type: direct
+  - name: block
+    type: block
 routing:
   default: direct
   rule-providers:
-    - {name: mdom, behavior: domain, path: /dom.mrs}
-    - {name: mip, behavior: ipcidr, path: /ip.mrs}
+    - name: mdom
+      behavior: domain
+      path: /dom.mrs
+    - name: mip
+      behavior: ipcidr
+      path: /ip.mrs
   rules:
-    - {rule-set: [mdom], to: block}
-    - {rule-set: [mip], to: block}
+    - rule-set:
+        - mdom
+      to: block
+    - rule-set:
+        - mip
+      to: block
 Y
 docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v $D/_mrs.yaml:/c.yaml:ro -v $D/_dom.mrs:/dom.mrs:ro -v $D/_ip.mrs:/ip.mrs:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 if ! wait_log ${PFX}c "监听于" 20; then echo "  [NTR 加载 .mrs 失败]  FAIL"; docker logs ${PFX}c 2>&1|tail -4|sed 's/^/  NTR:/'; cleanup; echo DONE; exit 0; fi

@@ -25,14 +25,22 @@ echo "TLS 靶机 TGT=$TGT"
 # NTR:socks 入站(开 sniff)+ 路由 domain-suffix blocked.test→block
 mkntr(){ cat > $D/_sniff_$1.yaml <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], sniff: $2, outbound: direct}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    sniff: $2
+    outbound: direct
 outbounds:
-  - {name: direct, type: direct}
-  - {name: block, type: block}
+  - name: direct
+    type: direct
+  - name: block
+    type: block
 routing:
   default: direct
   rules:
-    - {domain-suffix: [blocked.test], to: block}
+    - domain-suffix:
+        - blocked.test
+      to: block
 Y
 docker rm -f ${PFX}c >/dev/null 2>&1
 docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v $D/_sniff_$1.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1

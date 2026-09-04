@@ -17,15 +17,23 @@ fi
 [ -s "$D/geoip.mmdb" ] || { echo "  [下载 geoip.mmdb 失败]  FAIL"; echo DONE; exit 0; }
 cleanup; docker network create $NET >/dev/null 2>&1
 cat > $D/_geo.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
 outbounds:
-  - {name: direct, type: direct}
-  - {name: block, type: block}
+  - name: direct
+    type: direct
+  - name: block
+    type: block
 routing:
   default: direct
   geoip-path: /geoip.mmdb
   rules:
-    - {geoip: [CN], to: block}
+    - geoip:
+        - CN
+      to: block
 Y
 docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v $D/_geo.yaml:/c.yaml:ro -v $D/geoip.mmdb:/geoip.mmdb:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 wait_log ${PFX}c "监听于" 15

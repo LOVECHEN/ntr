@@ -29,10 +29,15 @@ sleep 2
 
 mkntr(){ cat > $D/_logic_$1.yaml <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
 outbounds:
-  - {name: direct, type: direct}
-  - {name: block, type: block}
+  - name: direct
+    type: direct
+  - name: block
+    type: block
 routing:
   default: direct
   rules:
@@ -46,19 +51,36 @@ probe(){ docker run --rm --network $NET $CURL -s --max-time 8 -o /dev/null -w '%
 chk(){ echo "  [$1]  $([ "$2" = "$3" ] && echo PASS || echo "FAIL(http=$2 期望 $3)")"; }
 
 echo "=== A: and[domain-suffix tgt, port 80] → block ==="
-mkntr and '    - {op: and, to: block, sub: [{domain-suffix: [tgt]}, {port: [80]}]}'
+mkntr and '    - op: and
+      to: block
+      sub:
+        - domain-suffix:
+            - tgt
+        - port:
+            - 80'
 chk "① tgt:80 and 全中→block"      "$(probe tgt:80)"   000
 chk "② tgt:443 端口不符→direct"     "$(probe tgt:443)"  200
 chk "③ other:80 域名不符→direct"    "$(probe other:80)" 200
 
 echo "=== B: or[domain x1, domain x2] → block ==="
-mkntr or '    - {op: or, to: block, sub: [{domain: [x1]}, {domain: [x2]}]}'
+mkntr or '    - op: or
+      to: block
+      sub:
+        - domain:
+            - x1
+        - domain:
+            - x2'
 chk "④ x1:80 or 命中→block"         "$(probe x1:80)"    000
 chk "⑤ x2:443 or 命中→block"        "$(probe x2:443)"   000
 chk "⑥ other:443 不符→direct"       "$(probe other:443)" 200
 
 echo "=== C: not(or[domain-suffix keep]) → block ==="
-mkntr not '    - {op: or, not: true, to: block, sub: [{domain-suffix: [keep]}]}'
+mkntr not '    - op: or
+      not: true
+      to: block
+      sub:
+        - domain-suffix:
+            - keep'
 chk "⑦ tgt:80 非keep→not命中→block" "$(probe tgt:80)"   000
 chk "⑧ keep:80 是keep→放行→direct"  "$(probe keep:80)"  200
 

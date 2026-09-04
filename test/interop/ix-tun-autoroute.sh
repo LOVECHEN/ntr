@@ -20,7 +20,7 @@ cleanup; docker network create $NET_F >/dev/null 2>&1; docker network create $NE
 # W 靶机:仅后端网(TUN 容器前端网直连够不到,只能经 proxy)
 docker run -d --name ${PFX}target --network $NET_B traefik/whoami >/dev/null 2>&1
 # P 网关代理:前端网起 + 接后端网(跨网,socks→direct)
-printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}\noutbounds: [{name: direct, type: direct}]\n' > $D/${PFX}p.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: direct\noutbounds:\n  - name: direct\n    type: direct\n' > $D/${PFX}p.yaml
 docker run -d --name ${PFX}p --network $NET_F -v $NTR:/ntr:ro -v $D/${PFX}p.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 docker network connect $NET_B ${PFX}p
 sleep 1
@@ -32,16 +32,22 @@ echo "P(NF)=$PIP  P(NB)=$PBIP  W(NB)=$WIP"
 # TUN 容器:auto-route: true + route-exclude=[P],出站 proxy→P。装 iproute2(auto-route 用 ip)
 cat > $D/${PFX}tun.yaml <<EOF
 inbounds:
-  - type: tun
+  - name: tun-in
+    type: tun
     if-name: ntr-tun0
-    address: [10.9.9.1/24]
+    address:
+      - 10.9.9.1/24
     mtu: 1500
     auto-route: true
-    route-exclude: ["$PIP"]
+    route-exclude:
+      - "$PIP"
     outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "$PIP:1080", layers: [{type: socks}]}
-  - {name: direct, type: direct}
+  - name: up
+    type: socks
+    server: "$PIP:1080"
+  - name: direct
+    type: direct
 EOF
 docker run -d --name ${PFX}tun --network $NET_F --cap-add NET_ADMIN --device /dev/net/tun -e NTR_DEBUG=1 \
   -v $NTR:/ntr:ro -v $D/${PFX}tun.yaml:/c.yaml:ro alpine sh -c 'apk add --no-cache iproute2 curl >/dev/null 2>&1; exec /ntr -config /c.yaml' >/dev/null 2>&1

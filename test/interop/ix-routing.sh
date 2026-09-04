@@ -12,16 +12,22 @@ sleep 1
 BLOCKIP=$(docker inspect ${PFX}block --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
 cat > $D/_rt.yaml <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}]}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
 outbounds:
-  - {name: direct, type: direct}
-  - {name: block, type: block}
+  - name: direct
+    type: direct
+  - name: block
+    type: block
 routing:
   default: direct
   rules:
-    - domain: [${PFX}block]
+    - domain:
+        - ${PFX}block
       to: block
-    - ip-cidr: [$BLOCKIP/32]
+    - ip-cidr:
+        - $BLOCKIP/32
       to: block
 Y
 docker run -d --name ${PFX}s --network $NET -v $NTR:/ntr:ro -v $D/_rt.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1

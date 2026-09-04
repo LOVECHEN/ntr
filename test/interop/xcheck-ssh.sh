@@ -28,9 +28,16 @@ docker run -d --name ${P}sshd --network $NET alpine sh -c '
   /usr/sbin/sshd -D -e' >/dev/null
 cat > $D/xvs-ntrcli.yaml <<EOF
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: ssh, server: "${P}sshd:22", user: $U, secret: "$PW"}
+  - name: up
+    type: ssh
+    server: "${P}sshd:22"
+    user: $U
+    secret: "$PW"
 EOF
 # 等真 sshd 就绪且 AllowTcpForwarding 生效(apk add+keygen 在负载下可能超过固定 sleep)
 for i in $(seq 1 30); do
@@ -44,11 +51,17 @@ probe ${P}ntrcli:1080 >/dev/null && echo "方向A NTR-ssh客户端 → 真OpenSS
 ########## NTR ssh 服务端(方向 B/C 共用) ##########
 cat > $D/xvs-ntrsrv.yaml <<EOF
 inbounds:
-  - listen: 0.0.0.0:2222
+  - name: srv-in
     type: ssh
-    tls: {key-file: /hostkey}
-    users: [{name: $U, password: "$PW"}]
-outbounds: [{name: direct, type: direct}]
+    listen: 0.0.0.0:2222
+    tls:
+      key-file: /hostkey
+    users:
+      - name: $U
+        password: "$PW"
+outbounds:
+  - name: direct
+    type: direct
 EOF
 docker run -d --name ${P}ntrsrv --network $NET -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/xvs-ntrsrv.yaml:/c.yaml:ro -v $D/ssh_hostkey:/hostkey:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 3

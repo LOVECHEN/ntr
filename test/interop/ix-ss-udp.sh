@@ -11,17 +11,29 @@ sleep 1
 
 ntr_srv(){ cat > $D/_udp_s.cfg <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: shadowsocks, method: $C, password: "$CPW"}]
+  - name: srv-in
+    type: shadowsocks
+    listen: 0.0.0.0:10000
+    method: $C
+    password: "$CPW"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
 }
 ntr_cli(){ cat > $D/_udp_c.cfg <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "$1:10000", layers: [{type: shadowsocks, method: $C, password: "$CPW"}]}
+  - name: up
+    type: shadowsocks
+    server: "$1:10000"
+    method: $C
+    password: "$CPW"
 Y
 }
 xray_srv(){ cat > $D/_udp_s.cfg <<J

@@ -16,18 +16,30 @@ sleep 1
 # --- 配置生成(每引擎+角色+协议唯一文件名,避 OrbStack 原地截断竞态)---
 ntr_cli(){ cat > "$3" <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "$1:10000", secret: "$UUID", layers: [{type: vless}], mux: {protocol: $2}}
+  - name: up
+    type: vless
+    server: "$1:10000"
+    secret: "$UUID"
+    mux:
+      protocol: $2
 Y
 }
 ntr_srv(){ cat > "$2" <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: vless}]
-    users: [{uuid: "$UUID"}]
+  - name: srv-in
+    type: vless
+    listen: 0.0.0.0:10000
+    users:
+      - uuid: "$UUID"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
 }
 singbox_cli(){ cat > "$3" <<J

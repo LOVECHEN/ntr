@@ -19,7 +19,7 @@ cleanup; docker network create $NET >/dev/null 2>&1
 echo "########################################################################"
 echo "# 方向 A:mihomo masque 客户端(connect-ip)→ NTR masque 服务端"
 echo "########################################################################"
-printf 'inbounds:\n  - listen: 0.0.0.0:8443\n    type: masque\n    tls: {cert-file: /cert.pem, key-file: /key.pem}\noutbounds: [{name: direct, type: direct}]\n' > $D/${PFX}srv.yaml
+printf 'inbounds:\n  - name: srv-in\n    type: masque\n    listen: 0.0.0.0:8443\n    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\noutbounds:\n  - name: direct\n    type: direct\n' > $D/${PFX}srv.yaml
 docker run -d --name ${PFX}srv --network $NET -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/${PFX}srv.yaml:/c.yaml:ro -v $D/cert.pem:/cert.pem:ro -v $D/key.pem:/key.pem:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 # mihomo masque 需 WARP 专有字段:SEC1 EC 私钥/公钥 + ip CIDR + mtu
 openssl ecparam -name prime256v1 -genkey -noout -out $D/${PFX}ec.key 2>/dev/null
@@ -61,7 +61,7 @@ echo "########################################################################"
 echo "# 回退验证:NTR masque 自环 TCP(RFC 9220 CONNECT over h3)"
 echo "########################################################################"
 docker run -d --name ${PFX}target --network $NET traefik/whoami >/dev/null
-printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: masque, server: "xcm-srv:8443", sni: %s, insecure: true}\n' "$DEST" > $D/${PFX}cli.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: masque\n    server: "xcm-srv:8443"\n    sni: %s\n    insecure: true\n' "$DEST" > $D/${PFX}cli.yaml
 docker run -d --name ${PFX}cli --network $NET -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/${PFX}cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 5
 OUT=$(docker run --rm --network $NET curlimages/curl:latest -s --max-time 12 -x socks5h://${PFX}cli:1080 http://${PFX}target/ 2>&1)

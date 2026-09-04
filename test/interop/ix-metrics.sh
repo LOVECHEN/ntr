@@ -12,11 +12,17 @@ cleanup; docker network create $NET >/dev/null 2>&1
 docker run -d --name ${PFX}target --network $NET python:3-alpine sh -c "python3 -c \"open('/f','wb').write(b'x'*5242880)\"; cd /; python3 -m http.server 80" >/dev/null 2>&1
 cat > $D/_mtr.yaml <<Y
 metrics:
-  access: ["0.0.0.0/0"]
+  access:
+    - "0.0.0.0/0"
   listen: 0.0.0.0:9091
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}
-outbounds: [{name: direct, type: direct}]
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
+outbounds:
+  - name: direct
+    type: direct
 Y
 docker run -d --name ${PFX}s --network $NET -v $NTR:/ntr:ro -v $D/_mtr.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 2

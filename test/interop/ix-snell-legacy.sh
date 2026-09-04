@@ -20,15 +20,28 @@ test_ver(){ # $1 = version
   local v=$1
   cat > $D/_snl_srv.yaml <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: snell, psk: $PSK, version: $v}]
+  - name: snell-in
+    type: snell
+    listen: 0.0.0.0:10000
+    psk: $PSK
+    version: $v
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
   cat > $D/_snl_ntrcli.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:10000", layers: [{type: snell, psk: $PSK, version: $v}]}
+  - name: up
+    type: snell
+    server: "${PFX}s:10000"
+    psk: $PSK
+    version: $v
 Y
   cat > $D/_snl_micli.yaml <<Y
 log-level: warning

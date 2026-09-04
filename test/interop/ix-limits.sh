@@ -14,20 +14,35 @@ sleep 1
 start_srv(){ # $1 = users-line
   docker rm -f ${PFX}s >/dev/null 2>&1
   cat > $D/_lim_srv.yaml <<Y
-metrics: {listen: 0.0.0.0:9091, access: ["0.0.0.0/0"]}
+metrics:
+  listen: 0.0.0.0:9091
+  access:
+    - "0.0.0.0/0"
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: vless}]
-    users: [{uuid: "$UUID", $1}]
+  - name: srv-in
+    type: vless
+    listen: 0.0.0.0:10000
+    users:
+      - uuid: "$UUID"
+        $1
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
   docker run -d --name ${PFX}s --network $NET -v $NTR:/ntr:ro -v $D/_lim_srv.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 }
 cat > $D/_lim_cli.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:10000", secret: "$UUID", layers: [{type: vless}]}
+  - name: up
+    type: vless
+    server: "${PFX}s:10000"
+    secret: "$UUID"
 Y
 start_cli(){ docker rm -f ${PFX}c >/dev/null 2>&1; docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v $D/_lim_cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1; }
 S(){ docker inspect ${PFX}s --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null; }

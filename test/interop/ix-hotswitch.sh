@@ -11,18 +11,32 @@ cleanup; docker network create $NET >/dev/null 2>&1
 docker run -d --name ${PFX}target --network $NET traefik/whoami >/dev/null 2>&1
 sleep 1
 cat > $D/_hsw_srv.yaml <<Y
-metrics: {listen: 0.0.0.0:9091, access: ["0.0.0.0/0"]}
+metrics:
+  listen: 0.0.0.0:9091
+  access:
+    - "0.0.0.0/0"
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: vless}]
-    users: [{uuid: "$UUID"}]
+  - name: vless-in
+    type: vless
+    listen: 0.0.0.0:10000
+    users:
+      - uuid: "$UUID"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
 cat > $D/_hsw_cli.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:10000", secret: "$UUID", layers: [{type: vless}]}
+  - name: up
+    type: vless
+    server: "${PFX}s:10000"
+    secret: "$UUID"
 Y
 docker run -d --name ${PFX}s --network $NET -v $NTR:/ntr:ro -v $D/_hsw_srv.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v $D/_hsw_cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1

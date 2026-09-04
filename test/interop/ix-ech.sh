@@ -21,17 +21,36 @@ sleep 1
 # NTR ECH 服务端
 cat > $D/_ech_s.yaml <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: tls, cert-file: /cert.pem, key-file: /key.pem, ech-key-file: /ech-keys.pem}, {type: vless}]
-    users: [{uuid: "$UUID"}]
+  - name: srv-in
+    type: vless
+    listen: 0.0.0.0:10000
+    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
+      ech-key-file: /ech-keys.pem
+    users:
+      - uuid: "$UUID"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
 # NTR ECH 客户端(内层 sni=secret.example,ech-config 给公钥)
 ntr_cli(){ cat > $D/_ech_c.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "$1:10000", secret: "$UUID", layers: [{type: tls, sni: secret.example, insecure: true, ech-config-file: /ech-configs.pem}, {type: vless}]}
+  - name: up
+    type: vless
+    server: "$1:10000"
+    secret: "$UUID"
+    tls:
+      sni: secret.example
+      insecure: true
+      ech-config-file: /ech-configs.pem
 Y
 }
 

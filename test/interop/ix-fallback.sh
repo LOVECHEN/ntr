@@ -35,8 +35,20 @@ sleep 1
 
 # NTR [tls, trojan] 服务端(自签)+ 单站 fallback
 srv "" <<Y
-inbounds: [{listen: 0.0.0.0:10000, layers: [{type: tls, cert-file: /cert.pem, key-file: /key.pem}, {type: trojan}], users: [{password: "$PW"}], outbound: direct, fallback: "${PFX}decoy:80"}]
-outbounds: [{name: direct, type: direct}]
+inbounds:
+  - name: fb-in
+    type: trojan
+    listen: 0.0.0.0:10000
+    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
+    users:
+      - password: "$PW"
+    outbound: direct
+    fallback: "${PFX}decoy:80"
+outbounds:
+  - name: direct
+    type: direct
 Y
 
 # ① 探测:直连 HTTPS 无 trojan → 伪装站
@@ -45,9 +57,19 @@ echo "  [① 直连HTTPS无trojan探测 → 伪装站]  $(echo "$P"|grep -q 'Nam
 
 # ② 有效 NTR trojan 客户端 → 真目标
 mkdir -p $D/cfgc; cat > $D/cfgc/c.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:10000", secret: "$PW", layers: [{type: tls, sni: example.com, insecure: true}, {type: trojan}]}
+  - name: up
+    type: trojan
+    server: "${PFX}s:10000"
+    secret: "$PW"
+    tls:
+      sni: example.com
+      insecure: true
 Y
 docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v $D/cfgc:/cfg:ro alpine /ntr -config /cfg/c.yaml >/dev/null 2>&1
 wait_log ${PFX}c "监听于" 15
@@ -78,14 +100,22 @@ docker rm -f ${PFX}xs >/dev/null 2>&1
 # ⑤⑥ 多站回落(NTR fallbacks 列表):按 HTTP path 前缀路由到不同伪装站(对齐 xray fallbacks 的 path 维)
 srv "" <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: tls, cert-file: /cert.pem, key-file: /key.pem}, {type: trojan}]
-    users: [{password: "$PW"}]
+  - name: fb-in
+    type: trojan
+    listen: 0.0.0.0:10000
+    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
+    users:
+      - password: "$PW"
     outbound: direct
     fallbacks:
-      - {path: "/alpha", dest: "${PFX}decoy:80"}
-      - {dest: "${PFX}db:80"}
-outbounds: [{name: direct, type: direct}]
+      - path: "/alpha"
+        dest: "${PFX}decoy:80"
+      - dest: "${PFX}db:80"
+outbounds:
+  - name: direct
+    type: direct
 Y
 PA=$(probe 'Name: DECOY' https://${PFX}s:10000/alpha)
 echo "  [⑤ 多站回落 GET /alpha → 规则1 伪装站A(DECOY-SITE)]  $(echo "$PA"|grep -q 'Name: DECOY-SITE' && echo PASS || echo FAIL)"
@@ -96,14 +126,23 @@ echo "  [⑥ 多站回落 GET /beta → 默认规则2 伪装站B(DECOY-BETA)]  $
 # 用 Docker 网络别名让 alpha.test/beta.test 都解析到 NTR 服务端(curl 以此为 SNI,免 --resolve+取 IP 的竞态)
 srv "--network-alias alpha.test --network-alias beta.test" <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: tls, cert-file: /cert.pem, key-file: /key.pem}, {type: trojan}]
-    users: [{password: "$PW"}]
+  - name: fb-in
+    type: trojan
+    listen: 0.0.0.0:10000
+    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
+    users:
+      - password: "$PW"
     outbound: direct
     fallbacks:
-      - {sni: ["alpha.test"], dest: "${PFX}decoy:80"}
-      - {dest: "${PFX}db:80"}
-outbounds: [{name: direct, type: direct}]
+      - sni:
+          - "alpha.test"
+        dest: "${PFX}decoy:80"
+      - dest: "${PFX}db:80"
+outbounds:
+  - name: direct
+    type: direct
 Y
 SA=$(probe 'Name: DECOY' https://alpha.test:10000/)
 echo "  [⑦ SNI=alpha.test → 规则1 伪装站A(DECOY-SITE)]  $(echo "$SA"|grep -q 'Name: DECOY-SITE' && echo PASS || echo FAIL)"
@@ -175,10 +214,24 @@ printf 'module xverdecoy\ngo 1.21\n' > $D/xverdecoy/go.mod
 docker run --rm -v $D/xverdecoy:/src -w /src -e CGO_ENABLED=0 golang:alpine go build -o xverdecoy-bin . >/dev/null 2>&1
 docker run -d --name ${PFX}xd --network $NET -v $D/xverdecoy/xverdecoy-bin:/d:ro alpine /d >/dev/null 2>&1; sleep 1
 for xv in 0 1 2; do
-  if [ "$xv" = 0 ]; then FB='fallbacks: [{dest: "'${PFX}'xd:9000"}]'; else FB='fallbacks: [{dest: "'${PFX}'xd:9000", xver: '$xv'}]'; fi
+  XVER=""; [ "$xv" != 0 ] && XVER="        xver: $xv"
   srv "" <<Y
-inbounds: [{listen: 0.0.0.0:10000, layers: [{type: tls, cert-file: /cert.pem, key-file: /key.pem}, {type: trojan}], users: [{password: "$PW"}], outbound: direct, $FB}]
-outbounds: [{name: direct, type: direct}]
+inbounds:
+  - name: fb-in
+    type: trojan
+    listen: 0.0.0.0:10000
+    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
+    users:
+      - password: "$PW"
+    outbound: direct
+    fallbacks:
+      - dest: "${PFX}xd:9000"
+$XVER
+outbounds:
+  - name: direct
+    type: direct
 Y
   RX=$(probe 'PROXY' https://${PFX}s:10000/ | tail -1)
   if [ "$xv" = 0 ]; then

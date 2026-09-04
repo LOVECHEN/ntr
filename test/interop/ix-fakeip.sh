@@ -17,20 +17,31 @@ dns:
   enabled: true
   detour: direct
   nameservers:
-    - {tag: up, address: udp://1.1.1.1:53, detour: direct}
+    - tag: up
+      address: udp://1.1.1.1:53
+      detour: direct
   fake-ip:
     enabled: true
     inet4-range: 198.18.0.0/15
 inbounds:
-  - {listen: 0.0.0.0:53, type: dns}
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}
+  - name: dns-in
+    type: dns
+    listen: 0.0.0.0:53
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
 outbounds:
-  - {name: direct, type: direct}
-  - {name: block, type: block}
+  - name: direct
+    type: direct
+  - name: block
+    type: block
 routing:
   default: direct
   rules:
-    - {domain-suffix: [example.com], to: block}
+    - domain-suffix:
+        - example.com
+      to: block
 Y
 docker run -d --name ${PFX}ntr --network $NET -v $NTR:/ntr:ro -v $D/_fakeip.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 if ! wait_log ${PFX}ntr "监听于" 15; then echo "  [NTR 启动失败]  FAIL"; docker logs ${PFX}ntr 2>&1|tail -4|sed 's/^/  NTR:/'; cleanup; echo DONE; exit 0; fi

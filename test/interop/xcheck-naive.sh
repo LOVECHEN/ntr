@@ -34,7 +34,7 @@ docker run -d --name xvn-sbsrv --network $NET \
   $SB -c /etc/sing-box/config.json run >/dev/null 2>&1
 
 # NTR naive 客户端
-printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: naive, server: "xvn-sbsrv:8443", user: %s, secret: "%s", sni: example.com, insecure: true}\n' "$U" "$PW" > $D/xvn-ntr-cli.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: naive\n    server: "xvn-sbsrv:8443"\n    user: %s\n    secret: "%s"\n    sni: example.com\n    insecure: true\n' "$U" "$PW" > $D/xvn-ntr-cli.yaml
 docker run -d --name xvn-ntrcli --network $NET $PA -e NTR_DEBUG=1 \
   -v $D/ntr:/ntr:ro -v $D/xvn-ntr-cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 
@@ -69,7 +69,7 @@ if [ ! -f $D/xvn-fullchain.pem ]; then
   cat $D/xvn-leaf.pem $D/xvn-ca.pem > $D/xvn-fullchain.pem
 fi
 # NTR naive 服务端(出示 leaf+CA 全链)
-printf 'inbounds:\n  - listen: 0.0.0.0:8443\n    type: naive\n    tls: {cert-file: /cert.pem, key-file: /key.pem}\n    users: [{name: %s, password: "%s"}]\noutbounds: [{name: direct, type: direct}]\n' "$U" "$PW" > $D/xvn-ntr-srv.yaml
+printf 'inbounds:\n  - name: srv-in\n    type: naive\n    listen: 0.0.0.0:8443\n    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n    users:\n      - name: %s\n        password: "%s"\noutbounds:\n  - name: direct\n    type: direct\n' "$U" "$PW" > $D/xvn-ntr-srv.yaml
 docker run -d --name xvn-ntrsrv --network $NET $PA -e NTR_DEBUG=1 \
   -v $D/ntr:/ntr:ro -v $D/xvn-ntr-srv.yaml:/c.yaml:ro \
   -v $D/xvn-fullchain.pem:/cert.pem:ro -v $D/xvn-leaf.key:/key.pem:ro alpine /ntr -config /c.yaml >/dev/null 2>&1

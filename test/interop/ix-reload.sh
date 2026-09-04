@@ -16,12 +16,20 @@ sleep 1
 write_cfg(){ cat > $CFG <<Y
 inbounds:
 $1
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
 }
 # v1:1080 + 1081
-write_cfg '  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}
-  - {listen: 0.0.0.0:1081, layers: [{type: socks}], outbound: direct}'
+write_cfg '  - name: s5-1080
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
+  - name: s5-1081
+    type: socks
+    listen: 0.0.0.0:1081
+    outbound: direct'
 docker run -d --name ${PFX}s --network $NET -v $NTR:/ntr:ro -v $CFG:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 2
 
@@ -35,8 +43,14 @@ docker run -d --name ${PFX}dl --network $NET curlimages/curl:latest \
 sleep 3  # 确保下载进行中
 
 echo "=== 改配置(去 :1081、加 :1082)+ SIGHUP 热重载 ==="
-write_cfg '  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}
-  - {listen: 0.0.0.0:1082, layers: [{type: socks}], outbound: direct}'
+write_cfg '  - name: s5-1080
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
+  - name: s5-1082
+    type: socks
+    listen: 0.0.0.0:1082
+    outbound: direct'
 docker kill -s HUP ${PFX}s >/dev/null 2>&1
 sleep 2
 docker logs ${PFX}s 2>&1 | grep -iE '热重载完成' | tail -1 | sed 's/^/  /'

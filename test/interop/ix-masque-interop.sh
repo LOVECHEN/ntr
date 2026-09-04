@@ -87,7 +87,7 @@ fi
 # ---- 拓扑 ----
 docker run -d --name echo --network $NET -v $D/udpecho.py:/e.py:ro python:3-alpine python /e.py >/dev/null 2>&1
 docker run -d --name mgproxy --network $NET -v $MGP:/proxy:ro -v $D/cert.pem:/cert.pem:ro -v $D/key.pem:/key.pem:ro alpine /proxy >/dev/null 2>&1
-printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: masque, server: "mgproxy:8443", sni: example.com, insecure: true}\n' > $D/mqint-cli.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: masque\n    server: "mgproxy:8443"\n    sni: example.com\n    insecure: true\n' > $D/mqint-cli.yaml
 docker run -d --name cli --network $NET -e NTR_DEBUG=1 -v $NTR:/ntr:ro -v $D/mqint-cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 5
 

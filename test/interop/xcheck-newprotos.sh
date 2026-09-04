@@ -30,9 +30,9 @@ tt() {
   docker run -d --name xvt-mihomo --network $NET -v $D/mh-tt-srv.yaml:/root/.config/mihomo/config.yaml:ro \
     -v $D/cert.pem:/root/.config/mihomo/cert.pem:ro -v $D/key.pem:/root/.config/mihomo/key.pem:ro \
     metacubex/mihomo:latest >/dev/null 2>&1
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: trusttunnel, server: "xvt-mihomo:8443", user: u, secret: "ttpw", sni: example.com, insecure: true}\n' > ntr-tt-cli.yaml
+  printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: trusttunnel\n    server: "xvt-mihomo:8443"\n    user: u\n    secret: "ttpw"\n    sni: example.com\n    insecure: true\n' > ntr-tt-cli.yaml
   docker run -d --name xvt-ntr --network $NET -v $D/ntr:/ntr:ro -v $D/ntr-tt-cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
-  printf 'inbounds:\n  - listen: 0.0.0.0:8443\n    type: trusttunnel\n    tls: {cert-file: /cert.pem, key-file: /key.pem}\n    users: [{name: u, password: "ttpw"}]\noutbounds: [{name: direct, type: direct}]\n' > ntr-tt-srv.yaml
+  printf 'inbounds:\n  - name: srv-in\n    type: trusttunnel\n    listen: 0.0.0.0:8443\n    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n    users:\n      - name: u\n        password: "ttpw"\noutbounds:\n  - name: direct\n    type: direct\n' > ntr-tt-srv.yaml
   docker run -d --name xvt-ntrsrv --network $NET -v $D/ntr:/ntr:ro -v $D/ntr-tt-srv.yaml:/c.yaml:ro \
     -v $D/cert.pem:/cert.pem:ro -v $D/key.pem:/key.pem:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
   printf 'log-level: debug\nmixed-port: 1080\nallow-lan: true\nproxies:\n  - name: tt-out\n    type: trusttunnel\n    server: xvt-ntrsrv\n    port: 8443\n    username: u\n    password: ttpw\n    sni: example.com\n    skip-cert-verify: true\nrules:\n  - MATCH,tt-out\n' > mh-tt-cli.yaml
@@ -51,9 +51,9 @@ naive() {
   printf '{"log":{"level":"debug"},"inbounds":[{"type":"naive","tag":"naive-in","listen":"::","listen_port":8443,"users":[{"username":"u","password":"nvpw"}],"tls":{"enabled":true,"certificate_path":"/cert.pem","key_path":"/key.pem"}}],"outbounds":[{"type":"direct","tag":"direct"}]}\n' > sb-naive-srv.json
   docker run -d --name xvn-sb --network $NET -v $D/sb-naive-srv.json:/c.json:ro \
     -v $D/cert.pem:/cert.pem:ro -v $D/key.pem:/key.pem:ro ghcr.io/sagernet/sing-box:latest -c /c.json run >/dev/null 2>&1
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: naive, server: "xvn-sb:8443", user: u, secret: "nvpw", sni: example.com, insecure: true}\n' > ntr-nv-cli.yaml
+  printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: naive\n    server: "xvn-sb:8443"\n    user: u\n    secret: "nvpw"\n    sni: example.com\n    insecure: true\n' > ntr-nv-cli.yaml
   docker run -d --name xvn-ntr --network $NET -v $D/ntr:/ntr:ro -v $D/ntr-nv-cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
-  printf 'inbounds:\n  - listen: 0.0.0.0:8443\n    type: naive\n    tls: {cert-file: /cert.pem, key-file: /key.pem}\n    users: [{name: u, password: "nvpw"}]\noutbounds: [{name: direct, type: direct}]\n' > ntr-nv-srv.yaml
+  printf 'inbounds:\n  - name: srv-in\n    type: naive\n    listen: 0.0.0.0:8443\n    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n    users:\n      - name: u\n        password: "nvpw"\noutbounds:\n  - name: direct\n    type: direct\n' > ntr-nv-srv.yaml
   docker run -d --name xvn-ntrsrv --network $NET -v $D/ntr:/ntr:ro -v $D/ntr-nv-srv.yaml:/c.yaml:ro \
     -v $D/cert.pem:/cert.pem:ro -v $D/key.pem:/key.pem:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
   # sing-box naive outbound = 内嵌 NaiveProxy/cronet,不支持 insecure,必须信任 CA
@@ -78,9 +78,9 @@ adduser -D -s /bin/sh u >/dev/null 2>&1; echo "u:pw" | chpasswd >/dev/null 2>&1
 sed -i "s/^#*AllowTcpForwarding.*/AllowTcpForwarding yes/" /etc/ssh/sshd_config
 sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
 /usr/sbin/sshd -D -e' >/dev/null 2>&1
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: ssh, server: "xvs-sshd:22", user: u, secret: "pw"}\n' > ntr-ssh-cli.yaml
+  printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: ssh\n    server: "xvs-sshd:22"\n    user: u\n    secret: "pw"\n' > ntr-ssh-cli.yaml
   docker run -d --name xvs-ntr --network $NET -v $D/ntr:/ntr:ro -v $D/ntr-ssh-cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
-  printf 'inbounds:\n  - listen: 0.0.0.0:2222\n    type: ssh\n    tls: {key-file: /hostkey}\n    users: [{name: u, password: "pw"}]\noutbounds: [{name: direct, type: direct}]\n' > ntr-ssh-srv.yaml
+  printf 'inbounds:\n  - name: srv-in\n    type: ssh\n    listen: 0.0.0.0:2222\n    tls:\n      key-file: /hostkey\n    users:\n      - name: u\n        password: "pw"\noutbounds:\n  - name: direct\n    type: direct\n' > ntr-ssh-srv.yaml
   docker run -d --name xvs-ntrsrv --network $NET -v $D/ntr:/ntr:ro -v $D/ntr-ssh-srv.yaml:/c.yaml:ro -v $D/ssh_hostkey:/hostkey:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
   sleep 3
   docker run -d --name xvs-sshcli --network $NET alpine sh -c '

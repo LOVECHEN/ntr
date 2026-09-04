@@ -23,8 +23,20 @@ setup(){ cleanup; docker network create $NET >/dev/null 2>&1; docker run -d --na
 setup
 # A: mihomo ss+kcptun 客户端 → NTR [kcptun, shadowsocks] 服务端
 cat > $D/_s.yaml <<Y
-inbounds: [{listen: 0.0.0.0:10000, layers: [{type: kcptun, key: "$KKEY", crypt: aes, mode: fast}, {type: shadowsocks, method: $SSM, password: "$SSP"}], outbound: direct}]
-outbounds: [{name: direct, type: direct}]
+inbounds:
+  - name: ss-in
+    type: shadowsocks
+    listen: 0.0.0.0:10000
+    method: $SSM
+    password: "$SSP"
+    kcptun:
+      key: "$KKEY"
+      crypt: aes
+      mode: fast
+    outbound: direct
+outbounds:
+  - name: direct
+    type: direct
 Y
 run_ntr_ready ${PFX}s $D/_s.yaml
 cat > $D/_c.yaml <<Y
@@ -67,9 +79,21 @@ listeners:
 Y
 run_mi_ready ${PFX}s $D/_s.yaml
 cat > $D/_c.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:10000", layers: [{type: kcptun, key: "$KKEY", crypt: aes, mode: fast}, {type: shadowsocks, method: $SSM, password: "$SSP"}]}
+  - name: up
+    type: shadowsocks
+    server: "${PFX}s:10000"
+    method: $SSM
+    password: "$SSP"
+    kcptun:
+      key: "$KKEY"
+      crypt: aes
+      mode: fast
 Y
 run_ntr_ready ${PFX}c $D/_c.yaml
 echo "  [B. NTR 客户端 → mihomo ss+kcptun 服务端]  $(chk "$(pullr ${PFX}c)")"
@@ -77,14 +101,38 @@ docker rm -f ${PFX}s ${PFX}c >/dev/null 2>&1
 
 # C: NTR↔NTR 自环
 cat > $D/_s.yaml <<Y
-inbounds: [{listen: 0.0.0.0:10000, layers: [{type: kcptun, key: "$KKEY", crypt: aes, mode: fast}, {type: shadowsocks, method: $SSM, password: "$SSP"}], outbound: direct}]
-outbounds: [{name: direct, type: direct}]
+inbounds:
+  - name: ss-in
+    type: shadowsocks
+    listen: 0.0.0.0:10000
+    method: $SSM
+    password: "$SSP"
+    kcptun:
+      key: "$KKEY"
+      crypt: aes
+      mode: fast
+    outbound: direct
+outbounds:
+  - name: direct
+    type: direct
 Y
 run_ntr_ready ${PFX}s $D/_s.yaml
 cat > $D/_c.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:10000", layers: [{type: kcptun, key: "$KKEY", crypt: aes, mode: fast}, {type: shadowsocks, method: $SSM, password: "$SSP"}]}
+  - name: up
+    type: shadowsocks
+    server: "${PFX}s:10000"
+    method: $SSM
+    password: "$SSP"
+    kcptun:
+      key: "$KKEY"
+      crypt: aes
+      mode: fast
 Y
 run_ntr_ready ${PFX}c $D/_c.yaml
 echo "  [C. NTR↔NTR 自环]  $(chk "$(pullr ${PFX}c)")"

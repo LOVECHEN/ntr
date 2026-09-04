@@ -37,10 +37,20 @@ for VER in 3 2; do
   cleanup_pair
   cat > $D/ix-st-srv.yaml <<EOF
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: shadowtls, version: $VER, password: stpw, sni: $DEST, handshake: $DEST:443}, {type: shadowsocks, method: aes-256-gcm, password: sspw}]
+  - name: st-in
+    type: shadowsocks
+    listen: 0.0.0.0:10000
+    method: aes-256-gcm
+    password: sspw
+    shadowtls:
+      version: $VER
+      password: stpw
+      sni: $DEST
+      handshake: $DEST:443
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 EOF
   run_ntr_srv $D/ix-st-srv.yaml
   cat > $D/ix-st-mc.yaml <<EOF
@@ -84,10 +94,22 @@ EOF
   run_sb ixn-srv $D/ix-sb-srv.json
   cat > $D/ix-ntr-cli.yaml <<EOF
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "ixn-srv:10000", secret: "sspw",
-     layers: [{type: shadowtls, version: $VER, password: stpw, sni: $DEST, handshake: $DEST:443, insecure: true}, {type: shadowsocks, method: aes-256-gcm, password: sspw}]}
+  - name: up
+    type: shadowsocks
+    server: "ixn-srv:10000"
+    method: aes-256-gcm
+    password: sspw
+    shadowtls:
+      version: $VER
+      password: stpw
+      sni: $DEST
+      handshake: $DEST:443
+      insecure: true
 EOF
   run_ntr_cli $D/ix-ntr-cli.yaml
   sleep 4; CHK ixn-cli; REC "shadowtls v$VER + ss | NTR→对端 | NTR客户端 → sing-box 1.13.19 服务端" $?
@@ -99,10 +121,15 @@ for VER in 4 5; do
   cleanup_pair
   cat > $D/ix-sn-srv.yaml <<EOF
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: snell, psk: snellpsk0123456789abcdef, version: $VER}]
+  - name: snell-in
+    type: snell
+    listen: 0.0.0.0:10000
+    psk: snellpsk0123456789abcdef
+    version: $VER
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 EOF
   run_ntr_srv $D/ix-sn-srv.yaml
   cat > $D/ix-sn-mc.yaml <<EOF
@@ -138,10 +165,16 @@ EOF
   run_mi ixn-srv $D/ix-sn-msrv.yaml
   cat > $D/ix-sn-ntrcli.yaml <<EOF
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "ixn-srv:10000",
-     layers: [{type: snell, psk: snellpsk0123456789abcdef, version: $VER}]}
+  - name: up
+    type: snell
+    server: "ixn-srv:10000"
+    psk: snellpsk0123456789abcdef
+    version: $VER
 EOF
   run_ntr_cli $D/ix-sn-ntrcli.yaml
   sleep 4; CHK ixn-cli; REC "snell v$VER | NTR→对端 | NTR客户端 → mihomo v1.19.30 服务端(listener)" $?

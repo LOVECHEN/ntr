@@ -18,17 +18,29 @@ pw_for(){ case $1 in 2022-blake3-aes-128-gcm) echo "$K16";; 2022-blake3-aes-256-
 # ---- 配置生成器:$1=cipher $2=pw $3=peerhost(client 用) ----
 ntr_srv(){ cat <<EOF
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: shadowsocks, method: $1, password: "$2"}]
+  - name: ss-in
+    type: shadowsocks
+    listen: 0.0.0.0:10000
+    method: $1
+    password: "$2"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 EOF
 }
 ntr_cli(){ cat <<EOF
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "$3:10000", layers: [{type: shadowsocks, method: $1, password: "$2"}]}
+  - name: up
+    type: shadowsocks
+    server: "$3:10000"
+    method: $1
+    password: "$2"
 EOF
 }
 xray_srv(){ cat <<EOF

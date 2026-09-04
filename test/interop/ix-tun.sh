@@ -23,21 +23,30 @@ echo "whoami W=$W  udpecho U=$U"
 # 网关 P:NTR socks 入站 → direct(eth0 可达 W)
 cat > $D/_tun_gw.yaml <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}
-outbounds: [{name: direct, type: direct}]
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
+outbounds:
+  - name: direct
+    type: direct
 Y
 docker run -d --name ${PFX}gw --network $NET -v $NTR:/ntr:ro -v $D/_tun_gw.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 
 # TUN 容器:NTR-tun tun 入站 → socks 出站到网关
 cat > $D/_tun_ntr.yaml <<Y
 inbounds:
-  - type: tun
+  - name: tun-in
+    type: tun
     if-name: ntr-tun0
-    address: [10.9.9.1/24]
+    address:
+      - 10.9.9.1/24
     mtu: 1500
     outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}gw:1080", layers: [{type: socks}]}
+  - name: up
+    type: socks
+    server: "${PFX}gw:1080"
 Y
 docker run -d --name ${PFX}tun --network $NET --cap-add NET_ADMIN --device /dev/net/tun \
   -v $NTRTUN:/ntr-tun:ro -v $D/_tun_ntr.yaml:/c.yaml:ro -v $D/udpclient:/udpclient:ro alpine /ntr-tun -config /c.yaml >/dev/null 2>&1

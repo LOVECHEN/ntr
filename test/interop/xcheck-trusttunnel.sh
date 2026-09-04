@@ -40,9 +40,18 @@ docker run -d --name ${PFX}msrv --network $NET \
 
 cat > $D/xvt-ncli.yaml <<EOF
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: trusttunnel, server: "${PFX}msrv:8443", user: $U, secret: "$PW", sni: example.com, insecure: true}
+  - name: up
+    type: trusttunnel
+    server: "${PFX}msrv:8443"
+    user: $U
+    secret: "$PW"
+    sni: example.com
+    insecure: true
 EOF
 docker run -d --name ${PFX}ncli --network $NET -e NTR_DEBUG=1 \
   -v $D/ntr:/ntr:ro -v $D/xvt-ncli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
@@ -61,11 +70,18 @@ fi
 ########## 方向 B:mihomo trusttunnel 客户端 -> NTR trusttunnel 服务端 ##########
 cat > $D/xvt-nsrv.yaml <<EOF
 inbounds:
-  - listen: 0.0.0.0:8443
+  - name: srv-in
     type: trusttunnel
-    tls: {cert-file: /cert.pem, key-file: /key.pem}
-    users: [{name: $U, password: "$PW"}]
-outbounds: [{name: direct, type: direct}]
+    listen: 0.0.0.0:8443
+    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
+    users:
+      - name: $U
+        password: "$PW"
+outbounds:
+  - name: direct
+    type: direct
 EOF
 docker run -d --name ${PFX}nsrv --network $NET -e NTR_DEBUG=1 \
   -v $D/ntr:/ntr:ro -v $D/xvt-nsrv.yaml:/c.yaml:ro \

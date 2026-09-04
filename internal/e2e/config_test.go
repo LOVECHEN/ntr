@@ -17,15 +17,17 @@ import (
 
 const configYAML = `
 inbounds:
-  - listen: 127.0.0.1:0
-    layers:
-      - { type: tls }
-      - { type: vless }
+  - name: in
+    type: vless
+    listen: 127.0.0.1:0
+    tls:
+      sni: localhost
     users:
-      - { uuid: "00112233-4455-6677-8899-aabbccddeeff" }
+      - uuid: "00112233-4455-6677-8899-aabbccddeeff"
     outbound: direct
 outbounds:
-  - { name: direct, type: direct }
+  - name: direct
+    type: direct
 `
 
 // TestConfigFileEndToEnd:YAML 配置 → config.Build 装配入站栈([tls→vless]+具名用户)→

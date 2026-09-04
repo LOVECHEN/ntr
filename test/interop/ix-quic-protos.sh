@@ -29,29 +29,29 @@ docker run -d --name ${pfx}target --network $NET traefik/whoami >/dev/null 2>&1
 
 # ---- 生成配置 ----
 # hy2
-printf 'inbounds:\n  - listen: 0.0.0.0:8443\n    type: hysteria2\n    tls: {cert-file: /cert.pem, key-file: /key.pem}\n    users: [{password: "hy2pw"}]\noutbounds: [{name: direct, type: direct}]\n' > q-hy2-ntrsrv.yaml
+printf 'inbounds:\n  - name: hy2-in\n    type: hysteria2\n    listen: 0.0.0.0:8443\n    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n    users:\n      - password: "hy2pw"\noutbounds:\n  - name: direct\n    type: direct\n' > q-hy2-ntrsrv.yaml
 printf '{"inbounds":[{"type":"hysteria2","listen":"::","listen_port":8443,"users":[{"password":"hy2pw"}],"tls":{"enabled":true,"certificate_path":"/cert.pem","key_path":"/key.pem"}}],"outbounds":[{"type":"direct"}]}\n' > q-hy2-sbsrv.json
 printf 'log-level: warning\nlisteners:\n  - {name: hy2in, type: hysteria2, listen: 0.0.0.0, port: 8443, users: {u: "hy2pw"}, certificate: /root/.config/mihomo/cert.pem, private-key: /root/.config/mihomo/key.pem}\n' > q-hy2-msrv.yaml
-mk_hy2_ncli(){ printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: hysteria2, server: "%s:8443", secret: "hy2pw", sni: example.com, insecure: true}\n' "$1" > "$2"; }
+mk_hy2_ncli(){ printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: hysteria2\n    server: "%s:8443"\n    secret: "hy2pw"\n    sni: example.com\n    insecure: true\n' "$1" > "$2"; }
 mk_hy2_ncli ${pfx}hy2-sbsrv q-hy2-ncli-sb.yaml
 mk_hy2_ncli ${pfx}hy2-msrv  q-hy2-ncli-mh.yaml
 printf '{"log":{"level":"error"},"inbounds":[{"type":"mixed","listen":"::","listen_port":1080}],"outbounds":[{"type":"hysteria2","server":"%shy2-ntrsrv","server_port":8443,"password":"hy2pw","tls":{"enabled":true,"server_name":"example.com","insecure":true}}]}\n' "$pfx" > q-hy2-sbcli.json
 printf 'mixed-port: 1080\nallow-lan: true\nlog-level: warning\nproxies:\n  - {name: p, type: hysteria2, server: %shy2-ntrsrv, port: 8443, password: "hy2pw", sni: example.com, skip-cert-verify: true}\nrules: ["MATCH,p"]\n' "$pfx" > q-hy2-mcli.yaml
 
 # tuic
-printf 'inbounds:\n  - listen: 0.0.0.0:8443\n    type: tuic\n    tls: {cert-file: /cert.pem, key-file: /key.pem}\n    users: [{uuid: "%s", password: "tuicpw"}]\noutbounds: [{name: direct, type: direct}]\n' "$UUID" > q-tuic-ntrsrv.yaml
+printf 'inbounds:\n  - name: tuic-in\n    type: tuic\n    listen: 0.0.0.0:8443\n    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n    users:\n      - uuid: "%s"\n        password: "tuicpw"\noutbounds:\n  - name: direct\n    type: direct\n' "$UUID" > q-tuic-ntrsrv.yaml
 printf '{"inbounds":[{"type":"tuic","listen":"::","listen_port":8443,"users":[{"uuid":"%s","password":"tuicpw"}],"congestion_control":"bbr","tls":{"enabled":true,"certificate_path":"/cert.pem","key_path":"/key.pem","alpn":["h3"]}}],"outbounds":[{"type":"direct"}]}\n' "$UUID" > q-tuic-sbsrv.json
 printf 'log-level: warning\nlisteners:\n  - {name: tuicin, type: tuic, listen: 0.0.0.0, port: 8443, users: {"%s": "tuicpw"}, congestion-controller: bbr, alpn: [h3], certificate: /root/.config/mihomo/cert.pem, private-key: /root/.config/mihomo/key.pem}\n' "$UUID" > q-tuic-msrv.yaml
-mk_tuic_ncli(){ printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: tuic, server: "%s:8443", uuid: "%s", secret: "tuicpw", sni: example.com, insecure: true}\n' "$1" "$UUID" > "$2"; }
+mk_tuic_ncli(){ printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: tuic\n    server: "%s:8443"\n    uuid: "%s"\n    secret: "tuicpw"\n    sni: example.com\n    insecure: true\n' "$1" "$UUID" > "$2"; }
 mk_tuic_ncli ${pfx}tuic-sbsrv q-tuic-ncli-sb.yaml
 mk_tuic_ncli ${pfx}tuic-msrv  q-tuic-ncli-mh.yaml
 printf '{"log":{"level":"error"},"inbounds":[{"type":"mixed","listen":"::","listen_port":1080}],"outbounds":[{"type":"tuic","server":"%stuic-ntrsrv","server_port":8443,"uuid":"%s","password":"tuicpw","congestion_control":"bbr","tls":{"enabled":true,"server_name":"example.com","insecure":true,"alpn":["h3"]}}]}\n' "$pfx" "$UUID" > q-tuic-sbcli.json
 printf 'mixed-port: 1080\nallow-lan: true\nlog-level: warning\nproxies:\n  - {name: p, type: tuic, server: %stuic-ntrsrv, port: 8443, uuid: "%s", password: "tuicpw", congestion-controller: bbr, alpn: [h3], sni: example.com, skip-cert-verify: true}\nrules: ["MATCH,p"]\n' "$pfx" "$UUID" > q-tuic-mcli.yaml
 
 # hy1
-printf 'inbounds:\n  - listen: 0.0.0.0:8443\n    type: hysteria1\n    tls: {cert-file: /cert.pem, key-file: /key.pem}\n    users: [{password: "h1pw"}]\noutbounds: [{name: direct, type: direct}]\n' > q-h1-ntrsrv.yaml
+printf 'inbounds:\n  - name: hy1-in\n    type: hysteria1\n    listen: 0.0.0.0:8443\n    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n    users:\n      - password: "h1pw"\noutbounds:\n  - name: direct\n    type: direct\n' > q-h1-ntrsrv.yaml
 printf '{"inbounds":[{"type":"hysteria","listen":"::","listen_port":8443,"up_mbps":100,"down_mbps":100,"users":[{"auth_str":"h1pw"}],"tls":{"enabled":true,"certificate_path":"/cert.pem","key_path":"/key.pem","alpn":["hysteria"]}}],"outbounds":[{"type":"direct"}]}\n' > q-h1-sbsrv.json
-printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: hysteria1, server: "%sh1-sbsrv:8443", secret: "h1pw", sni: example.com, insecure: true}\n' "$pfx" > q-h1-ncli-sb.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: hysteria1\n    server: "%sh1-sbsrv:8443"\n    secret: "h1pw"\n    sni: example.com\n    insecure: true\n' "$pfx" > q-h1-ncli-sb.yaml
 printf '{"log":{"level":"error"},"inbounds":[{"type":"mixed","listen":"::","listen_port":1080}],"outbounds":[{"type":"hysteria","server":"%sh1-ntrsrv","server_port":8443,"up_mbps":100,"down_mbps":100,"auth_str":"h1pw","tls":{"enabled":true,"server_name":"example.com","insecure":true,"alpn":["hysteria"]}}]}\n' "$pfx" > q-h1-sbcli.json
 printf 'mixed-port: 1080\nallow-lan: true\nlog-level: warning\nproxies:\n  - {name: p, type: hysteria, server: %sh1-ntrsrv, port: 8443, auth-str: "h1pw", up: "100 Mbps", down: "100 Mbps", sni: example.com, skip-cert-verify: true, alpn: [hysteria]}\nrules: ["MATCH,p"]\n' "$pfx" > q-h1-mcli.yaml
 

@@ -28,9 +28,16 @@ docker ps --filter name=xct-mtg --format '  mtg: {{.Status}}'
 echo "### 2) 起 NTR mtproto 客户端(socks 1080 → mtproto → xct-mtg:3128, dc=2, 同 secret)"
 cat > $D/xct-ntrcli.yaml <<EOF
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "xct-mtg:3128", layers: [{type: mtproto, secret: "$SEC", dc: "2"}]}
+  - name: up
+    type: mtproto
+    server: "xct-mtg:3128"
+    secret: "$SEC"
+    dc: "2"
 EOF
 docker run -d --name xct-ntrcli --network $NET -e NTR_DEBUG=1 \
   -v $D/ntr:/ntr:ro -v $D/xct-ntrcli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
@@ -52,9 +59,16 @@ fi
 echo "### 5) 负控 —— 换错 16 字节 key,mtg 必须拒绝(证明 digest 校验是真的,没被放宽)"
 cat > $D/xct-ntrcli-wrong.yaml <<EOF
 inbounds:
-  - {listen: 0.0.0.0:1081, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1081
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "xct-mtg:3128", layers: [{type: mtproto, secret: "$WRONG", dc: "2"}]}
+  - name: up
+    type: mtproto
+    server: "xct-mtg:3128"
+    secret: "$WRONG"
+    dc: "2"
 EOF
 docker run -d --name xct-ntrcli-wrong --network $NET -e NTR_DEBUG=1 \
   -v $D/ntr:/ntr:ro -v $D/xct-ntrcli-wrong.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1

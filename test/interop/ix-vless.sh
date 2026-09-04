@@ -52,26 +52,27 @@ target(){ docker run -d --name ixv-target --network $NET traefik/whoami >/dev/nu
 # 配置生成器
 # ============================================================================
 # --- NTR 客户端(socks 入 → vless 出),$1=combo: none/tls/reality/vision ---
-gen_ntr_cli(){ local combo=$1 srv=$2 out=$3
+# 层块(SEC:tls/reality 安全层)与协议字段(FLOW:vless flow)拆成条件多行块,插入 up 出站(4 空格缩进)。
+gen_ntr_cli(){ local combo=$1 srv=$2 out=$3 SEC="" FLOW=""
   case $combo in
-   none)   L='[{type: vless}]';;
-   tls)    L='[{type: tls, sni: example.com, insecure: true}, {type: vless}]';;
-   reality)L="[{type: reality, public-key: \"$RPUB\", server-name: \"$SNIR\", short-id: \"$SID\", fingerprint: chrome}, {type: vless}]";;
-   vision) L='[{type: tls, sni: example.com, insecure: true}, {type: vless, flow: xtls-rprx-vision}]';;
-   vision-reality) L="[{type: reality, public-key: \"$RPUB\", server-name: \"$SNIR\", short-id: \"$SID\", fingerprint: chrome}, {type: vless, flow: xtls-rprx-vision}]";;
+   none)   SEC="";;
+   tls)    SEC=$'    tls:\n      sni: example.com\n      insecure: true\n';;
+   reality)SEC=$'    reality:\n      public-key: "'$RPUB$'"\n      server-name: "'$SNIR$'"\n      short-id: "'$SID$'"\n      fingerprint: chrome\n';;
+   vision) SEC=$'    tls:\n      sni: example.com\n      insecure: true\n'; FLOW=$'    flow: xtls-rprx-vision\n';;
+   vision-reality) SEC=$'    reality:\n      public-key: "'$RPUB$'"\n      server-name: "'$SNIR$'"\n      short-id: "'$SID$'"\n      fingerprint: chrome\n'; FLOW=$'    flow: xtls-rprx-vision\n';;
   esac
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "%s:10000", secret: "%s", layers: %s}\n' "$srv" "$UUID" "$L" > $out
+  printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: vless\n    server: "%s:10000"\n    secret: "%s"\n%s%s' "$srv" "$UUID" "$FLOW" "$SEC" > $out
 }
 # --- NTR 服务端(vless 入 → direct),$1=combo ---
-gen_ntr_srv(){ local combo=$1 out=$2
+gen_ntr_srv(){ local combo=$1 out=$2 SEC=""
   case $combo in
-   none)   L='[{type: vless}]';;
-   tls)    L='[{type: tls, cert-file: /cert.pem, key-file: /key.pem}, {type: vless}]';;
-   reality)L="[{type: reality, private-key: \"$RPRIV\", dest: \"$DEST\", server-name: \"$SNIR\", short-id: \"$SID\"}, {type: vless}]";;
-   vision) L='[{type: tls, cert-file: /cert.pem, key-file: /key.pem}, {type: vless}]';;
-   vision-reality) L="[{type: reality, private-key: \"$RPRIV\", dest: \"$DEST\", server-name: \"$SNIR\", short-id: \"$SID\"}, {type: vless}]";;
+   none)   SEC="";;
+   tls)    SEC=$'    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n';;
+   reality)SEC=$'    reality:\n      private-key: "'$RPRIV$'"\n      dest: "'$DEST$'"\n      server-name: "'$SNIR$'"\n      short-id: "'$SID$'"\n';;
+   vision) SEC=$'    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n';;
+   vision-reality) SEC=$'    reality:\n      private-key: "'$RPRIV$'"\n      dest: "'$DEST$'"\n      server-name: "'$SNIR$'"\n      short-id: "'$SID$'"\n';;
   esac
-  printf 'inbounds:\n  - listen: 0.0.0.0:10000\n    layers: %s\n    users: [{uuid: "%s"}]\n    outbound: direct\noutbounds: [{name: direct, type: direct}]\n' "$L" "$UUID" > $out
+  printf 'inbounds:\n  - name: vless-in\n    type: vless\n    listen: 0.0.0.0:10000\n%s    users:\n      - uuid: "%s"\n    outbound: direct\noutbounds:\n  - name: direct\n    type: direct\n' "$SEC" "$UUID" > $out
 }
 
 # --- xray 服务端 ---

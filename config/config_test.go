@@ -29,8 +29,9 @@ func TestLoadMalformedYAML(t *testing.T) {
 func TestBuildValid(t *testing.T) {
 	f := &File{
 		Inbounds: []Inbound{{
+			Name:     "in",
 			Listen:   "127.0.0.1:0",
-			Layers:   []map[string]any{{"type": "vless"}},
+			Type:     "vless",
 			Users:    []map[string]any{{"uuid": testUUID}},
 			Outbound: "direct",
 		}},
@@ -53,23 +54,23 @@ func TestBuildErrors(t *testing.T) {
 	}{
 		{"空 inbounds", &File{Outbounds: []Outbound{{Name: "direct", Type: "direct"}}}},
 		{"入站缺 listen", &File{
-			Inbounds:  []Inbound{{Layers: []map[string]any{{"type": "vless"}}}},
+			Inbounds:  []Inbound{{Name: "in", Type: "vless"}},
 			Outbounds: []Outbound{{Name: "direct", Type: "direct"}},
 		}},
 		{"未知出站 type", &File{
-			Inbounds:  []Inbound{{Listen: "127.0.0.1:0", Layers: []map[string]any{{"type": "vless"}}}},
+			Inbounds:  []Inbound{{Name: "in", Listen: "127.0.0.1:0", Type: "vless"}},
 			Outbounds: []Outbound{{Name: "x", Type: "no-such-outbound"}},
 		}},
 		{"未知层 type", &File{
-			Inbounds:  []Inbound{{Listen: "127.0.0.1:0", Layers: []map[string]any{{"type": "no-such-layer"}}, Outbound: "direct"}},
+			Inbounds:  []Inbound{{Name: "in", Listen: "127.0.0.1:0", Type: "no-such-layer", Outbound: "direct"}},
 			Outbounds: []Outbound{{Name: "direct", Type: "direct"}},
 		}},
 		{"引用未定义出站", &File{
-			Inbounds:  []Inbound{{Listen: "127.0.0.1:0", Layers: []map[string]any{{"type": "vless"}}, Outbound: "ghost"}},
+			Inbounds:  []Inbound{{Name: "in", Listen: "127.0.0.1:0", Type: "vless", Outbound: "ghost"}},
 			Outbounds: []Outbound{{Name: "direct", Type: "direct"}},
 		}},
 		{"出站缺 name", &File{
-			Inbounds:  []Inbound{{Listen: "127.0.0.1:0", Layers: []map[string]any{{"type": "vless"}}, Outbound: "direct"}},
+			Inbounds:  []Inbound{{Name: "in", Listen: "127.0.0.1:0", Type: "vless", Outbound: "direct"}},
 			Outbounds: []Outbound{{Type: "direct"}},
 		}},
 	}
@@ -85,8 +86,9 @@ func TestBuildErrors(t *testing.T) {
 func TestBuildNonStringYAMLValues(t *testing.T) {
 	f := &File{
 		Inbounds: []Inbound{{
+			Name:     "in",
 			Listen:   "127.0.0.1:0",
-			Layers:   []map[string]any{{"type": "vless"}},
+			Type:     "vless",
 			Users:    []map[string]any{{"uuid": 12345}}, // 非字符串
 			Outbound: "direct",
 		}},

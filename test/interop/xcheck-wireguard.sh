@@ -43,7 +43,7 @@ for i in $(seq 1 25); do docker logs wg-srv 2>&1 | grep -q WG-SERVER-READY && br
 docker logs wg-srv 2>&1 | grep -q WG-SERVER-READY || { echo "❌ WG 服务端未就绪"; docker logs wg-srv 2>&1|tail -10; exit 1; }
 echo "✅ 真 WireGuard 服务端就绪(内核实现)"
 
-printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - name: up\n    type: wireguard\n    server: "wg-srv:51820"\n    private-key: "%s"\n    peer-public-key: "%s"\n    local-address: ["10.7.0.2/32"]\n    allowed-ips: ["0.0.0.0/0"]\n    keepalive: 15\n' "$CPRIV" "$SPUB" > $D/wg-cli.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: wireguard\n    server: "wg-srv:51820"\n    private-key: "%s"\n    peer-public-key: "%s"\n    local-address:\n      - "10.7.0.2/32"\n    allowed-ips:\n      - "0.0.0.0/0"\n    keepalive: 15\n' "$CPRIV" "$SPUB" > $D/wg-cli.yaml
 docker run -d --name wg-cli --network $NET -e NTR_DEBUG=1 -v $D/ntr-wg:/ntr:ro -v $D/wg-cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 6
 TIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' wg-target)

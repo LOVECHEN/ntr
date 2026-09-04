@@ -26,26 +26,25 @@ ok(){ echo "$1" | grep -q Hostname && echo PASS || echo FAIL; }
 target(){ docker run -d --name ixv2-target --network $NET traefik/whoami >/dev/null 2>&1; }
 
 # ---- NTR 客户端(socks 入 → 协议 出);$1=proto ----
-gen_ntr_cli(){ local p=$1 out=$2 L
+# TYPE=终端协议;SEC=secret 行;FIELDS=协议字段(uuid/method/password);TLS=tls 安全层块。均条件多行、4 空格缩进。
+gen_ntr_cli(){ local p=$1 out=$2 TYPE="" SEC="" FIELDS="" TLS=""
   case $p in
-   vmess)  L='[{type: tls, sni: example.com, insecure: true}, {type: vmess, uuid: "'$UUID'"}]';;
-   vless)  L='[{type: vless}]';;
-   trojan) L='[{type: tls, sni: example.com, insecure: true}, {type: trojan}]';;
-   ss)     L='[{type: shadowsocks, method: '$M', password: "'$PW'"}]';;
+   vmess)  TYPE=vmess; FIELDS=$'    uuid: "'$UUID$'"\n'; TLS=$'    tls:\n      sni: example.com\n      insecure: true\n';;
+   vless)  TYPE=vless; SEC=$'    secret: "'$UUID$'"\n';;
+   trojan) TYPE=trojan; SEC=$'    secret: "'$PW$'"\n'; TLS=$'    tls:\n      sni: example.com\n      insecure: true\n';;
+   ss)     TYPE=shadowsocks; FIELDS=$'    method: '$M$'\n    password: "'$PW$'"\n';;
   esac
-  # vless 凭据经 secret(UUID);trojan 经 secret(PW)+ 叠 TLS;vmess/ss 凭据在层内
-  local sec=''; case $p in vless) sec='secret: "'$UUID'", ';; trojan) sec='secret: "'$PW'", ';; esac
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "ixv2-srv:10000", %slayers: %s}\n' "$sec" "$L" > $out
+  printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: %s\n    server: "ixv2-srv:10000"\n%s%s%s' "$TYPE" "$SEC" "$FIELDS" "$TLS" > $out
 }
 # ---- NTR 服务端(协议 入 → direct);$1=proto ----
-gen_ntr_srv(){ local p=$1 out=$2 L U
+gen_ntr_srv(){ local p=$1 out=$2 TYPE="" FIELDS="" TLS="" USERS=""
   case $p in
-   vmess)  L='[{type: tls, cert-file: /cert.pem, key-file: /key.pem}, {type: vmess, uuid: "'$UUID'"}]'; U='';;
-   vless)  L='[{type: vless}]'; U='users: [{uuid: "'$UUID'"}]';;
-   trojan) L='[{type: tls, cert-file: /cert.pem, key-file: /key.pem}, {type: trojan}]'; U='users: [{password: "'$PW'"}]';;
-   ss)     L='[{type: shadowsocks, method: '$M', password: "'$PW'"}]'; U='';;
+   vmess)  TYPE=vmess; FIELDS=$'    uuid: "'$UUID$'"\n'; TLS=$'    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n';;
+   vless)  TYPE=vless; USERS=$'    users:\n      - uuid: "'$UUID$'"\n';;
+   trojan) TYPE=trojan; TLS=$'    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n'; USERS=$'    users:\n      - password: "'$PW$'"\n';;
+   ss)     TYPE=shadowsocks; FIELDS=$'    method: '$M$'\n    password: "'$PW$'"\n';;
   esac
-  printf 'inbounds:\n  - listen: 0.0.0.0:10000\n    layers: %s\n    %s\n    outbound: direct\noutbounds: [{name: direct, type: direct}]\n' "$L" "$U" > $out
+  printf 'inbounds:\n  - name: srv-in\n    type: %s\n    listen: 0.0.0.0:10000\n%s%s%s    outbound: direct\noutbounds:\n  - name: direct\n    type: direct\n' "$TYPE" "$TLS" "$FIELDS" "$USERS" > $out
 }
 # ---- v2ray-core 服务端(协议 入 → freedom)----
 gen_v2_srv(){ local p=$1 out=$2 s

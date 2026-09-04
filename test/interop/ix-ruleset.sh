@@ -9,18 +9,34 @@ wait_log(){ local i; for i in $(seq 1 $(( ${3:-30} * 2 ))); do docker logs "$1" 
 cleanup; docker network create $NET >/dev/null 2>&1
 # ① 远程 ip-list:Loyalsoldier cncidr.txt(经 detour=direct 拉)→ CN IP 分流到 block
 cat > $D/_rs.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
 outbounds:
-  - {name: direct, type: direct}
-  - {name: block, type: block}
+  - name: direct
+    type: direct
+  - name: block
+    type: block
 routing:
   default: direct
   rule-providers:
-    - {name: cnip, behavior: ipcidr, detour: direct, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/cncidr.txt"}
-    - {name: goog, behavior: domain, detour: direct, url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/google.txt"}
+    - name: cnip
+      behavior: ipcidr
+      detour: direct
+      url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/cncidr.txt"
+    - name: goog
+      behavior: domain
+      detour: direct
+      url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/google.txt"
   rules:
-    - {rule-set: [cnip], to: block}
-    - {rule-set: [goog], to: block}
+    - rule-set:
+        - cnip
+      to: block
+    - rule-set:
+        - goog
+      to: block
 Y
 docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v $D/_rs.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 # 远程拉取在 Build 期,给足时间(拉两个 CDN 文件)

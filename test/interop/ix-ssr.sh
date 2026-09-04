@@ -24,9 +24,18 @@ J
 ntr_client(){ local f=$D/_ssr_ntr.yaml
   cat > "$f" <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:9000", layers: [{type: ssr, cipher: $1, password: "$PW", protocol: $2, obfs: $3}]}
+  - name: up
+    type: ssr
+    server: "${PFX}s:9000"
+    cipher: $1
+    password: "$PW"
+    protocol: $2
+    obfs: $3
 Y
   docker rm -f ${PFX}c >/dev/null 2>&1
   docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v "$f":/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1

@@ -13,7 +13,7 @@ docker run -d --name ${PFX}target --network $NET traefik/whoami --name UTLS-TARG
 sleep 1
 
 ntr_cli(){ # $1=server host
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "%s:10000", secret: "%s", layers: [{type: tls, sni: example.com, insecure: true, fingerprint: chrome}, {type: vless}]}\n' "$1" "$UUID" > $D/_utls_c.yaml
+  printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: vless\n    server: "%s:10000"\n    secret: "%s"\n    tls:\n      sni: example.com\n      insecure: true\n      fingerprint: chrome\n' "$1" "$UUID" > $D/_utls_c.yaml
 }
 run_case(){ # $1=label $2=srv-kind
   local srv=${PFX}$2s

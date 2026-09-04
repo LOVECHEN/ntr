@@ -25,51 +25,79 @@ curlp(){ local i out; for i in 1 2 3 4 5 6; do out=$(docker run --rm --network $
 # 通用:NTR 服务端/客户端配置(TLS+transport+vless)
 # transport: ws / grpc / httpupgrade
 # ============================================================
-ntr_srv(){ # $1=transport-layer-yaml
+ntr_srv(){ # $1=transport-layer-yaml(命名块,4 空格缩进)
   cat > ixr-ntrsrv.yaml <<EOF
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers:
+  - name: srv-in
+    type: vless
+    listen: 0.0.0.0:10000
 $1
-      - {type: vless}
-    users: [{uuid: "$UUID"}]
+    users:
+      - uuid: "$UUID"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 EOF
 }
-ntr_cli(){ # $1=server host, $2=transport-layer-yaml
+ntr_cli(){ # $1=server host, $2=transport-layer-yaml(命名块,4 空格缩进)
   cat > ixr-ntrcli.yaml <<EOF
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
   - name: up
-    type: proxy
+    type: vless
     server: "$1:10000"
     secret: "$UUID"
-    layers:
 $2
-      - {type: vless}
 EOF
 }
 run_ntr_srv(){ docker run -d --name ixr-ntrsrv --network $NET -v $D/ntr:/ntr:ro -v $D/ixr-ntrsrv.yaml:/c.yaml:ro -v $D/cert.pem:/cert.pem:ro -v $D/key.pem:/key.pem:ro alpine /ntr -config /c.yaml >/dev/null 2>&1; }
 run_ntr_cli(){ docker run -d --name ixr-ntrcli --network $NET -v $D/ntr:/ntr:ro -v $D/ixr-ntrcli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1; }
 
-# transport-layer 片段(server 侧 tls 带证书;client 侧 tls insecure）
+# transport-layer 片段(命名块,4 空格缩进;server 侧 tls 带证书;client 侧 tls insecure)
 # ws
-NTR_WS_S='      - {type: tls, cert-file: /cert.pem, key-file: /key.pem}
-      - {type: ws, path: /ws, host: example.com}'
-NTR_WS_C='      - {type: tls, sni: example.com, insecure: true}
-      - {type: ws, path: /ws, host: example.com}'
+NTR_WS_S='    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
+    ws:
+      path: /ws
+      host: example.com'
+NTR_WS_C='    tls:
+      sni: example.com
+      insecure: true
+    ws:
+      path: /ws
+      host: example.com'
 # grpc(需 h2 alpn)
-NTR_GRPC_S='      - {type: tls, cert-file: /cert.pem, key-file: /key.pem, alpn: h2}
-      - {type: grpc, service-name: GunService}'
-NTR_GRPC_C='      - {type: tls, sni: example.com, insecure: true, alpn: h2}
-      - {type: grpc, service-name: GunService}'
+NTR_GRPC_S='    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
+      alpn: h2
+    grpc:
+      service-name: GunService'
+NTR_GRPC_C='    tls:
+      sni: example.com
+      insecure: true
+      alpn: h2
+    grpc:
+      service-name: GunService'
 # httpupgrade
-NTR_HU_S='      - {type: tls, cert-file: /cert.pem, key-file: /key.pem}
-      - {type: httpupgrade, path: /up, host: example.com}'
-NTR_HU_C='      - {type: tls, sni: example.com, insecure: true}
-      - {type: httpupgrade, path: /up, host: example.com}'
+NTR_HU_S='    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
+    httpupgrade:
+      path: /up
+      host: example.com'
+NTR_HU_C='    tls:
+      sni: example.com
+      insecure: true
+    httpupgrade:
+      path: /up
+      host: example.com'
 
 del(){ docker rm -f ixr-ntrsrv ixr-ntrcli ixr-peer >/dev/null 2>&1; }
 

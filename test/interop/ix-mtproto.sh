@@ -23,7 +23,7 @@ cleanup; docker network create $NET >/dev/null 2>&1
 echo "=== ① NTR mtproto client → 真 mtg(9seconds/mtg)服务端 ==="
 docker run -d --name ${PFX}mtg --network $NET $MTG simple-run 0.0.0.0:3128 "$SEC" --debug >/dev/null 2>&1
 sleep 4
-printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "%smtg:3128", layers: [{type: mtproto, secret: "%s", dc: "2"}]}\n' "$PFX" "$SEC" > $D/${PFX}cli.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: mtproto\n    server: "%smtg:3128"\n    secret: "%s"\n    dc: "2"\n' "$PFX" "$SEC" > $D/${PFX}cli.yaml
 docker run -d --name ${PFX}cli --network $NET -e NTR_DEBUG=1 -v $NTR:/ntr:ro -v $D/${PFX}cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 3
 docker run --rm --network $NET curlimages/curl:latest -s --max-time 12 -x socks5h://${PFX}cli:1080 http://example.com/ >/dev/null 2>&1
@@ -35,10 +35,10 @@ else echo "  ❌ 未见 dc 绑定"; FAIL=$((FAIL+1)); docker logs ${PFX}mtg 2>&1
 # ② NTR↔NTR 双向自证(server + client 都工作)
 echo "=== ② NTR↔NTR MTProto 双向自证(NTR mtproto 服务端 + 客户端)==="
 docker run -d --name ${PFX}target --network $NET traefik/whoami >/dev/null 2>&1
-printf 'inbounds:\n  - listen: 0.0.0.0:8443\n    layers: [{type: mtproto, secret: "%s", dc-map: "2=%starget:80"}]\noutbounds: [{name: direct, type: direct}]\n' "$SEC" "$PFX" > $D/${PFX}srv.yaml
+printf 'inbounds:\n  - name: mt-in\n    type: mtproto\n    listen: 0.0.0.0:8443\n    secret: "%s"\n    dc-map: "2=%starget:80"\noutbounds:\n  - name: direct\n    type: direct\n' "$SEC" "$PFX" > $D/${PFX}srv.yaml
 docker run -d --name ${PFX}srv --network $NET -e NTR_DEBUG=1 -v $NTR:/ntr:ro -v $D/${PFX}srv.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 2
-printf 'inbounds:\n  - {listen: 0.0.0.0:1082, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "%ssrv:8443", layers: [{type: mtproto, secret: "%s", dc: "2"}]}\n' "$PFX" "$SEC" > $D/${PFX}cli2.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1082\n    outbound: up\noutbounds:\n  - name: up\n    type: mtproto\n    server: "%ssrv:8443"\n    secret: "%s"\n    dc: "2"\n' "$PFX" "$SEC" > $D/${PFX}cli2.yaml
 docker run -d --name ${PFX}cli2 --network $NET -e NTR_DEBUG=1 -v $NTR:/ntr:ro -v $D/${PFX}cli2.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 3
 OUT=""; for i in 1 2 3 4; do OUT=$(docker run --rm --network $NET curlimages/curl:latest -s --max-time 10 -x socks5h://${PFX}cli2:1082 http://${PFX}target/ 2>&1); echo "$OUT"|grep -q Hostname && break; sleep 2; done
@@ -48,7 +48,7 @@ else echo "  ❌ NTR↔NTR 不通"; FAIL=$((FAIL+1)); docker logs ${PFX}srv 2>&1
 
 # ③ 负控:错 secret → mtg 拒绝(digest 校验真实)
 echo "=== ③ 负控:错 16 字节 key → mtg ErrBadDigest 拒绝 ==="
-printf 'inbounds:\n  - {listen: 0.0.0.0:1081, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "%smtg:3128", layers: [{type: mtproto, secret: "%s", dc: "2"}]}\n' "$PFX" "$WRONG" > $D/${PFX}wrong.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1081\n    outbound: up\noutbounds:\n  - name: up\n    type: mtproto\n    server: "%smtg:3128"\n    secret: "%s"\n    dc: "2"\n' "$PFX" "$WRONG" > $D/${PFX}wrong.yaml
 docker run -d --name ${PFX}wrong --network $NET -e NTR_DEBUG=1 -v $NTR:/ntr:ro -v $D/${PFX}wrong.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 2
 docker run --rm --network $NET curlimages/curl:latest -s --max-time 8 -x socks5h://${PFX}wrong:1081 http://example.com/ >/dev/null 2>&1

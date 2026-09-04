@@ -17,10 +17,15 @@ sleep 1
 # OrbStack 文件同步延迟导致容器读到半写配置的竞态。
 ntr_srv(){ cat > "$3" <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: shadowsocks, method: $1, password: "$2"}]
+  - name: srv-in
+    type: shadowsocks
+    listen: 0.0.0.0:10000
+    method: $1
+    password: "$2"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
 }
 # 各核 SS UDP 客户端(socks/mixed 入站 -> SS 出站,指向 NTR 服务端 $3);写到 $4(带 cipher 唯一名)。

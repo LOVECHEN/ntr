@@ -29,19 +29,32 @@ Y
 
 ntr_cli(){ cat > $D/_uot_ncli.yaml <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "${PFX}s:10000", layers: [{type: shadowsocks, method: $M, password: "$PW", udp-over-tcp: true}]}
+  - name: up
+    type: shadowsocks
+    server: "${PFX}s:10000"
+    method: $M
+    password: "$PW"
+    udp-over-tcp: true
 Y
   docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v $D/_uot_ncli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1; }
 
 # ---- 方向 B:NTR SS 服务端(自动检测 UoT)+ 对端 SS-UoT 客户端 ----
 ntr_srv(){ cat > $D/_uot_nsrv.yaml <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: shadowsocks, method: $M, password: "$PW"}]
+  - name: srv-in
+    type: shadowsocks
+    listen: 0.0.0.0:10000
+    method: $M
+    password: "$PW"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
   docker run -d --name ${PFX}s --network $NET -v $NTR:/ntr:ro -v $D/_uot_nsrv.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1; }
 singbox_cli(){ cat > $D/_uot_sbcli.json <<J

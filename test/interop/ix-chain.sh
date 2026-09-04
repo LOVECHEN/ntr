@@ -29,7 +29,7 @@ ntr(){ local name=$1 cfg=$2 net=$3
 }
 # NTR proxy 服务端:vless(none 明文)入 10000 → direct 出;$1=uuid $2=输出文件
 gen_srv(){ local uuid=$1 out=$2
-  printf 'inbounds:\n  - listen: 0.0.0.0:10000\n    layers: [{type: vless}]\n    users: [{uuid: "%s"}]\n    outbound: direct\noutbounds: [{name: direct, type: direct}]\n' "$uuid" > "$out"
+  printf 'inbounds:\n  - name: srv-in\n    type: vless\n    listen: 0.0.0.0:10000\n    users:\n      - uuid: "%s"\n    outbound: direct\noutbounds:\n  - name: direct\n    type: direct\n' "$uuid" > "$out"
 }
 pull(){ docker run --rm --network "$NF" curlimages/curl:latest -s --max-time 15 -x "socks5h://ixc-cli:1080" http://ixc-target/ 2>&1; }
 pull_retry(){ local o=""; local i; for i in $(seq 1 8); do o=$(pull); echo "$o" | grep -q Hostname && { echo "$o"; return; }; sleep 2; done; echo "$o"; }
@@ -52,10 +52,20 @@ case_2hop(){
   sleep 2
   cat > c-2hop.yaml <<EOF
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: exit}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: exit
 outbounds:
-  - {name: exit, type: proxy, server: "ixc-exit:10000", secret: "$U",  layers: [{type: vless}], dialer: mid}
-  - {name: mid,  type: proxy, server: "ixc-mid:10000",  secret: "$U2", layers: [{type: vless}]}
+  - name: exit
+    type: vless
+    server: "ixc-exit:10000"
+    secret: "$U"
+    dialer: mid
+  - name: mid
+    type: vless
+    server: "ixc-mid:10000"
+    secret: "$U2"
 EOF
   ntr ixc-cli c-2hop.yaml "$NF"
   sleep 3
@@ -81,9 +91,15 @@ case_isolation(){
   sleep 2
   cat > c-iso.yaml <<EOF
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: exit}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: exit
 outbounds:
-  - {name: exit, type: proxy, server: "ixc-exit:10000", secret: "$U", layers: [{type: vless}]}
+  - name: exit
+    type: vless
+    server: "ixc-exit:10000"
+    secret: "$U"
 EOF
   ntr ixc-cli c-iso.yaml "$NF"
   sleep 5
@@ -112,11 +128,25 @@ case_3hop(){
   sleep 2
   cat > c-3hop.yaml <<EOF
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: exit}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: exit
 outbounds:
-  - {name: exit,  type: proxy, server: "ixc-exit:10000",  secret: "$U",  layers: [{type: vless}], dialer: mid}
-  - {name: mid,   type: proxy, server: "ixc-mid:10000",   secret: "$U2", layers: [{type: vless}], dialer: entry}
-  - {name: entry, type: proxy, server: "ixc-entry:10000", secret: "$U3", layers: [{type: vless}]}
+  - name: exit
+    type: vless
+    server: "ixc-exit:10000"
+    secret: "$U"
+    dialer: mid
+  - name: mid
+    type: vless
+    server: "ixc-mid:10000"
+    secret: "$U2"
+    dialer: entry
+  - name: entry
+    type: vless
+    server: "ixc-entry:10000"
+    secret: "$U3"
 EOF
   ntr ixc-cli c-3hop.yaml "$NF"
   sleep 3
@@ -138,10 +168,21 @@ case_cycle(){
   clean
   cat > c-cycle.yaml <<EOF
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: a}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: a
 outbounds:
-  - {name: a, type: proxy, server: "ixc-x:10000", secret: "$U",  layers: [{type: vless}], dialer: b}
-  - {name: b, type: proxy, server: "ixc-y:10000", secret: "$U2", layers: [{type: vless}], dialer: a}
+  - name: a
+    type: vless
+    server: "ixc-x:10000"
+    secret: "$U"
+    dialer: b
+  - name: b
+    type: vless
+    server: "ixc-y:10000"
+    secret: "$U2"
+    dialer: a
 EOF
   local LOG; LOG=$(docker run --rm --network "$NF" -v "$D/ntr:/ntr:ro" -v "$D/c-cycle.yaml:/c.yaml:ro" alpine /ntr -config /c.yaml 2>&1)
   if echo "$LOG" | grep -q "成环"; then

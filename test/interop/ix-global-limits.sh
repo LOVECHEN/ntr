@@ -16,15 +16,21 @@ start(){ # $1 = limits-block
   cat > $D/_glim.yaml <<Y
 $1
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}
-outbounds: [{name: direct, type: direct}]
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
+outbounds:
+  - name: direct
+    type: direct
 Y
   docker run -d --name ${PFX}s --network $NET -v $NTR:/ntr:ro -v $D/_glim.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
   sleep 2
 }
 
 echo "=== A. 全局 max-conns=2 ==="
-start 'limits: {max-conns: 2}'
+start 'limits:
+  max-conns: 2'
 for i in 1 2; do docker run -d --name ${PFX}dl$i --network $NET curlimages/curl:latest -s --max-time 60 --limit-rate 150k -x socks5h://${PFX}s:1080 http://${PFX}big/f -o /dev/null >/dev/null 2>&1; done
 sleep 4
 r3=$(docker run --rm --network $NET curlimages/curl:latest -s --max-time 6 -x socks5h://${PFX}s:1080 http://${PFX}who/ 2>/dev/null | grep -c Hostname)
@@ -33,7 +39,8 @@ echo "  第3条(全局)接入=$([ "$r3" = 0 ] && echo 被拒 || echo 通过)   [
 docker rm -f ${PFX}dl1 ${PFX}dl2 >/dev/null 2>&1
 
 echo "=== B. 全局 rate=16mbps,下载 20MiB ==="
-start 'limits: {rate: 16mbps}'
+start 'limits:
+  rate: 16mbps'
 spd=$(docker run --rm --network $NET curlimages/curl:latest -s --max-time 40 -x socks5h://${PFX}s:1080 http://${PFX}big/f -o /dev/null -w '%{speed_download}' 2>/dev/null)
 spd=${spd%.*}
 b=$([ -n "$spd" ] && [ "$spd" -ge 1400000 ] && [ "$spd" -le 3200000 ] && echo PASS || echo FAIL)

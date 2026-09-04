@@ -7,7 +7,7 @@
 #   - 客户端 POST,头 X-Session-ID = base64 RawURLEncoding(16B 随机);服务端 RawURLEncoding.DecodeString。
 #   - 服务端 http.Server 开 HTTP1+HTTP2+UnencryptedHTTP2,over TLS 监听;不校验 path。
 # ★配置要点(踩过的坑):
-#   - vmess 的 uuid 必须放 vmess 层上(layers:[...,{type:vmess,uuid:X}]);放 outbound/users 会用空 uuid → bad request。
+#   - vmess 入站 uuid 走顶层 users.keys.vmess(库内委托匹配,口上不写 uuid);vmess 出站写顶层 uuid。
 #   - mihomo mekya 客户端(A)必须设 polling-interval-initial(默认 0 空轮询打转,KCP SYN 发不出)。
 #   - mihomo mekya 服务端(B)必须给 certificate/private-key(它 over-TLS 监听),且证书路径须在 SAFE_PATHS
 #     (~/.config/mihomo)内;listener 段用【全块状 YAML】(mihomo yaml 库对 block 里混 flow-map 报错)。
@@ -26,14 +26,37 @@ run_mi_tls(){ docker run -d --name $1 --network $NET -v $2:/root/.config/mihomo/
 pull(){ docker run --rm --network $NET curlimages/curl:latest -s --max-time 12 -x socks5h://$1:1080 http://${PFX}target/ 2>&1; }
 chk(){ echo "$1" | grep -q Hostname && echo PASS || echo FAIL; }
 ntr_srv(){ cat > $1 <<Y
-inbounds: [{listen: 0.0.0.0:10000, layers: [{type: mekya, path: /m}, {type: vmess, uuid: "$UUID"}], outbound: direct}]
-outbounds: [{name: direct, type: direct}]
+inbounds:
+  - name: srv-in
+    type: vmess
+    listen: 0.0.0.0:10000
+    mekya:
+      path: /m
+    outbound: direct
+users:
+  - name: u
+    keys:
+      vmess: "$UUID"
+outbounds:
+  - name: direct
+    type: direct
 Y
 }
 ntr_cli(){ cat > $1 <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "$2:10000", layers: [{type: mekya, path: /m, sni: example.com, insecure: true}, {type: vmess, uuid: "$UUID"}]}
+  - name: up
+    type: vmess
+    server: "$2:10000"
+    mekya:
+      path: /m
+      sni: example.com
+      insecure: true
+    uuid: "$UUID"
 Y
 }
 mi_cli(){ cat > $1 <<Y

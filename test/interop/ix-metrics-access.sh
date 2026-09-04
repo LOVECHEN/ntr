@@ -16,8 +16,13 @@ metrics:
   listen: 0.0.0.0:9091
 $1
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}
-outbounds: [{name: direct, type: direct}]
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
+outbounds:
+  - name: direct
+    type: direct
 Y
   docker run -d --name ${PFX}s --network $NET -v $NTR:/ntr:ro -v $D/_macc.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
   sleep 2
@@ -34,13 +39,15 @@ echo "  [默认跨容器被拒 403]  $a"
 
 echo "=== ② access:[docker 网段] ==="
 GW=$(docker network inspect $NET --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null)
-start "  access: [\"$GW\"]"
+start "  access:
+    - \"$GW\""
 c=$(code_from_other)
 b=$( [ "$c" = "200" ] && echo PASS || echo FAIL )
 echo "  网段=$GW 跨容器访问码=$c   [白名单网段放行]  $b"
 
 echo "=== ③ access:[0.0.0.0/0](全开)==="
-start "  access: [\"0.0.0.0/0\"]"
+start "  access:
+    - \"0.0.0.0/0\""
 c=$(code_from_other)
 d=$( [ "$c" = "200" ] && echo PASS || echo FAIL )
 echo "  全开访问码=$c   [0.0.0.0/0 全放行]  $d"

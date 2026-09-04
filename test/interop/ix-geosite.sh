@@ -15,15 +15,23 @@ fi
 [ -s "$D/geosite.dat" ] || { echo "  [下载 geosite.dat 失败]  FAIL"; echo DONE; exit 0; }
 cleanup; docker network create $NET >/dev/null 2>&1
 cat > $D/_gs.yaml <<Y
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
 outbounds:
-  - {name: direct, type: direct}
-  - {name: block, type: block}
+  - name: direct
+    type: direct
+  - name: block
+    type: block
 routing:
   default: direct
   geosite-path: /geosite.dat
   rules:
-    - {geosite: [google], to: block}
+    - geosite:
+        - google
+      to: block
 Y
 docker run -d --name ${PFX}c --network $NET -v $NTR:/ntr:ro -v $D/_gs.yaml:/c.yaml:ro -v $D/geosite.dat:/geosite.dat:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 wait_log ${PFX}c "监听于" 15

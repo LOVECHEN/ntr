@@ -33,6 +33,18 @@ import (
 // runConfig 按 YAML 配置起多入站(声明式部署路径)。支持 SIGHUP 热重载:运行时增删入站(服务/端口
 // 上下线)—— 未变的口零断连、删的口停、加的口起、改的口重启(Drain)。承设计 §4.8 两阶段:新配置 Build
 // 失败即保留旧配置零扰动;计量注册表跨代复用(累计流量 + metrics 端点不断)。
+// checkConfig 只校验配置能否 Load+Build(不监听、不服务),用于 CI/发布前静态检查。
+func checkConfig(path string) {
+	f, err := config.Load(path)
+	if err != nil {
+		fatalf("加载配置失败:%v", err)
+	}
+	if _, err := f.Build(context.Background()); err != nil {
+		fatalf("装配配置失败:%v", err)
+	}
+	log.Printf("ntr: 配置 %s 校验通过", path)
+}
+
 func runConfig(path string) {
 	f, err := config.Load(path)
 	if err != nil {
@@ -202,6 +214,7 @@ func main() {
 		return
 	}
 	configPath := flag.String("config", "", "YAML 配置文件路径(给了则忽略下面的 flags,按配置起多入站)")
+	checkOnly := flag.Bool("check", false, "只校验 -config(Load+Build,不监听/不服务),OK 退 0、错退 1")
 	mode := flag.String("mode", "server", "运行模式:server|client")
 	listen := flag.String("listen", "127.0.0.1:8388", "监听地址 host:port")
 	protocol := flag.String("protocol", "", "代理协议名(snell|vless|trojan|...)")
@@ -236,6 +249,10 @@ func main() {
 	}
 
 	if *configPath != "" {
+		if *checkOnly {
+			checkConfig(*configPath)
+			return
+		}
 		runConfig(*configPath)
 		return
 	}

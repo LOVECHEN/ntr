@@ -32,13 +32,13 @@ echo "════════ 1. AnyTLS ⇄ sing-box ════════"
 # --- 1A: NTR anytls 客户端 → sing-box anytls 服务端 ---
 printf '{"log":{"level":"warn"},"inbounds":[{"type":"anytls","listen":"::","listen_port":8443,"users":[{"password":"%s"}],"tls":{"enabled":true,"certificate_path":"/cert.pem","key_path":"/key.pem"}}],"outbounds":[{"type":"direct"}]}\n' "$PW" > $D/ix-sb-at-srv.json
 docker run -d --name ${PFX}sb-at-srv --network $NET -v $D/ix-sb-at-srv.json:/c.json:ro -v $D/cert.pem:/cert.pem:ro -v $D/key.pem:/key.pem:ro $SB -c /c.json run >/dev/null 2>&1
-printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: at}\noutbounds:\n  - {name: at, type: anytls, server: "%ssb-at-srv:8443", secret: "%s", sni: example.com, insecure: true}\n' "$PFX" "$PW" > $D/ix-ntr-at-cli.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: at\noutbounds:\n  - name: at\n    type: anytls\n    server: "%ssb-at-srv:8443"\n    secret: "%s"\n    sni: example.com\n    insecure: true\n' "$PFX" "$PW" > $D/ix-ntr-at-cli.yaml
 docker run -d --name ${PFX}ntr-at-cli --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-at-cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 5
 hit "$(dial -x socks5h://${PFX}ntr-at-cli:1080 http://${PFX}target/)" AT_SB_A "1A anytls NTR客户端→sing-box服务端" || { dbg ${PFX}sb-at-srv; dbg ${PFX}ntr-at-cli; }
 
 # --- 1B: sing-box anytls 客户端 → NTR anytls 服务端 ---
-printf 'inbounds:\n  - listen: 0.0.0.0:8443\n    type: anytls\n    users: [{password: "%s"}]\n    tls: {cert-file: /cert.pem, key-file: /key.pem}\n    outbound: direct\noutbounds: [{name: direct, type: direct}]\n' "$PW" > $D/ix-ntr-at-srv.yaml
+printf 'inbounds:\n  - name: at-in\n    type: anytls\n    listen: 0.0.0.0:8443\n    users:\n      - password: "%s"\n    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n    outbound: direct\noutbounds:\n  - name: direct\n    type: direct\n' "$PW" > $D/ix-ntr-at-srv.yaml
 docker run -d --name ${PFX}ntr-at-srv --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-at-srv.yaml:/c.yaml:ro -v $D/cert.pem:/cert.pem:ro -v $D/key.pem:/key.pem:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 printf '{"log":{"level":"warn"},"inbounds":[{"type":"mixed","listen":"::","listen_port":1080}],"outbounds":[{"type":"anytls","server":"%sntr-at-srv","server_port":8443,"password":"%s","tls":{"enabled":true,"server_name":"example.com","insecure":true}}]}\n' "$PFX" "$PW" > $D/ix-sb-at-cli.json
 docker run -d --name ${PFX}sb-at-cli --network $NET -v $D/ix-sb-at-cli.json:/c.json:ro $SB -c /c.json run >/dev/null 2>&1
@@ -67,7 +67,7 @@ rules:
   - MATCH,DIRECT
 EOF
 docker run -d --name ${PFX}mh-at-srv --network $NET -v $D/ix-mh-at-srv.yaml:/root/.config/mihomo/config.yaml:ro $MH >/dev/null 2>&1
-printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: at}\noutbounds:\n  - {name: at, type: anytls, server: "%smh-at-srv:8443", secret: "%s", sni: example.com, insecure: true}\n' "$PFX" "$PW" > $D/ix-ntr-at-cli2.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: at\noutbounds:\n  - name: at\n    type: anytls\n    server: "%smh-at-srv:8443"\n    secret: "%s"\n    sni: example.com\n    insecure: true\n' "$PFX" "$PW" > $D/ix-ntr-at-cli2.yaml
 docker run -d --name ${PFX}ntr-at-cli2 --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-at-cli2.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 5
 hit "$(dial -x socks5h://${PFX}ntr-at-cli2:1080 http://${PFX}target/)" AT_MH_A "2A anytls NTR客户端→mihomo服务端" || { dbg ${PFX}mh-at-srv; dbg ${PFX}ntr-at-cli2; }
@@ -99,14 +99,14 @@ echo "════════ 3. NaiveProxy ⇄ sing-box(cronet)═════
 # --- 3A: NTR naive 客户端 → sing-box naive 服务端 ---
 printf '{"log":{"level":"warn"},"inbounds":[{"type":"naive","listen":"::","listen_port":8443,"users":[{"username":"%s","password":"%s"}],"tls":{"enabled":true,"certificate_path":"/cert.pem","key_path":"/key.pem"}}],"outbounds":[{"type":"direct"}]}\n' "$U" "$PW" > $D/ix-sb-nv-srv.json
 docker run -d --name ${PFX}sb-nv-srv --network $NET -v $D/ix-sb-nv-srv.json:/c.json:ro -v $D/cert.pem:/cert.pem:ro -v $D/key.pem:/key.pem:ro $SB -c /c.json run >/dev/null 2>&1
-printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: naive, server: "%ssb-nv-srv:8443", user: %s, secret: "%s", sni: example.com, insecure: true}\n' "$PFX" "$U" "$PW" > $D/ix-ntr-nv-cli.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: naive\n    server: "%ssb-nv-srv:8443"\n    user: %s\n    secret: "%s"\n    sni: example.com\n    insecure: true\n' "$PFX" "$U" "$PW" > $D/ix-ntr-nv-cli.yaml
 docker run -d --name ${PFX}ntr-nv-cli --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-nv-cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 5
 hit "$(dial -x socks5h://${PFX}ntr-nv-cli:1080 http://${PFX}target/)" NV_A "3A naive NTR客户端→sing-box服务端" || { dbg ${PFX}sb-nv-srv; dbg ${PFX}ntr-nv-cli; }
 
 # --- 3B: sing-box naive(cronet)客户端 → NTR naive 服务端 ---
 # cronet 不支持 insecure,须信任 CA;NTR 服务端出示 leaf(cert.pem 已是 CA 签的短期叶子)
-printf 'inbounds:\n  - listen: 0.0.0.0:8443\n    type: naive\n    tls: {cert-file: /cert.pem, key-file: /key.pem}\n    users: [{name: %s, password: "%s"}]\noutbounds: [{name: direct, type: direct}]\n' "$U" "$PW" > $D/ix-ntr-nv-srv.yaml
+printf 'inbounds:\n  - name: nv-in\n    type: naive\n    listen: 0.0.0.0:8443\n    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n    users:\n      - name: %s\n        password: "%s"\noutbounds:\n  - name: direct\n    type: direct\n' "$U" "$PW" > $D/ix-ntr-nv-srv.yaml
 docker run -d --name ${PFX}ntr-nv-srv --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-nv-srv.yaml:/c.yaml:ro -v $D/cert.pem:/cert.pem:ro -v $D/key.pem:/key.pem:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 printf '{"log":{"level":"warn"},"inbounds":[{"type":"mixed","listen":"::","listen_port":1080}],"outbounds":[{"type":"naive","server":"%sntr-nv-srv","server_port":8443,"username":"%s","password":"%s","tls":{"enabled":true,"server_name":"example.com","certificate_path":"/ca.pem"}}]}\n' "$PFX" "$U" "$PW" > $D/ix-sb-nv-cli.json
 docker run -d --name ${PFX}sb-nv-cli --network $NET -v $D/ix-sb-nv-cli.json:/c.json:ro -v $D/ca.pem:/ca.pem:ro $SB -c /c.json run >/dev/null 2>&1
@@ -136,13 +136,13 @@ rules:
   - MATCH,DIRECT
 EOF
 docker run -d --name ${PFX}mh-tt-srv --network $NET -v $D/ix-mh-tt-srv.yaml:/root/.config/mihomo/config.yaml:ro $MH >/dev/null 2>&1
-printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: trusttunnel, server: "%smh-tt-srv:8443", user: %s, secret: "%s", sni: example.com, insecure: true}\n' "$PFX" "$U" "$PW" > $D/ix-ntr-tt-cli.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: trusttunnel\n    server: "%smh-tt-srv:8443"\n    user: %s\n    secret: "%s"\n    sni: example.com\n    insecure: true\n' "$PFX" "$U" "$PW" > $D/ix-ntr-tt-cli.yaml
 docker run -d --name ${PFX}ntr-tt-cli --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-tt-cli.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 5
 hit "$(dial -x socks5h://${PFX}ntr-tt-cli:1080 http://${PFX}target/)" TT_A "4A trusttunnel NTR客户端→mihomo服务端" || { dbg ${PFX}mh-tt-srv; dbg ${PFX}ntr-tt-cli; }
 
 # --- 4B: mihomo trusttunnel 客户端 → NTR trusttunnel 服务端 ---
-printf 'inbounds:\n  - listen: 0.0.0.0:8443\n    type: trusttunnel\n    tls: {cert-file: /cert.pem, key-file: /key.pem}\n    users: [{name: %s, password: "%s"}]\noutbounds: [{name: direct, type: direct}]\n' "$U" "$PW" > $D/ix-ntr-tt-srv.yaml
+printf 'inbounds:\n  - name: tt-in\n    type: trusttunnel\n    listen: 0.0.0.0:8443\n    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n    users:\n      - name: %s\n        password: "%s"\noutbounds:\n  - name: direct\n    type: direct\n' "$U" "$PW" > $D/ix-ntr-tt-srv.yaml
 docker run -d --name ${PFX}ntr-tt-srv --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-tt-srv.yaml:/c.yaml:ro -v $D/cert.pem:/cert.pem:ro -v $D/key.pem:/key.pem:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 cat > $D/ix-mh-tt-cli.yaml <<EOF
 mixed-port: 1080
@@ -169,13 +169,13 @@ hit "$(dial -x http://${PFX}mh-tt-cli:1080 http://${PFX}target/)" TT_B "4B trust
 ########################################################################
 echo "════════ 5. uTLS 指纹回归:naive/trusttunnel 出站加 client-fingerprint: chrome ════════"
 # 5A naive chrome fp → sing-box naive srv(复用 3A 的 sb-nv-srv)
-printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: naive, server: "%ssb-nv-srv:8443", user: %s, secret: "%s", sni: example.com, insecure: true, client-fingerprint: chrome}\n' "$PFX" "$U" "$PW" > $D/ix-ntr-nv-cli-fp.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: naive\n    server: "%ssb-nv-srv:8443"\n    user: %s\n    secret: "%s"\n    sni: example.com\n    insecure: true\n    client-fingerprint: chrome\n' "$PFX" "$U" "$PW" > $D/ix-ntr-nv-cli-fp.yaml
 docker run -d --name ${PFX}ntr-nv-cli-fp --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-nv-cli-fp.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 4
 hit "$(dial -x socks5h://${PFX}ntr-nv-cli-fp:1080 http://${PFX}target/)" NV_FP "5A naive(chrome指纹)NTR客户端→sing-box服务端" || { dbg ${PFX}ntr-nv-cli-fp; }
 
 # 5B trusttunnel chrome fp → mihomo trusttunnel srv(复用 4A 的 mh-tt-srv)
-printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: trusttunnel, server: "%smh-tt-srv:8443", user: %s, secret: "%s", sni: example.com, insecure: true, client-fingerprint: chrome}\n' "$PFX" "$U" "$PW" > $D/ix-ntr-tt-cli-fp.yaml
+printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: trusttunnel\n    server: "%smh-tt-srv:8443"\n    user: %s\n    secret: "%s"\n    sni: example.com\n    insecure: true\n    client-fingerprint: chrome\n' "$PFX" "$U" "$PW" > $D/ix-ntr-tt-cli-fp.yaml
 docker run -d --name ${PFX}ntr-tt-cli-fp --network $NET $PA -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ix-ntr-tt-cli-fp.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
 sleep 4
 hit "$(dial -x socks5h://${PFX}ntr-tt-cli-fp:1080 http://${PFX}target/)" TT_FP "5B trusttunnel(chrome指纹)NTR客户端→mihomo服务端" || { dbg ${PFX}ntr-tt-cli-fp; }

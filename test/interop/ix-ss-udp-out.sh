@@ -16,9 +16,16 @@ sleep 1
 
 ntr_cli(){ cat > $D/_sso_c.cfg <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "$3:10000", layers: [{type: shadowsocks, method: $1, password: "$2"}]}
+  - name: up
+    type: shadowsocks
+    server: "$3:10000"
+    method: $1
+    password: "$2"
 Y
 }
 # ★ 每引擎独立配置文件名:避免原地截断同名文件时 OrbStack 文件同步延迟导致容器读到空文件的竞态。

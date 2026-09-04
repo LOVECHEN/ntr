@@ -31,9 +31,9 @@ case1(){
   "outbounds": [{"protocol": "freedom", "tag": "direct"}] }
 EOF
   docker run -d --name ixw-xportal --network $NET -v $D/ixr-xportal.json:/cfg.json:ro $XRAY run -c /cfg.json >/dev/null 2>&1
-  printf 'outbounds:\n  - {name: up, type: proxy, server: "ixw-xportal:10000", secret: "%s", layers: [{type: vless}]}\nbridges:\n  - {portal: up, control-domain: %s, pool: 2}\n' "$U" "$CD" > $D/ixr-bridge.yaml
+  printf 'outbounds:\n  - name: up\n    type: vless\n    server: "ixw-xportal:10000"\n    secret: "%s"\nbridges:\n  - portal: up\n    control-domain: %s\n    pool: 2\n' "$U" "$CD" > $D/ixr-bridge.yaml
   docker run -d --name ixw-bridge --network $NET -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ixr-bridge.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "ixw-xportal:10000", secret: "%s", layers: [{type: vless}]}\n' "$U" > $D/ixr-user.yaml
+  printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: vless\n    server: "ixw-xportal:10000"\n    secret: "%s"\n' "$U" > $D/ixr-user.yaml
   docker run -d --name ixw-usr --network $NET -v $D/ntr:/ntr:ro -v $D/ixr-user.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
   sleep 6
   local BIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ixw-bridge)
@@ -57,7 +57,7 @@ case2(){
   echo "===== 用例2: xray bridge  ⇄  NTR portal  (方向: 对端 bridge 由 xray → NTR) ====="
   cleanup
   docker run -d --name ixw-target --network $NET traefik/whoami >/dev/null
-  printf 'inbounds:\n  - listen: 0.0.0.0:10000\n    type: portal\n    control-domain: %s\n    layers: [{type: vless}]\n    users: [{uuid: %s}]\noutbounds: [{name: direct, type: direct}]\n' "$CD" "$U" > $D/ixr-nportal.yaml
+  printf 'inbounds:\n  - name: portal-in\n    type: vless\n    mode: portal\n    listen: 0.0.0.0:10000\n    control-domain: %s\n    users:\n      - uuid: %s\noutbounds:\n  - name: direct\n    type: direct\n' "$CD" "$U" > $D/ixr-nportal.yaml
   docker run -d --name ixw-nportal --network $NET -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ixr-nportal.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
   cat > $D/ixr-xbridge.json <<EOF
 { "log": {"loglevel": "warning"},
@@ -70,7 +70,7 @@ case2(){
     {"inboundTag": ["bridge"], "outboundTag": "out-direct"} ]} }
 EOF
   docker run -d --name ixw-xbridge --network $NET -v $D/ixr-xbridge.json:/cfg.json:ro $XRAY run -c /cfg.json >/dev/null 2>&1
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "ixw-nportal:10000", secret: "%s", layers: [{type: vless}]}\n' "$U" > $D/ixr-user2.yaml
+  printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: vless\n    server: "ixw-nportal:10000"\n    secret: "%s"\n' "$U" > $D/ixr-user2.yaml
   docker run -d --name ixw-usr --network $NET -v $D/ntr:/ntr:ro -v $D/ixr-user2.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
   sleep 6
   local XBIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ixw-xbridge)
@@ -103,10 +103,10 @@ case3(){
   "outbounds": [{"protocol": "freedom", "tag": "direct"}] }
 EOF
   docker run -d --name ixw-xportal --network $NET -v $D/ixr-xportal-u.json:/cfg.json:ro $XRAY run -c /cfg.json >/dev/null 2>&1
-  printf 'outbounds:\n  - {name: up, type: proxy, server: "ixw-xportal:10000", secret: "%s", layers: [{type: vless}]}\nbridges:\n  - {portal: up, control-domain: %s, pool: 2}\n' "$U" "$CD" > $D/ixr-bridge-u.yaml
+  printf 'outbounds:\n  - name: up\n    type: vless\n    server: "ixw-xportal:10000"\n    secret: "%s"\nbridges:\n  - portal: up\n    control-domain: %s\n    pool: 2\n' "$U" "$CD" > $D/ixr-bridge-u.yaml
   docker run -d --name ixw-bridge --network $NET -e NTR_DEBUG=1 -v $D/ntr:/ntr:ro -v $D/ixr-bridge-u.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
   # socksudp.py 硬编码容器名 cli 与 echo
-  printf 'inbounds:\n  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}\noutbounds:\n  - {name: up, type: proxy, server: "ixw-xportal:10000", secret: "%s", layers: [{type: vless}]}\n' "$U" > $D/ixr-user-u.yaml
+  printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: vless\n    server: "ixw-xportal:10000"\n    secret: "%s"\n' "$U" > $D/ixr-user-u.yaml
   docker run -d --name cli --network $NET -v $D/ntr:/ntr:ro -v $D/ixr-user-u.yaml:/c.yaml:ro alpine /ntr -config /c.yaml >/dev/null 2>&1
   docker rm -f echo >/dev/null 2>&1
   docker run -d --name echo --network $NET -v $D/udpecho.py:/e.py:ro python:3-alpine python /e.py >/dev/null 2>&1

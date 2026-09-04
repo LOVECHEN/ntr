@@ -16,10 +16,17 @@ test_combo(){ # $1=cipher $2=protocol $3=obfs
   nsrv=$D/_ssrsv_n_${tag}.yaml; mcli=$D/_ssrsv_m_${tag}.yaml
   cat > "$nsrv" <<Y
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: ssr, cipher: $1, password: "$PW", protocol: $2, obfs: $3}]
+  - name: ssr-in
+    type: ssr
+    listen: 0.0.0.0:10000
+    cipher: $1
+    password: "$PW"
+    protocol: $2
+    obfs: $3
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 Y
   cat > "$mcli" <<Y
 mixed-port: 1080

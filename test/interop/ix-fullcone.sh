@@ -60,9 +60,14 @@ sleep 2
 # NTR:socks5 入站(UDP ASSOCIATE)+ direct 出站(full-cone 可开关)
 mkntr(){ cat > $D/_fc_$1.yaml <<Y
 inbounds:
-  - {listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: direct}
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: direct
 outbounds:
-  - {name: direct, type: direct, full-cone: $2}
+  - name: direct
+    type: direct
+    full-cone: $2
 routing:
   default: direct
 Y

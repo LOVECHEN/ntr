@@ -73,30 +73,64 @@ sys.exit(0 if payload==msg else 1)
 PY
 # ---- NTR 客户端(A方向,socks 入站默认支持 UDP-ASSOCIATE)----
 cat > n-vm-cli.yaml.tpl <<EOF
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "@SRV@:10000", layers: [{type: tls, sni: example.com, insecure: true}, {type: vmess, uuid: "$UUID"}]}
+  - name: up
+    type: vmess
+    server: "@SRV@:10000"
+    uuid: "$UUID"
+    tls:
+      sni: example.com
+      insecure: true
 EOF
 cat > n-tj-cli.yaml.tpl <<EOF
-inbounds: [{listen: 0.0.0.0:1080, layers: [{type: socks}], outbound: up}]
+inbounds:
+  - name: s5-in
+    type: socks
+    listen: 0.0.0.0:1080
+    outbound: up
 outbounds:
-  - {name: up, type: proxy, server: "@SRV@:10000", secret: "$PW", layers: [{type: tls, sni: example.com, insecure: true}, {type: trojan}]}
+  - name: up
+    type: trojan
+    server: "@SRV@:10000"
+    secret: "$PW"
+    tls:
+      sni: example.com
+      insecure: true
 EOF
 # ---- NTR 服务端(B方向)----
 cat > n-vm-srv.yaml <<EOF
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: tls, cert-file: /cert.pem, key-file: /key.pem}, {type: vmess, uuid: "$UUID"}]
+  - name: srv-in
+    type: vmess
+    listen: 0.0.0.0:10000
+    uuid: "$UUID"
+    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 EOF
 cat > n-tj-srv.yaml <<EOF
 inbounds:
-  - listen: 0.0.0.0:10000
-    layers: [{type: tls, cert-file: /cert.pem, key-file: /key.pem}, {type: trojan}]
-    users: [{password: "$PW"}]
+  - name: srv-in
+    type: trojan
+    listen: 0.0.0.0:10000
+    tls:
+      cert-file: /cert.pem
+      key-file: /key.pem
+    users:
+      - password: "$PW"
     outbound: direct
-outbounds: [{name: direct, type: direct}]
+outbounds:
+  - name: direct
+    type: direct
 EOF
 # ---- peer 服务端(xray/sing-box/mihomo vmess/trojan;freedom/direct 出站带 UDP)----
 cat > p-xvm-srv.json <<EOF
