@@ -2,14 +2,16 @@
 # 通用约定:任何 xxx-file 键会读文件、以 xxx 键注入内容(如 cert-file → cert)。
 
 inbounds:
-  # VLESS over TLS 入站(新格式:type=协议名;凭据不写口里,写顶层 users)
+  # VLESS 入站(新格式:type=协议名;凭据不写口里,写顶层 users)。
+  # 本例为【明文 vless】(最小可跑);要 TLS 就取消下面 tls: 整块注释 —— ★tls: 必须有子键才生成 TLS 层
+  # (留空/全注释 = 无 TLS 层,退回明文);留空证书=自签临时(仅测试),生产配真证书。
   - name: vless-in
     type: vless
     listen: 0.0.0.0
     port: 8443
-    tls: # 留空证书 = 自签临时(仅测试,开箱即跑);生产取消下面两行注释配真证书
-      # cert-file: /etc/ntr/server.crt
-      # key-file: /etc/ntr/server.key
+    # tls:
+    #   cert-file: /etc/ntr/server.crt
+    #   key-file: /etc/ntr/server.key
     outbound: direct
 
   # VLESS over REALITY(借真站证书、抗主动探测)
@@ -22,8 +24,7 @@ inbounds:
   #     private-key: <base64 x25519 私钥>
   #     dest: www.apple.com:443
   #     server-name: www.apple.com
-  #     short-id:
-  #       - "0123456789abcdef"
+  #     short-id: "0123456789abcdef"   # 单个标量(reality 只读单值,非列表)
   #   outbound: direct
 
 outbounds:
@@ -38,7 +39,8 @@ outbounds:
   #   tls:
   #     sni: example.com
 
-# 顶层 users(第4章集中式):一人一块,keys 按协议平铺(键=口的 type);缺省全开——能连所有他有密钥的口。
+# 顶层 users(第4章集中式):一人一块,keys 按协议平铺(键=协议名;单协议口即口的 type,多层口如
+# shadowtls+snell 按各层协议名各一把);缺省全开——能连所有他有密钥的口。
 users:
   - name: alice
     keys:
