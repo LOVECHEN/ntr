@@ -7,6 +7,8 @@
 package meter
 
 import (
+	"context"
+	"log"
 	"net/netip"
 	"sort"
 	"sync"
@@ -25,6 +27,7 @@ const drainThreshold = 128 * 1024
 type connHandle struct {
 	kill       func()
 	lastActive atomic.Int64
+	src        netip.Addr // 源 IP(KillIP 按源筛选;取证标签,不作计费键)
 }
 
 // Cell 是一个计费槽(用户)的原子计数 + 热开关状态(承 §6.5「计量树就是开关树」)。
@@ -33,6 +36,14 @@ type Cell struct {
 	down       atomic.Uint64 // 应用层下行字节(target→client)
 	connsTotal atomic.Uint64 // 单调累计连接数
 	connsLive  atomic.Int64  // 当前活跃连接
+
+	// 速率结算(§5:每秒 out-of-band 采样做差得瞬时 bps,不动上面的单调计数)。rateUp/rateDn 由 sampler
+	// 写、Snapshot 读(故原子);last* 仅 sampler 单 goroutine 读写(无需原子)。
+	rateUp  atomic.Uint64
+	rateDn  atomic.Uint64
+	lastUp  uint64
+	lastDn  uint64
+	lastRej uint64 // 上次采样的合计 rejected(WARN 边沿触发用)
 
 	disabled atomic.Bool            // 热开关:停用(拒新 + 断老,承 §6.5.2)
 	liveMu   sync.Mutex             // 配对 disabled 检查与 live 增删(D-01 竞态修法,承 §6.5.5)
@@ -177,7 +188,7 @@ func (r *Registry) Open(id cred.ID, src netip.Addr, kill func()) (*Meter, func()
 		return nil, nil, false
 	}
 	connID := r.connSeq.Add(1)
-	h := &connHandle{kill: kill}
+	h := &connHandle{kill: kill, src: src}
 	h.lastActive.Store(time.Now().UnixNano()) // 建连即算一次活跃(避免刚接入就被判「最久空闲」误踢)
 	if !c.addGuarded(connID, h) {             // 已被 Disable(热开关)→ 拒
 		c.releaseConn()
@@ -240,6 +251,92 @@ func (r *Registry) KillConn(connID uint64) int {
 	}
 	go h.kill()
 	return 1
+}
+
+// KillIP 断某凭据来自源 IP ip 的全部活连接(热开关三件套之一,承 §6.5;不拒新,凭据仍有效)。
+// 返回断了多少条。在锁下摘除再异步 kill(不持树锁调 stop)。
+func (r *Registry) KillIP(id cred.ID, ip netip.Addr) int {
+	r.mu.RLock()
+	c := r.cells[id]
+	r.mu.RUnlock()
+	if c == nil {
+		return 0
+	}
+	c.liveMu.Lock()
+	var kills []func()
+	for connID, h := range c.live {
+		if h.src == ip {
+			kills = append(kills, h.kill)
+			delete(c.live, connID)
+		}
+	}
+	c.liveMu.Unlock()
+	for _, k := range kills {
+		go k()
+	}
+	return len(kills)
+}
+
+// cellRejected 汇总一个 Cell 当前的合计触顶拒绝数(max-conns per-user/合计 + max-ips)。供速率采样器
+// 边沿告警 + Snapshot 暴露。
+func (c *Cell) cellRejected() uint64 {
+	n := c.rejectedConns.Load()
+	if s := c.shared; s != nil {
+		n += s.rejected.Load()
+		if s.ipg != nil {
+			n += s.ipg.rejected.Load()
+		}
+	} else if c.ipg != nil {
+		n += c.ipg.rejected.Load()
+	}
+	return n
+}
+
+// sampleRates 采样一次:遍历各 Cell,用本次与上次的 up/down 累计做差 ÷ 间隔得瞬时 bps,写入 rateUp/rateDn;
+// 并对「本窗口新增了触顶拒绝」的凭据打一行 WARN(§6.4.2 可见性铁律:触顶绝不静默,必有 reader + 日志)。
+// 仅由 RunRateSampler 单 goroutine 调用(last* 无并发)。
+func (r *Registry) sampleRates(interval time.Duration) {
+	sec := interval.Seconds()
+	if sec <= 0 {
+		sec = 1
+	}
+	r.mu.RLock()
+	cells := make([]*Cell, 0, len(r.cells))
+	ids := make([]cred.ID, 0, len(r.cells))
+	for id, c := range r.cells {
+		cells = append(cells, c)
+		ids = append(ids, id)
+	}
+	labels := r.labels
+	r.mu.RUnlock()
+	for i, c := range cells {
+		up := c.up.Load()
+		dn := c.down.Load()
+		c.rateUp.Store(uint64(float64(up-c.lastUp) / sec))
+		c.rateDn.Store(uint64(float64(dn-c.lastDn) / sec))
+		c.lastUp, c.lastDn = up, dn
+		if rej := c.cellRejected(); rej > c.lastRej {
+			log.Printf("ntr: 限额触顶 bill=%s 本窗口新增拒绝 %d 条(累计 %d;§6.4.2 触顶绝不静默)", labels[ids[i]], rej-c.lastRej, rej)
+			c.lastRej = rej
+		}
+	}
+}
+
+// RunRateSampler 跑速率采样循环(每 interval 一次),阻塞至 ctx 取消。作为一个 Instance 挂在 metrics 开启时。
+func (r *Registry) RunRateSampler(ctx context.Context, interval time.Duration) error {
+	if interval <= 0 {
+		interval = time.Second
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			r.sampleRates(interval)
+		}
+	}
 }
 
 // evictIdle 踢最多 n 条「最久无数据传输」的活连接(承 §6.4bis.3:mem-guard 硬阈值止损)。按 lastActive
@@ -386,8 +483,11 @@ type UserStat struct {
 	ConnsTotal uint64 `json:"conns_total"`
 	ConnsLive  int64  `json:"conns_live"`
 	Disabled   bool   `json:"disabled"`
-	MaxConns   int64  `json:"max_conns"`          // 0=不限
-	Rejected   uint64 `json:"rejected,omitempty"` // 因 max-conns 触顶被拒的连接数
+	MaxConns   int64  `json:"max_conns"`             // 0=不限
+	Rejected   uint64 `json:"rejected,omitempty"`    // 因 max-conns 触顶被拒的连接数
+	RejectedIP uint64 `json:"rejected_ip,omitempty"` // 因 max-ips 触顶被拒的新源 IP 数(§6.4.2 可见性)
+	RateUp     uint64 `json:"rate_up"`               // 瞬时上行速率 bytes/s(上一采样窗口)
+	RateDown   uint64 `json:"rate_down"`             // 瞬时下行速率 bytes/s
 }
 
 // Snapshot 返回所有用户的当前计量(按 ID 排序)。读原子计数,不含各连接未 drain 的私有余量
@@ -400,6 +500,12 @@ func (r *Registry) Snapshot() []UserStat {
 		if s := c.shared; s != nil {
 			maxConns = s.maxConns // 按人合计的上限
 		}
+		var rejIP uint64
+		if s := c.shared; s != nil && s.ipg != nil {
+			rejIP = s.ipg.rejected.Load()
+		} else if c.ipg != nil {
+			rejIP = c.ipg.rejected.Load()
+		}
 		out = append(out, UserStat{
 			ID:         uint64(id),
 			Bill:       r.labels[id],
@@ -410,6 +516,9 @@ func (r *Registry) Snapshot() []UserStat {
 			Disabled:   c.disabled.Load(),
 			MaxConns:   maxConns,
 			Rejected:   c.rejectedConns.Load(),
+			RejectedIP: rejIP,
+			RateUp:     c.rateUp.Load(),
+			RateDown:   c.rateDn.Load(),
 		})
 	}
 	r.mu.RUnlock()

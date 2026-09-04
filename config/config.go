@@ -1425,6 +1425,10 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		insts = append(insts, Instance{Listen: "metrics:" + listen, Hash: hashOf(f.Metrics), Run: func(ctx context.Context) error {
 			return serveMetrics(ctx, listen, metricReg, allow, memGuard)
 		}})
+		// 速率采样器(§5:每秒 out-of-band 做差得瞬时 bps + 触顶新增告警),作为一个 Instance 跑到 ctx 取消。
+		insts = append(insts, Instance{Listen: "rate-sampler", Hash: "rate-sampler", Run: func(ctx context.Context) error {
+			return metricReg.RunRateSampler(ctx, time.Second)
+		}})
 	}
 
 	if len(insts) == 0 {
@@ -1494,6 +1498,21 @@ func serveMetrics(ctx context.Context, listen string, reg *meter.Registry, allow
 		writeKilled(w, 0)
 	}))
 	mux.HandleFunc("/kill", gate(func(w http.ResponseWriter, req *http.Request) {
+		// 两式:?conn=<connID> 断单条;?ip=<src> [+ bill=/id=] 断某凭据来自该源 IP 的全部连接(§6.5 KillIP)。
+		if ipStr := req.URL.Query().Get("ip"); ipStr != "" {
+			ip, err := netip.ParseAddr(ipStr)
+			if err != nil {
+				http.Error(w, "bad ip", http.StatusBadRequest)
+				return
+			}
+			id, ok := credID(req)
+			if !ok {
+				http.Error(w, "kill?ip= 需 bill= 或 id= 指定凭据", http.StatusBadRequest)
+				return
+			}
+			writeKilled(w, reg.KillIP(id, ip))
+			return
+		}
 		connID, err := parseUint(req.URL.Query().Get("conn"))
 		if err != nil {
 			http.Error(w, "bad conn", http.StatusBadRequest)
