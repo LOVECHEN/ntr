@@ -54,3 +54,30 @@ func TestSniffPacket(t *testing.T) {
 		t.Fatal("SniffSTUN.String() 应为 stun")
 	}
 }
+
+// TestIsDTLS:DTLS record 识别(WebRTC 媒体面)。content-type=22 handshake + 版本 fe fd(DTLS1.2)/fe ff(1.0)。
+func TestIsDTLS(t *testing.T) {
+	mk := func(ct, vmaj, vmin byte) []byte {
+		b := make([]byte, 13)
+		b[0], b[1], b[2] = ct, vmaj, vmin
+		return b
+	}
+	if !isDTLS(mk(22, 0xfe, 0xfd)) {
+		t.Fatal("DTLS1.2 handshake 应识别")
+	}
+	if !isDTLS(mk(23, 0xfe, 0xff)) {
+		t.Fatal("DTLS1.0 appdata 应识别")
+	}
+	if isDTLS(mk(99, 0xfe, 0xfd)) {
+		t.Error("非法 content-type 不应判 DTLS")
+	}
+	if isDTLS(mk(22, 0x03, 0x03)) {
+		t.Error("TLS(非 DTLS)版本不应判 DTLS")
+	}
+	if isDTLS(make([]byte, 12)) {
+		t.Error("<13 字节不应判 DTLS")
+	}
+	if p := sniffPacket(mk(22, 0xfe, 0xfd)); p != endpoint.SniffDTLS || p.String() != "dtls" {
+		t.Fatalf("DTLS datagram 应嗅为 SniffDTLS/dtls,实为 %v", p)
+	}
+}

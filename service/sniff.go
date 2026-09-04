@@ -71,7 +71,25 @@ func sniffPacket(datagram []byte) endpoint.SniffProto {
 	if isSTUN(datagram) {
 		return endpoint.SniffSTUN
 	}
+	if isDTLS(datagram) {
+		return endpoint.SniffDTLS
+	}
 	return endpoint.SniffNone
+}
+
+// isDTLS 判定一份 UDP 报文是否为 DTLS record(RFC 6347;WebRTC 媒体面 DTLS-SRTP 用之):≥13 字节固定头 +
+// content-type ∈ {20 CCS,21 alert,22 handshake,23 appdata,25 heartbeat} + 版本 major=0xfe、
+// minor∈{0xff DTLS1.0, 0xfd DTLS1.2}。与 sing-box common/sniff/dtls.go 同判据。配合 STUN 规则可拦整条 WebRTC。
+func isDTLS(b []byte) bool {
+	if len(b) < 13 {
+		return false
+	}
+	switch b[0] {
+	case 20, 21, 22, 23, 25:
+	default:
+		return false
+	}
+	return b[1] == 0xfe && (b[2] == 0xff || b[2] == 0xfd)
 }
 
 // isSTUN 判定一份报文是否为 STUN(RFC 5389):≥20 字节头 + 魔术 cookie 0x2112A442(bytes[4:8])+ 消息长度

@@ -42,6 +42,7 @@ const (
 	SniffHTTP            // Host 头
 	SniffQUIC            // QUIC Initial(第 11 章 §11.2)
 	SniffSTUN            // STUN 绑定报文(WebRTC/ICE;magic cookie 0x2112A442)—— 供 protocol 规则拦截防真实 IP 泄漏
+	SniffDTLS            // DTLS record(WebRTC 媒体面 DTLS-SRTP;含 handshake/appdata)—— 与 STUN 配合拦整条 WebRTC
 )
 
 // String 返回协议的小写名(供 routing 的 protocol 维度按名匹配;SniffNone → "")。
@@ -55,6 +56,8 @@ func (p SniffProto) String() string {
 		return "quic"
 	case SniffSTUN:
 		return "stun"
+	case SniffDTLS:
+		return "dtls"
 	default:
 		return ""
 	}
