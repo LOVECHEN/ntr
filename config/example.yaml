@@ -1,42 +1,45 @@
-# ntr 示例配置(声明式)。层的 type = 注册表插件名;层内键原样交插件自解析。
-# 通用约定:任何 `xxx-file` 键会读文件、以 `xxx` 键注入内容(如 cert-file → cert)。
+# ntr 示例配置(第4章模型:type=协议名 + 命名层块 + 顶层 users 集中式)。全块式,无行内 {}/[]。
+# 通用约定:任何 xxx-file 键会读文件、以 xxx 键注入内容(如 cert-file → cert)。
 
 inbounds:
-  # VLESS over TLS 服务端入站
-  - listen: 127.0.0.1:8443
-    layers:
-      - type: tls           # 留空证书 = 自签临时证书(仅测试);生产配 cert-file/key-file
-        # cert-file: /etc/ntr/server.crt
-        # key-file: /etc/ntr/server.key
-      - type: vless
-    users:
-      - uuid: "00112233-4455-6677-8899-aabbccddeeff"
+  # VLESS over TLS 入站(新格式:type=协议名;凭据不写口里,写顶层 users)
+  - name: vless-in
+    type: vless
+    listen: 0.0.0.0
+    port: 8443
+    tls: # 留空证书 = 自签临时(仅测试,开箱即跑);生产取消下面两行注释配真证书
+      # cert-file: /etc/ntr/server.crt
+      # key-file: /etc/ntr/server.key
     outbound: direct
 
-  # VLESS over REALITY 服务端入站(借真站证书、抗主动探测)
-  # - listen: 0.0.0.0:443
-  #   layers:
-  #     - type: reality
-  #       private-key: "<base64 x25519 私钥>"
-  #       dest: "www.apple.com:443"
-  #       server-name: "www.apple.com"
-  #       short-id: "0123456789abcdef"
-  #     - type: vless
-  #   users:
-  #     - uuid: "..."
+  # VLESS over REALITY(借真站证书、抗主动探测)
+  # - name: reality-in
+  #   type: vless
+  #   listen: 0.0.0.0
+  #   port: 443
+  #   flow: xtls-rprx-vision       # Vision(需下层 tls/reality)
+  #   reality:
+  #     private-key: <base64 x25519 私钥>
+  #     dest: www.apple.com:443
+  #     server-name: www.apple.com
+  #     short-id:
+  #       - "0123456789abcdef"
   #   outbound: direct
 
 outbounds:
   - name: direct
     type: direct
 
-  # 转发到上游代理(链式部署 / 客户端出站)
+  # 转发到上游代理(链式部署 / 客户端出站;新格式 type=协议名 + tls: 块,secret 放顶层)
   # - name: upstream
-  #   type: proxy
-  #   server: "1.2.3.4:8443"
-  #   secret: "00112233-4455-6677-8899-aabbccddeeff"
-  #   layers:
-  #     - type: tls
-  #       sni: "example.com"
-  #       insecure: true
-  #     - type: vless
+  #   type: vless
+  #   server: 1.2.3.4:8443
+  #   secret: 00112233-4455-6677-8899-aabbccddeeff
+  #   tls:
+  #     sni: example.com
+
+# 顶层 users(第4章集中式):一人一块,keys 按协议平铺(键=口的 type);缺省全开——能连所有他有密钥的口。
+users:
+  - name: alice
+    keys:
+      vless: "00112233-4455-6677-8899-aabbccddeeff"
