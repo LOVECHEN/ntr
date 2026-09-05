@@ -44,7 +44,7 @@ type Config struct {
 	PSK     []byte       // 端口级 PSK(服务端认证 + 加密)
 	Version int          // 1-6(默认 6);1-3 走旧框架,4/5 同格式,6 最新
 	Mode    snellv6.Mode // v6 加密模式(default/unshaped/unsafe-raw),须与对端一致
-	ChaCha  bool         // v6 wire cipher;默认 AES-128-GCM(v4/v5 恒 AES-128)
+	ChaCha  bool         // v6 对称加密算法(method);默认 AES-128-GCM(v4/v5 恒 AES-128)
 }
 
 // Parse 从哑配置节点解出 Config。
@@ -54,7 +54,7 @@ func Parse(n *spec.Node) (Config, error) {
 		PSK:     []byte(n.Get("psk").Str()),
 		Version: n.Get("version").Int(6), // 缺省 v6
 		Mode:    mode,
-		ChaCha:  n.Get("cipher").Str() == "chacha20-ietf-poly1305",
+		ChaCha:  n.Get("method").Str() == "chacha20-ietf-poly1305",
 	}, nil
 }
 

@@ -6,8 +6,6 @@ import (
 	"testing"
 
 	yaml "gopkg.in/yaml.v3"
-
-	"github.com/LOVECHEN/ntr/service"
 )
 
 // 这组用例覆盖审计要求的「绝不静默」严格化(冻结律#6):所有会让层/凭据/限额静默失效的写法都必须判死。
@@ -28,42 +26,18 @@ func wantErr(t *testing.T, err error, sub string) {
 	}
 }
 
-// 值形状分拣:与层同名的【标量】是终端协议字段(如 ssr 的 obfs: plain / protocol: origin),不误判成层;
-// 只有【映射】值 + 注册层名才成层(simple-obfs 是 obfs: {mode,host})。
-func TestSynthStrict_ScalarSharingLayerNameIsProtoField(t *testing.T) {
+// 注册层名写成标量(tls: "x")→ 该层会静默缺席退化明文 → 判死(值形状:层永远是块式映射)。
+func TestSynthStrict_LayerAsScalar(t *testing.T) {
 	f := mustParse(t, `
-inbounds:
-  - name: ssr-in
-    type: ssr
-    listen: 127.0.0.1:18080
-    cipher: aes-256-cfb
-    password: pw
-    protocol: origin
-    obfs: plain
-    outbound: direct
+outbounds:
+  - name: up
+    type: vless
+    server: h:443
+    secret: u
+    tls: someref
 `)
-	ls, err := f.Inbounds[0].synthLayers()
-	if err != nil {
-		t.Fatalf("ssr 的 obfs: plain(标量)应作协议字段,不应报层错: %v", err)
-	}
-	for _, l := range ls {
-		if l.Name == "obfs" {
-			t.Fatal("obfs: plain 标量被误判成 simple-obfs 层")
-		}
-	}
-	// 终端 ssr 层的节点应含 obfs/protocol 协议字段
-	var ssr *service.LayerSpec
-	for i := range ls {
-		if ls[i].Name == "ssr" {
-			ssr = &ls[i]
-		}
-	}
-	if ssr == nil {
-		t.Fatal("未找到 ssr 终端层")
-	}
-	if got := ssr.Node.Get("obfs").Str(); got != "plain" {
-		t.Fatalf("ssr 节点应含 obfs=plain,实为 %q", got)
-	}
+	_, err := f.Outbounds[0].synthLayers()
+	wantErr(t, err, "块式映射")
 }
 
 // 映射值却不是注册层(拼错的 relaity:)→ 判死,不静默吞成协议字段。

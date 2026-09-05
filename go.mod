@@ -8,7 +8,6 @@ require (
 	github.com/golang/snappy v1.0.0
 	github.com/klauspost/compress v1.17.9
 	github.com/metacubex/blake3 v0.1.0
-	github.com/metacubex/chacha v0.1.5
 	github.com/metacubex/http v0.1.7
 	github.com/metacubex/jls-quic-go v0.0.0-20260727080412-732f2fc9a34d
 	github.com/metacubex/jls-tls v0.0.0-20260723084315-67adc0e2f796
@@ -29,7 +28,6 @@ require (
 	github.com/sagernet/sing-quic v0.6.4
 	github.com/sagernet/sing-shadowtls v0.2.1
 	github.com/xtls/reality v0.0.0-20260322125925-9234c772ba8f
-	gitlab.com/go-extension/aes-ccm v0.0.0-20230221065045-e58665ef23c7
 	golang.org/x/crypto v0.55.0
 	golang.org/x/net v0.57.0
 	golang.org/x/sys v0.47.0
@@ -56,6 +54,7 @@ require (
 	github.com/klauspost/reedsolomon v1.12.3 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/metacubex/ascon v0.1.0 // indirect
+	github.com/metacubex/chacha v0.1.5 // indirect
 	github.com/metacubex/cpu v0.1.0 // indirect
 	github.com/metacubex/hkdf v0.1.0 // indirect
 	github.com/metacubex/hpke v0.1.0 // indirect
@@ -70,6 +69,7 @@ require (
 	github.com/sina-ghaderi/poly1305 v0.0.0-20220724002748-c5926b03988b // indirect
 	github.com/sina-ghaderi/rabaead v0.0.0-20220730151906-ab6e06b96e8c // indirect
 	github.com/sina-ghaderi/rabbitio v0.0.0-20220730151941-9ce26f4f872e // indirect
+	gitlab.com/go-extension/aes-ccm v0.0.0-20230221065045-e58665ef23c7 // indirect
 	gitlab.com/yawning/bsaes.git v0.0.0-20190805113838-0a714cd429ec // indirect
 	golang.org/x/exp v0.0.0-20250911091902-df9299821621 // indirect
 	golang.org/x/sync v0.22.0 // indirect

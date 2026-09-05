@@ -283,10 +283,11 @@ func synthStack(typ string, extra, tls map[string]any) ([]service.LayerSpec, err
 				return nil, fmt.Errorf("层 %q:%w", k, err)
 			}
 			specs = append(specs, service.LayerSpec{Name: k, Node: node})
+		case isLayer && !isMap: // 层名写成标量:该层会静默缺席(如 tls 退化明文)→ 判死
+			return nil, fmt.Errorf("层 %q 须写成块式映射(不能是标量/列表),否则该层静默缺席", k)
 		case !isLayer && isMap: // 映射值却不是注册层:十有八九是拼错的层名(relaity:)→ 判死,不静默吞成协议字段
 			return nil, fmt.Errorf("未知层块 %q:不是注册的层插件(协议专属字段应为标量,层块名请核对拼写)", k)
-		default: // 标量 → 终端协议字段;即便键名与某层同名(如 ssr 的 obfs: plain / protocol: origin),标量一律归协议字段
-			// (层永远是映射块;这样 ssr 的 obfs 协议字段与 simple-obfs 传输层块 obfs:{mode,host} 靠值形状区分)
+		default: // 标量、非注册层名 → 终端协议字段
 			protoFields[k] = v
 		}
 	}
@@ -316,15 +317,12 @@ func (o Outbound) newFormat() bool { return isProxyProto(o.Type) }
 
 // synthLayers 出站:同入站分拣,无具名 tls 字段。uuid/secret 是 Outbound 的具名字段(会话式 tuic 的
 // uuid、各协议的 secret),yaml 具名优先会把它们截胡 —— 但对「凭据须落协议 Node」的流式协议(vmess 的
-// uuid、mtproto/ssr 的 secret,其 ClientHandshake 忽略传入 key、从节点 n.Get 读),这里把具名字段转交进
+// uuid、mtproto 的 secret,其 ClientHandshake 忽略传入 key、从节点 n.Get 读),这里把具名字段转交进
 // Node。对 CredentialCodec 协议(vless/trojan…)节点多一个 uuid/secret 键无害(它们不 Get 该键、用传入 key)。
 func (o Outbound) synthLayers() ([]service.LayerSpec, error) {
 	extra := o.Extra
-	// uuid/secret/protocol 是 Outbound 具名字段(tuic 的 uuid、各协议 secret、connect-ip 的 :protocol),
-	// yaml 具名优先会把它们从 inline Extra 里截胡 —— 但对「凭据/参数须落协议 Node」的流式协议(vmess 的
-	// uuid、mtproto/ssr 的 secret、ssr 的 protocol=auth_chain_a…),这里转交进 Node(值已在 extra 的不覆盖)。
-	if o.UUID != "" || o.Secret != "" || o.Protocol != "" {
-		extra = make(map[string]any, len(o.Extra)+3)
+	if o.UUID != "" || o.Secret != "" {
+		extra = make(map[string]any, len(o.Extra)+2)
 		for k, v := range o.Extra {
 			extra[k] = v
 		}
@@ -336,11 +334,6 @@ func (o Outbound) synthLayers() ([]service.LayerSpec, error) {
 		if o.Secret != "" {
 			if _, ok := extra["secret"]; !ok {
 				extra["secret"] = o.Secret
-			}
-		}
-		if o.Protocol != "" {
-			if _, ok := extra["protocol"]; !ok {
-				extra["protocol"] = o.Protocol
 			}
 		}
 	}

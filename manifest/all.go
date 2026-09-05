@@ -11,7 +11,6 @@ import (
 	_ "github.com/LOVECHEN/ntr/proto/shadowsocks"
 	_ "github.com/LOVECHEN/ntr/proto/snell"
 	_ "github.com/LOVECHEN/ntr/proto/socks"
-	_ "github.com/LOVECHEN/ntr/proto/ssr"
 	_ "github.com/LOVECHEN/ntr/proto/trojan"
 	_ "github.com/LOVECHEN/ntr/proto/vless"
 	_ "github.com/LOVECHEN/ntr/proto/vmess"
