@@ -21,7 +21,7 @@ inbounds:
   - name: ss-in
     type: shadowsocks
     listen: 0.0.0.0:10000
-    method: $M
+    cipher: $M
     password: "$PW"
     outbound: direct
 outbounds:
@@ -52,7 +52,7 @@ outbounds:
   - name: up
     type: shadowsocks
     server: "${PFX}s:10000"
-    method: $M
+    cipher: $M
     password: "$PW"
     mux:
       protocol: cool

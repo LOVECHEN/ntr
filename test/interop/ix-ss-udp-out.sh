@@ -24,7 +24,7 @@ outbounds:
   - name: up
     type: shadowsocks
     server: "$3:10000"
-    method: $1
+    cipher: $1
     password: "$2"
 Y
 }

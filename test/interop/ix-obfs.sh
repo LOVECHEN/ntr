@@ -17,7 +17,7 @@ inbounds:
     listen: 0.0.0.0:10000
     obfs:
       host: $HOST
-    method: $M
+    cipher: $M
     password: "$PW"
     outbound: direct
 outbounds:
@@ -37,7 +37,7 @@ outbounds:
     server: "${PFX}s:10000"
     obfs:
       host: $HOST
-    method: $M
+    cipher: $M
     password: "$PW"
 Y
 }

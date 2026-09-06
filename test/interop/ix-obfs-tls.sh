@@ -18,7 +18,7 @@ inbounds:
     obfs:
       mode: tls
       host: $HOST
-    method: $M
+    cipher: $M
     password: "$PW"
     outbound: direct
 outbounds:
@@ -39,7 +39,7 @@ outbounds:
     obfs:
       mode: tls
       host: $HOST
-    method: $M
+    cipher: $M
     password: "$PW"
 Y
 }

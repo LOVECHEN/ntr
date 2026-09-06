@@ -40,7 +40,7 @@ inbounds:
   - name: st-in
     type: shadowsocks
     listen: 0.0.0.0:10000
-    method: aes-256-gcm
+    cipher: aes-256-gcm
     password: sspw
     shadowtls:
       version: $VER
@@ -102,7 +102,7 @@ outbounds:
   - name: up
     type: shadowsocks
     server: "ixn-srv:10000"
-    method: aes-256-gcm
+    cipher: aes-256-gcm
     password: sspw
     shadowtls:
       version: $VER

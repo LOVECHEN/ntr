@@ -32,7 +32,7 @@ gen_ntr_cli(){ local p=$1 out=$2 TYPE="" SEC="" FIELDS="" TLS=""
    vmess)  TYPE=vmess; FIELDS=$'    uuid: "'$UUID$'"\n'; TLS=$'    tls:\n      sni: example.com\n      insecure: true\n';;
    vless)  TYPE=vless; SEC=$'    secret: "'$UUID$'"\n';;
    trojan) TYPE=trojan; SEC=$'    secret: "'$PW$'"\n'; TLS=$'    tls:\n      sni: example.com\n      insecure: true\n';;
-   ss)     TYPE=shadowsocks; FIELDS=$'    method: '$M$'\n    password: "'$PW$'"\n';;
+   ss)     TYPE=shadowsocks; FIELDS=$'    cipher: '$M$'\n    password: "'$PW$'"\n';;
   esac
   printf 'inbounds:\n  - name: s5-in\n    type: socks\n    listen: 0.0.0.0:1080\n    outbound: up\noutbounds:\n  - name: up\n    type: %s\n    server: "ixv2-srv:10000"\n%s%s%s' "$TYPE" "$SEC" "$FIELDS" "$TLS" > $out
 }
@@ -42,7 +42,7 @@ gen_ntr_srv(){ local p=$1 out=$2 TYPE="" FIELDS="" TLS="" USERS=""
    vmess)  TYPE=vmess; FIELDS=$'    uuid: "'$UUID$'"\n'; TLS=$'    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n';;
    vless)  TYPE=vless; USERS=$'    users:\n      - uuid: "'$UUID$'"\n';;
    trojan) TYPE=trojan; TLS=$'    tls:\n      cert-file: /cert.pem\n      key-file: /key.pem\n'; USERS=$'    users:\n      - password: "'$PW$'"\n';;
-   ss)     TYPE=shadowsocks; FIELDS=$'    method: '$M$'\n    password: "'$PW$'"\n';;
+   ss)     TYPE=shadowsocks; FIELDS=$'    cipher: '$M$'\n    password: "'$PW$'"\n';;
   esac
   printf 'inbounds:\n  - name: srv-in\n    type: %s\n    listen: 0.0.0.0:10000\n%s%s%s    outbound: direct\noutbounds:\n  - name: direct\n    type: direct\n' "$TYPE" "$TLS" "$FIELDS" "$USERS" > $out
 }

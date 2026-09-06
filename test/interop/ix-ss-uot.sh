@@ -37,7 +37,7 @@ outbounds:
   - name: up
     type: shadowsocks
     server: "${PFX}s:10000"
-    method: $M
+    cipher: $M
     password: "$PW"
     udp-over-tcp: true
 Y
@@ -49,7 +49,7 @@ inbounds:
   - name: srv-in
     type: shadowsocks
     listen: 0.0.0.0:10000
-    method: $M
+    cipher: $M
     password: "$PW"
     outbound: direct
 outbounds:

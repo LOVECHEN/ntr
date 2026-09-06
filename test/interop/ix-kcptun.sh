@@ -27,7 +27,7 @@ inbounds:
   - name: ss-in
     type: shadowsocks
     listen: 0.0.0.0:10000
-    method: $SSM
+    cipher: $SSM
     password: "$SSP"
     kcptun:
       key: "$KKEY"
@@ -88,7 +88,7 @@ outbounds:
   - name: up
     type: shadowsocks
     server: "${PFX}s:10000"
-    method: $SSM
+    cipher: $SSM
     password: "$SSP"
     kcptun:
       key: "$KKEY"
@@ -105,7 +105,7 @@ inbounds:
   - name: ss-in
     type: shadowsocks
     listen: 0.0.0.0:10000
-    method: $SSM
+    cipher: $SSM
     password: "$SSP"
     kcptun:
       key: "$KKEY"
@@ -127,7 +127,7 @@ outbounds:
   - name: up
     type: shadowsocks
     server: "${PFX}s:10000"
-    method: $SSM
+    cipher: $SSM
     password: "$SSP"
     kcptun:
       key: "$KKEY"

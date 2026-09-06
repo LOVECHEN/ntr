@@ -27,7 +27,7 @@ inbounds:
       server-name: "$HOST"
       password: "$RPW"
       restls-script: "$SCRIPT"
-    method: $M
+    cipher: $M
     password: "$SSPW"
     outbound: direct
 outbounds:
@@ -49,7 +49,7 @@ outbounds:
       server-name: "$HOST"
       password: "$RPW"
       restls-script: "$SCRIPT"
-    method: $M
+    cipher: $M
     password: "$SSPW"
 Y
 # mihomo restls+ss 客户端

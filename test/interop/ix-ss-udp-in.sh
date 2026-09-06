@@ -20,7 +20,7 @@ inbounds:
   - name: srv-in
     type: shadowsocks
     listen: 0.0.0.0:10000
-    method: $1
+    cipher: $1
     password: "$2"
     outbound: direct
 outbounds:

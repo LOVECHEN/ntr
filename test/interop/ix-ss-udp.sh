@@ -14,7 +14,7 @@ inbounds:
   - name: srv-in
     type: shadowsocks
     listen: 0.0.0.0:10000
-    method: $C
+    cipher: $C
     password: "$CPW"
     outbound: direct
 outbounds:
@@ -32,7 +32,7 @@ outbounds:
   - name: up
     type: shadowsocks
     server: "$1:10000"
-    method: $C
+    cipher: $C
     password: "$CPW"
 Y
 }

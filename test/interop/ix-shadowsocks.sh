@@ -21,7 +21,7 @@ inbounds:
   - name: ss-in
     type: shadowsocks
     listen: 0.0.0.0:10000
-    method: $1
+    cipher: $1
     password: "$2"
     outbound: direct
 outbounds:
@@ -39,7 +39,7 @@ outbounds:
   - name: up
     type: shadowsocks
     server: "$3:10000"
-    method: $1
+    cipher: $1
     password: "$2"
 EOF
 }

@@ -2,7 +2,7 @@
 //
 // ★用第三方权威实现:客户端/服务端都走 github.com/metacubex/sing-shadowsocks 的
 // shadowaead_2022(与 Xray / mihomo / sing-box 线级互通)。SS 自包含 AEAD,无需下层传输,
-// 故栈就是 [shadowsocks] 一层。auth 靠 method+password(sing 内部处理),NTR 归 Ambient。
+// 故栈就是 [shadowsocks] 一层。auth 靠 cipher+password(sing 内部处理),NTR 归 Ambient。
 package shadowsocks
 
 import (
@@ -29,7 +29,7 @@ var (
 
 const defaultMethod = "2022-blake3-aes-128-gcm"
 
-// Config 是 Shadowsocks 自有配置。Password 是 base64 的密钥(长度按 method 定,sing 校验)。
+// Config 是 Shadowsocks 自有配置。Password 是 base64 的密钥(长度按 cipher 定,sing 校验)。
 // UDPoverTCP 开启后出站 UDP 走 uot(over-stream,与 sing-box/mihomo udp_over_tcp 互通)。
 type Config struct {
 	Method     string
@@ -39,7 +39,7 @@ type Config struct {
 
 // Parse 从哑节点解出 Config。
 func Parse(n *spec.Node) (Config, error) {
-	m := n.Get("method").Str()
+	m := n.Get("cipher").Str()
 	if m == "" {
 		m = defaultMethod
 	}
@@ -58,11 +58,11 @@ var _ proxy.UserRegistrar = (*Proxy)(nil)
 
 // RegisterUsers 实现 proxy.UserRegistrar(第4章顶层 users 接入):仅 2022-* 方法支持多用户 —— SS-2022 的
 // 身份是加密的 EIH,线上无明文 key,匹配只能在 sing 的 MultiService 内部完成:口的 password: 作服务端
-// iPSK,每个用户的 keys.shadowsocks 作其 uPSK(base64,长度按 method 校验),命中后以 tag 回读映射。
-// 经典 method(aes-256-gcm/chacha20…)无多用户机制 → 单 principal 豁免,配了顶层 users 直接报错。
+// iPSK,每个用户的 keys.shadowsocks 作其 uPSK(base64,长度按 cipher 校验),命中后以 tag 回读映射。
+// 经典 cipher(aes-256-gcm/chacha20…)无多用户机制 → 单 principal 豁免,配了顶层 users 直接报错。
 func (p *Proxy) RegisterUsers(users []proxy.RegisteredUser) error {
 	if !strings.HasPrefix(p.cfg.Method, "2022-") {
-		return fmt.Errorf("shadowsocks: method %q 无多用户机制(仅 2022-* 支持 EIH),此口不能接顶层 users —— 一口一密码即一 BillID", p.cfg.Method)
+		return fmt.Errorf("shadowsocks: cipher %q 无多用户机制(仅 2022-* 支持 EIH),此口不能接顶层 users —— 一口一密码即一 BillID", p.cfg.Method)
 	}
 	if p.cfg.Password == "" {
 		return fmt.Errorf("shadowsocks: 2022 多用户口须在口上写 password:(服务端 iPSK),用户各自的 uPSK 写在顶层 users.keys.shadowsocks")

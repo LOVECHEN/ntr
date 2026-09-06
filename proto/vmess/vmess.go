@@ -24,8 +24,9 @@ var (
 	_ proxy.Client = (*Proxy)(nil)
 )
 
-// Config 是 VMess 自有配置。UUID 是用户身份;Security 是 AEAD 套件(auto/aes-128-gcm/
-// chacha20-poly1305/none),默认 auto。AlterID 恒 0(纯 AEAD,MD5 旧协议已废)。
+// Config 是 VMess 自有配置。UUID 是用户身份;配置键 cipher 选 AEAD 套件(auto/aes-128-gcm/
+// chacha20-poly1305/none),默认 auto(内部 Security 字段承之,与 ss/snell 统一为 cipher)。
+// AlterID 恒 0(纯 AEAD,MD5 旧协议已废)。
 type Config struct {
 	UUID     string
 	Security string
@@ -33,7 +34,7 @@ type Config struct {
 
 // Parse 从哑节点解出 Config。
 func Parse(n *spec.Node) (Config, error) {
-	sec := n.Get("security").Str()
+	sec := n.Get("cipher").Str()
 	if sec == "" {
 		sec = "auto"
 	}

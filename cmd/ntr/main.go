@@ -226,7 +226,7 @@ func main() {
 	// snell 细项
 	snellMode := flag.String("snell-mode", "", "snell:v6 混淆模式(default|unshaped|unsafe-raw)")
 	snellVersion := flag.String("snell-version", "", "snell:协议版本 4|5|6(默认 6;4/5 与 mihomo/官方互通)")
-	cipher := flag.String("cipher", "", "snell:v6 对称加密算法 method(chacha20-ietf-poly1305;默认 aes-128-gcm)")
+	cipher := flag.String("cipher", "", "snell:v6 对称加密算法 cipher(chacha20-ietf-poly1305;默认 aes-128-gcm)")
 	// TLS
 	tlsOn := flag.Bool("tls", false, "在协议之下叠一层 TLS")
 	tlsCert := flag.String("tls-cert", "", "server TLS:证书 PEM 路径(留空 → 自签临时证书)")
@@ -264,7 +264,7 @@ func main() {
 		fatalf("未知协议 %q;已注册:%s", *protocol, strings.Join(registeredNames(), ", "))
 	}
 
-	protoNode := mapNode(map[string]string{"psk": *psk, "mode": *snellMode, "version": *snellVersion, "method": *cipher})
+	protoNode := mapNode(map[string]string{"psk": *psk, "mode": *snellMode, "version": *snellVersion, "cipher": *cipher})
 	secret := firstNonEmpty(*uuid, *password, *psk)
 
 	// 加密层(tls / reality,同 band 互斥):两个都开 → compile 定序时报 band 冲突。
