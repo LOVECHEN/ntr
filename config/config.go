@@ -1389,13 +1389,20 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 	}
 
 	// 给源自 inbound 的 Instance 打源配置语义哈希(热重载 diff:同 Listen 但 Hash 变 = 重启该口)。
+	// ★凭据级热重载止血(Tier-1):把该口【有效凭据集】(顶层 users 脱糖产物)一并折进哈希 —— 否则改
+	// 顶层 users/keys 只动 f.Users 不动 in,口 Hash 不变 → apply 静默 no-op → 轮换/吊销在活口上被无视
+	// (日志还报"起0停0"像成功)。折进后:任何触及本口的凭据变更都翻 Hash → 现成 apply 重启该口 → 新凭据
+	// 生效。代价 = 一次 Drain(断本口全部连接);零断连活体改键留待 Tier-2。
 	inboundHash := make(map[string]string, len(f.Inbounds))
 	for _, in := range f.Inbounds {
 		key := in.Listen
 		if in.Type == "tun" {
 			key = "tun:" + in.IfName
 		}
-		inboundHash[key] = hashOf(in)
+		inboundHash[key] = hashOf(struct {
+			In    Inbound
+			Binds []principal.CredBinding
+		}{in, bindingsByInbound[in.inboundName()]}) // bindings 按【口名】键,hash map 按 Listen/tun: 键,用 inboundName() 桥接
 	}
 	for i := range insts {
 		if h, ok := inboundHash[insts[i].Listen]; ok {
