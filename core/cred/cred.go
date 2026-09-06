@@ -2,7 +2,10 @@
 // 不认识 user、quota、expire。计量树节点即开关树节点,一根 Node 指针三用。
 package cred
 
-import "net/netip"
+import (
+	"fmt"
+	"net/netip"
+)
 
 // ID 是面板指定的稳定计费槽身份;核心只透传、不解释。
 type ID uint64
@@ -43,6 +46,35 @@ const (
 	ReasonForceSettle      // reaper 对已判死单元的兜底收尾
 	ReasonShutdown         // 优雅关闭
 )
+
+// stopReasonNames 是 StopReason 的可读标签(日志/审计用;顺序须与上方 const 严格对齐)。
+var stopReasonNames = [...]string{
+	ReasonUnknown:          "unknown",
+	ReasonDisable:          "disable",
+	ReasonKillIP:           "kill-ip",
+	ReasonKillConn:         "kill-conn",
+	ReasonEvictOldest:      "evict-oldest",
+	ReasonReloadDrain:      "reload-drain",
+	ReasonMemGuard:         "mem-guard",
+	ReasonEOF:              "eof",
+	ReasonIdleTimeout:      "idle-timeout",
+	ReasonHandshakeTimeout: "handshake-timeout",
+	ReasonSniffTimeout:     "sniff-timeout",
+	ReasonHalfClose:        "half-close",
+	ReasonUDPIdle:          "udp-idle",
+	ReasonProbeTimeout:     "probe-timeout",
+	ReasonFetchTimeout:     "fetch-timeout",
+	ReasonForceSettle:      "force-settle",
+	ReasonShutdown:         "shutdown",
+}
+
+// String 返回断因的可读标签(越界 = "reason(N)")。
+func (r StopReason) String() string {
+	if int(r) < len(stopReasonNames) && stopReasonNames[r] != "" {
+		return stopReasonNames[r]
+	}
+	return fmt.Sprintf("reason(%d)", uint8(r))
+}
 
 // Node 是计量树节点(= 开关树节点):一根指针三用(计量 / 热开关 / 瞬时限制)。
 type Node interface {

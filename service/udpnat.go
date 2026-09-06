@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/netip"
 	"sync"
+	"time"
 
 	"github.com/LOVECHEN/ntr/addr"
 	"github.com/LOVECHEN/ntr/buf"
@@ -27,10 +28,16 @@ func udpNAT(ctx context.Context, client link.PacketConn, resolver OutboundResolv
 	n := &udpNat{ctx: ctx, client: client, resolver: resolver, conns: make(map[string]link.PacketConn)}
 	defer n.closeAll()
 
+	// reaper Seam 4(§10):UDP assoc 整关 idle —— 每次读客户端包前 arm deadline,客户端静默超 udpIdle
+	// → ReadPacket 报 deadline 错 → 本循环 return → defer closeAll() 关所有出站 → 各反向 goroutine 的
+	// ReadPacket 连锁出错返回,整条 assoc 拆除,不泄漏。★idle 触发=整关,不可续读(即便触发时 vless 等
+	// 已读半帧长度头也无副作用,因整条 assoc 随即拆除)。
+	idle := udpIdleTimeout()
 	b := buf.New()
 	defer b.Release()
 	for {
 		b.Reset()
+		_ = client.SetDeadline(time.Now().Add(idle))
 		dst, err := client.ReadPacket(b)
 		if err != nil {
 			return err

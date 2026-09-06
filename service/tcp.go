@@ -40,6 +40,13 @@ func Serve(ctx context.Context, ln net.Listener, h endpoint.InboundHandler) erro
 
 func serveConn(ctx context.Context, c net.Conn, h endpoint.InboundHandler) {
 	defer c.Close()
+	// reaper 兜底(§10):对裸 TCP 开 keepalive —— 未计量的明文 splice 连接拿不到滑动 idle(splice 与
+	// per-read 挂钩物理互斥),握手 deadline 只覆盖首字节前;keepalive 是它们【建连后】唯一的死连接廉价保险
+	// (对端崩溃/掉线但没发 FIN 时,内核探测失败即断)。已计量连接另有 reaper Seam 3 的滑动 idle。
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(tcpKeepAlivePeriod)
+	}
 	md := &endpoint.Metadata{
 		Network: endpoint.NetworkTCP,
 		Source:  sourceAddr(c.RemoteAddr()),

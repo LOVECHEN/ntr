@@ -38,10 +38,10 @@ type Cell struct {
 	// 免跨核伪共享;热计数组再与下方冷 admit/config 组隔开。cpu.CacheLinePad 按 arch 自动(amd64=64B/arm64=128B)。
 	// 注:up/down 作为「本用户聚合点」的真共享(该 user 多连接汇聚同一 Cell)是设计使然,靠稀疏 drain(T=128K)
 	// 摊薄,非 padding 能治 —— 此处只消伪共享。
-	up atomic.Uint64 // 应用层上行字节(client→target)
-	_  cpu.CacheLinePad
-	down atomic.Uint64 // 应用层下行字节(target→client)
-	_    cpu.CacheLinePad
+	up         atomic.Uint64 // 应用层上行字节(client→target)
+	_          cpu.CacheLinePad
+	down       atomic.Uint64 // 应用层下行字节(target→client)
+	_          cpu.CacheLinePad
 	connsTotal atomic.Uint64 // 单调累计连接数
 	connsLive  atomic.Int64  // 当前活跃连接
 
@@ -395,6 +395,75 @@ func (r *Registry) evictIdle(n int) int {
 		}
 	}
 	return killed
+}
+
+// ReapIdle 踢所有「空闲超过 idle」的活连接(reaper Seam 3,§10:计量侧时间驱动 idle sweep)。
+// 与 evictIdle(mem-guard 硬阈值踢最旧 N 条)同骨架,但选取谓词是 now-lastActive>idle(而非最旧 N)。
+// lastActive 由 touch() 每 T 字节维护(稀疏 drain 点,零新增热路径成本),故给所有【已计量】连接一个真·
+// 滑动 idle 超时。★固有约束:未计量的裸明文 splice 连接不在候选集(splice 与 per-read 挂钩互斥),其 idle
+// 只能靠握手 deadline(Seam 1)+ 半关尾部(Seam 2)+ TCP keepalive 兜底 —— 不是本函数覆盖的范围。
+// reason 仅用于日志(最小版不改 kill 签名;贯穿 StopReason 到断连点是更大重构,后置)。返回实际踢掉条数。
+func (r *Registry) ReapIdle(idle time.Duration, reason cred.StopReason) int {
+	if idle <= 0 {
+		return 0
+	}
+	cutoff := time.Now().Add(-idle).UnixNano()
+	type ent struct {
+		cell *Cell
+		id   uint64
+		kill func()
+	}
+	r.mu.RLock()
+	cells := make([]*Cell, 0, len(r.cells))
+	for _, c := range r.cells {
+		cells = append(cells, c)
+	}
+	r.mu.RUnlock()
+	var ents []ent
+	for _, c := range cells {
+		c.liveMu.Lock()
+		for id, h := range c.live {
+			if h.lastActive.Load() < cutoff { // 空闲超 idle
+				ents = append(ents, ent{cell: c, id: id, kill: h.kill})
+			}
+		}
+		c.liveMu.Unlock()
+	}
+	killed := 0
+	for _, e := range ents {
+		e.cell.liveMu.Lock()
+		_, still := e.cell.live[e.id]
+		if still {
+			delete(e.cell.live, e.id) // 先摘除:防同一条在下一 tick 被重复选中
+		}
+		e.cell.liveMu.Unlock()
+		if still {
+			go e.kill()
+			killed++
+		}
+	}
+	if killed > 0 {
+		log.Printf("ntr: reaper 回收空闲连接 %d 条(idle>%s,reason=%s)", killed, idle, reason)
+	}
+	return killed
+}
+
+// RunReaper 按 tick 周期跑时间驱动 idle sweep(reaper Seam 3),阻塞至 ctx 取消。照 RunRateSampler 的
+// ticker 循环。挂成后台伪 Instance(config 侧),给所有已计量连接滑动 idle 回收。
+func (r *Registry) RunReaper(ctx context.Context, tick, idle time.Duration) error {
+	if tick <= 0 {
+		tick = 30 * time.Second
+	}
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			r.ReapIdle(idle, cred.ReasonIdleTimeout)
+		}
+	}
 }
 
 // Meter 是每连接计量器。localUp 仅由 Read 侧 goroutine 写、localDown 仅由 Write 侧写(relay 的两个

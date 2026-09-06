@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"time"
 
 	"github.com/LOVECHEN/ntr/addr"
 	"github.com/LOVECHEN/ntr/core/cred"
@@ -108,6 +109,9 @@ type ProxyInbound struct {
 	// Fallbacks:多站回落规则(按协商 ALPN + HTTP 请求 path 前缀选伪装站,对齐 xray fallbacks)。非空则优先。
 	// 匹配:首条 (ALPN 空或命中协商 ALPN) 且 (Path 空或请求首行 path 以其为前缀) 的规则;无命中则关连接。
 	Fallbacks []FallbackRule
+	// HandshakeTimeout:握手统一 deadline(reaper Seam 1,§10;≤0 = 用 defaultHandshakeTimeout)。
+	// 防 slow-loris:客户端连上后一字节不发 → 永久钉住 goroutine+fd。覆盖 ServerWrap(TLS 等)+ 协议握手。
+	HandshakeTimeout time.Duration
 }
 
 // FallbackRule 是一条回落规则(对齐 xray fallbacks 的 name/alpn/path/dest/xver):SNI(空=任意,匹配 ClientHello
@@ -284,6 +288,17 @@ var errAdmissionRejected = errors.New("service: 接入被拒(停用 / 限额触�
 // Metadata,返回握手后的 stream + Request,【不做 relay】。供需要接管握手后 stream 的上层复用
 // (如 reverse.Portal:控制连接要把 stream 当 mux 隧道,而非中继)。全程只认接口,不看协议。
 func (h *ProxyInbound) Handshake(ctx context.Context, s link.Stream, md *endpoint.Metadata) (link.Stream, *proxy.Request, error) {
+	// reaper Seam 1(§10):握手统一 deadline —— 在裸流 s 上 arm(透传给 ServerWrap 的 TLS 握手 +
+	// ServerHandshake 的读),防「客户端先说话」协议被 slow-loris 永久钉住 goroutine+fd。
+	// ★铁律:每条【存活返回】路径(成功 / errFallback 回落)都必须清 deadline,否则 relay/伪装站中继继承残留期限被误杀。
+	hsTimeout := h.HandshakeTimeout
+	if hsTimeout <= 0 {
+		hsTimeout = DefaultHandshakeTimeout
+	}
+	stop := context.AfterFunc(ctx, func() { _ = s.SetReadDeadline(time.Now()) }) // ctx 取消也解握手阻塞
+	defer stop()
+	_ = s.SetReadDeadline(time.Now().Add(hsTimeout))
+
 	below := s
 	for _, t := range h.Below { // 底→顶:裸 TCP →(tls)→ 给协议的 stream
 		wrapped, err := t.ServerWrap(ctx, below)
@@ -304,6 +319,7 @@ func (h *ProxyInbound) Handshake(ctx context.Context, s link.Stream, md *endpoin
 	if err != nil {
 		if rec != nil {
 			// 握手失败但配了回落:不关流,交 HandleStream 按 ALPN/path 选伪装站中继(回放已消费字节 + 后续)。
+			_ = s.SetReadDeadline(time.Time{}) // ★回落 relay 前清握手 deadline,否则伪装站中继继承残留期限被误杀
 			return nil, nil, errFallback{rec: rec}
 		}
 		// 协议握手失败(错凭据/畸形/探测常态):关已包裹的 below,触发传输层收尾——
@@ -311,8 +327,9 @@ func (h *ProxyInbound) Handshake(ctx context.Context, s link.Stream, md *endpoin
 		_ = below.Close()
 		return nil, nil, err
 	}
-	md.BindCred(req.Cred)    // 鉴权完成那刻追认归属
-	md.Destination = req.Dst // 代理协议的目标在握手后才可知
+	_ = s.SetReadDeadline(time.Time{}) // ★握手成功,清 deadline,否则 relay 继承残留期限误杀长连接
+	md.BindCred(req.Cred)              // 鉴权完成那刻追认归属
+	md.Destination = req.Dst           // 代理协议的目标在握手后才可知
 	return hs, req, nil
 }
 

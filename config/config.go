@@ -30,6 +30,7 @@ import (
 	"github.com/LOVECHEN/ntr/core/principal"
 	"github.com/LOVECHEN/ntr/core/proxy"
 	"github.com/LOVECHEN/ntr/core/registry"
+	"github.com/LOVECHEN/ntr/core/relay"
 	"github.com/LOVECHEN/ntr/core/route"
 	"github.com/LOVECHEN/ntr/core/spec"
 	"github.com/LOVECHEN/ntr/core/transport"
@@ -76,7 +77,8 @@ type File struct {
 	Routing   *RoutingSpec `yaml:"routing"` // 规则分流引擎(承设计 §8.3;按目标域名/IP/端口选出站,首个命中)
 	Users     []User       `yaml:"users"`   // 顶层用户集中式(第4章):权限白名单 on + keys 按协议/口;Desugar 脱糖成 CredBinding。空=无按人认证(纯面板模式凭据全走 API)
 
-	MemGuard *MemGuardSpec `yaml:"mem-guard"` // 防 OOM 三道防线(承设计 §6.4bis;SetMemoryLimit + soft 拒新 + hard 踢空闲)
+	MemGuard  *MemGuardSpec  `yaml:"mem-guard"` // 防 OOM 三道防线(承设计 §6.4bis;SetMemoryLimit + soft 拒新 + hard 踢空闲)
+	Lifecycle *LifecycleSpec `yaml:"lifecycle"` // reaper 生命周期超时旋钮(承 §10;全可选,缺省用内置默认,零配置照跑)
 
 	// Reg 是运行时注入的计量注册表(非 YAML)。热重载:调用方设它以跨代复用同一 Registry;Build 会写回。
 	Reg *meter.Registry `yaml:"-"`
@@ -93,6 +95,55 @@ type MemGuardSpec struct {
 	Limit string `yaml:"limit"` // 内存预算(1.5gb/512mb/2gib…);必填
 	Soft  string `yaml:"soft"`  // 拒新阈值百分比(默认 80%)
 	Hard  string `yaml:"hard"`  // 踢连接阈值百分比(默认 92%)
+}
+
+// LifecycleSpec 是 reaper 生命周期超时旋钮(承 §10;全可选,缺省用 service 内置默认,零配置照跑)。
+// 值为 Go duration 串(10s/5m/…);空/非法 → 回落默认。
+type LifecycleSpec struct {
+	Handshake     string `yaml:"handshake"`       // 握手统一 deadline(默认 10s;Seam 1)
+	TCPIdle       string `yaml:"tcp-idle"`        // 已计量 TCP 滑动 idle(默认 300s;Seam 3)
+	UDPIdle       string `yaml:"udp-idle"`        // UDP assoc 整关 idle(默认 60s;Seam 4)
+	HalfCloseIdle string `yaml:"half-close-idle"` // 半关后反向 idle(默认 30s;Seam 2)
+}
+
+// dur 解析 duration 串,空/非法回落 def(reaper 旋钮零配置安全)。
+func dur(s string, def time.Duration) time.Duration {
+	if s == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(s); err == nil && d > 0 {
+		return d
+	}
+	return def
+}
+
+// 各 reaper 超时的最终取值(nil Lifecycle → 全默认)。
+func (f *File) handshakeTimeout() time.Duration {
+	if f.Lifecycle == nil {
+		return service.DefaultHandshakeTimeout
+	}
+	return dur(f.Lifecycle.Handshake, service.DefaultHandshakeTimeout)
+}
+
+func (f *File) tcpIdle() time.Duration {
+	if f.Lifecycle == nil {
+		return service.DefaultTCPIdle
+	}
+	return dur(f.Lifecycle.TCPIdle, service.DefaultTCPIdle)
+}
+
+func (f *File) udpIdle() time.Duration {
+	if f.Lifecycle == nil {
+		return service.DefaultUDPIdle
+	}
+	return dur(f.Lifecycle.UDPIdle, service.DefaultUDPIdle)
+}
+
+func (f *File) halfCloseIdle() time.Duration {
+	if f.Lifecycle == nil {
+		return service.DefaultHalfCloseIdle
+	}
+	return dur(f.Lifecycle.HalfCloseIdle, service.DefaultHalfCloseIdle)
 }
 
 // LimitsSpec 是一层限制(全局 limits: 或每口 inbounds[].limits:;承设计 §6.2 层1/2)。
@@ -1363,7 +1414,8 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		gates := nonNilGates(globalGate, inboundGate)
 		if pi := asProxyInbound(handler); pi != nil {
 			pi.Gates = gates
-			if metricReg != nil { // 按用户计量;每用户限额已在 buildProxyInbound 装配凭据时同处挂载
+			pi.HandshakeTimeout = f.handshakeTimeout() // reaper Seam 1:握手统一 deadline(防 slow-loris)
+			if metricReg != nil {                      // 按用户计量;每用户限额已在 buildProxyInbound 装配凭据时同处挂载
 				pi.Meter = metricReg
 			}
 		}
@@ -1388,6 +1440,11 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		}
 	}
 
+	// reaper Seam 4(§10):把 UDP assoc 整关 idle 推给 service(进程级,udpNAT 主循环据此 arm deadline)。
+	service.SetUDPIdle(f.udpIdle())
+	// reaper Seam 2(§10):把半关尾部 idle 推给 relay(进程级)。
+	relay.SetHalfCloseIdle(f.halfCloseIdle())
+
 	// 给源自 inbound 的 Instance 打源配置语义哈希(热重载 diff:同 Listen 但 Hash 变 = 重启该口)。
 	// ★凭据级热重载止血(Tier-1):把该口【有效凭据集】(顶层 users 脱糖产物)一并折进哈希 —— 否则改
 	// 顶层 users/keys 只动 f.Users 不动 in,口 Hash 不变 → apply 静默 no-op → 轮换/吊销在活口上被无视
@@ -1400,9 +1457,10 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			key = "tun:" + in.IfName
 		}
 		inboundHash[key] = hashOf(struct {
-			In    Inbound
-			Binds []principal.CredBinding
-		}{in, bindingsByInbound[in.inboundName()]}) // bindings 按【口名】键,hash map 按 Listen/tun: 键,用 inboundName() 桥接
+			In        Inbound
+			Binds     []principal.CredBinding
+			Lifecycle *LifecycleSpec
+		}{in, bindingsByInbound[in.inboundName()], f.Lifecycle}) // bindings 按【口名】键、hash map 按 Listen/tun: 键(inboundName 桥接);Lifecycle 全局旋钮变更也翻各口 Hash → 重启应用新握手 deadline
 	}
 	for i := range insts {
 		if h, ok := inboundHash[insts[i].Listen]; ok {
@@ -1452,6 +1510,19 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		// 速率采样器(§5:每秒 out-of-band 做差得瞬时 bps + 触顶新增告警),作为一个 Instance 跑到 ctx 取消。
 		insts = append(insts, Instance{Listen: "rate-sampler", Hash: "rate-sampler", Run: func(ctx context.Context) error {
 			return metricReg.RunRateSampler(ctx, time.Second)
+		}})
+		// reaper(Seam 3,§10):时间驱动 idle sweep,给所有已计量连接滑动 idle 回收。tick 取 idle/10(限 5s~60s)
+		// 平衡回收粒度与开销。Hash 含 idle → 改 lifecycle.tcp-idle 会翻 Hash 重启本伪 Instance(新期限生效)。
+		tcpIdle := f.tcpIdle()
+		reapTick := tcpIdle / 10
+		if reapTick < 5*time.Second {
+			reapTick = 5 * time.Second
+		}
+		if reapTick > 60*time.Second {
+			reapTick = 60 * time.Second
+		}
+		insts = append(insts, Instance{Listen: "reaper", Hash: "reaper:" + tcpIdle.String(), Run: func(ctx context.Context) error {
+			return metricReg.RunReaper(ctx, reapTick, tcpIdle)
 		}})
 	}
 
