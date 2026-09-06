@@ -114,6 +114,7 @@ type Engine struct {
 	procName map[string]uint32 // 进程 basename -> min ord
 	procPath map[string]uint32 // 进程完整路径 -> min ord
 	hasProc  bool              // 是否有 process 规则(无则 RouteConn 跳过进程反查,省 I/O)
+	hasIP    bool              // 是否有 ip-cidr/geoip 规则(含组合子规则;无则域名目标跳过按需解析,省 DNS I/O)
 
 	logical    []evalRule // 逻辑组合规则(and/or/not),顺序求值取命中 min ord
 	hasLogical bool       // 是否有组合规则
@@ -129,6 +130,7 @@ type evalRule struct {
 type evalCtx struct {
 	dst      addr.Socksaddr
 	src      netip.AddrPort
+	ips      []netip.Addr // 域名目标按需解析出的真 IP(供 ip-cidr/geoip 子规则匹配;IP 目标时为空,直接用 dst.Addr)
 	network  string
 	proto    string // 嗅探出的应用协议(tls/http/quic/stun;供 protocol 子规则)
 	finder   ProcessFinder
@@ -173,6 +175,9 @@ func Compile(rules []Rule, def string) (*Engine, error) {
 		}
 		ord := uint32(i)
 		e.targets[i] = r.To
+		if ruleUsesIP(r) { // 叶子或组合子规则含 ip-cidr/geoip → 需按需解析域名(崩点1)
+			e.hasIP = true
+		}
 		// 组合规则(and/or/not):单独编成 evaluator,不进各维度索引。
 		if r.Op != "" {
 			if err := validateComposite(r); err != nil {
@@ -229,6 +234,20 @@ func Compile(rules []Rule, def string) (*Engine, error) {
 		}
 	}
 	return e, nil
+}
+
+// ruleUsesIP 报告一条规则(含其组合子规则,递归)是否用到 ip-cidr/geoip 维度 —— 用于决定是否需要
+// 对域名目标按需解析真 IP 再匹配(崩点1)。无 IP 维度则整条解析跳过、零 DNS I/O。
+func ruleUsesIP(r *Rule) bool {
+	if len(r.IPCIDR) > 0 || len(r.GeoIP) > 0 {
+		return true
+	}
+	for i := range r.Sub {
+		if ruleUsesIP(&r.Sub[i]) {
+			return true
+		}
+	}
+	return false
 }
 
 // validateComposite 校验组合规则(递归):op∈{and,or}、sub 非空、无叶子维度、子规则合法且不带 to。
@@ -297,6 +316,15 @@ func compileEval(r *Rule) func(*evalCtx) bool {
 }
 
 // matchLeaf 判定单维度叶子规则是否命中(供组合规则求值;含 process,lazy 反查)。
+// ipSet 返回用于 ip-cidr/geoip 匹配的 IP 集:IP 目标 → 自身(unmap);域名目标 → 按需解析出的真 IP
+// (resolved 可空 = 未解析/无 dns/解析失败,则 ip 类维度对该域名不命中,优雅降级到修复前行为,不崩不泄漏)。
+func ipSet(dst addr.Socksaddr, resolved []netip.Addr) []netip.Addr {
+	if dst.IsIP() {
+		return []netip.Addr{dst.Addr.Unmap()}
+	}
+	return resolved
+}
+
 func matchLeaf(r *Rule, c *evalCtx) bool {
 	dst := c.dst
 	if dst.IsFqdn() {
@@ -323,8 +351,7 @@ func matchLeaf(r *Rule, c *evalCtx) bool {
 			}
 		}
 	}
-	if dst.IsIP() {
-		ip := dst.Addr.Unmap()
+	for _, ip := range ipSet(dst, c.ips) { // IP 目标=自身;域名目标=按需解析出的真 IP(崩点1)
 		for _, cc := range r.IPCIDR {
 			if p, err := netip.ParsePrefix(cc); err == nil && p.Masked().Contains(ip) {
 				return true
@@ -364,15 +391,25 @@ func (e *Engine) Route(dst addr.Socksaddr) string {
 // HasProcess 报告是否配了 process 规则(上游据此决定是否需要源侧进程反查)。
 func (e *Engine) HasProcess() bool { return e.hasProc }
 
-// RouteConn 带源上下文路由:先匹配 dst 侧维度,再(仅当有 process 规则且 finder 非 nil)据 src+network
-// 反查发起进程,把 process 命中并入 min-ordinal。finder 为 nil 或无 process 规则时等价 Route(dst)。
-// 进程反查有 I/O 成本,故仅在 hasProc 时触发、admission 期一次、离字节路径。
+// HasIPRules 报告是否配了 ip-cidr/geoip 规则(含组合子规则)。上游据此决定:域名目标是否值得按需解析真 IP
+// 再匹配(崩点1)—— 无 IP 规则时对域名目标完全跳过解析,零 DNS I/O。
+func (e *Engine) HasIPRules() bool { return e.hasIP }
+
+// RouteConn 带源上下文路由(不带已解析 IP);等价 RouteConnIPs(dst,nil,...)。
 func (e *Engine) RouteConn(dst addr.Socksaddr, src netip.AddrPort, network, proto string, finder ProcessFinder) string {
-	best := e.dimsBest(dst, network, proto)
+	return e.RouteConnIPs(dst, nil, src, network, proto, finder)
+}
+
+// RouteConnIPs 带源上下文 + 域名目标已解析真 IP 的路由:先匹配 dst 侧维度(域名目标的 ip-cidr/geoip 用 ips
+// 匹配,崩点1),再(仅当有 process 规则且 finder 非 nil)据 src+network 反查发起进程,并入 min-ordinal。
+// ips 为空 = IP 目标或未解析/无 dns:则 ip 类维度对域名不命中(优雅降级,不崩不泄漏)。
+// I/O 成本(进程反查/域名解析)均在 admission 期一次、离字节路径。
+func (e *Engine) RouteConnIPs(dst addr.Socksaddr, ips []netip.Addr, src netip.AddrPort, network, proto string, finder ProcessFinder) string {
+	best := e.dimsBest(dst, ips, network, proto)
 	// 顶层 process 叶子规则:走 map 索引(快)。组合规则里的 process 子规则走 evalCtx.proc()。
 	var ctx *evalCtx
 	if (e.hasProc || e.hasLogical) && finder != nil && src.IsValid() {
-		ctx = &evalCtx{dst: dst, src: src, network: network, proto: proto, finder: finder}
+		ctx = &evalCtx{dst: dst, ips: ips, src: src, network: network, proto: proto, finder: finder}
 	}
 	if e.hasProc && ctx != nil {
 		if name, path, ok := ctx.proc(); ok {
@@ -386,7 +423,7 @@ func (e *Engine) RouteConn(dst addr.Socksaddr, src netip.AddrPort, network, prot
 	}
 	if e.hasLogical {
 		if ctx == nil { // 无源(纯 dst 路由):组合规则里的 process 子规则将不命中
-			ctx = &evalCtx{dst: dst, src: src, network: network, proto: proto, finder: finder}
+			ctx = &evalCtx{dst: dst, ips: ips, src: src, network: network, proto: proto, finder: finder}
 		}
 		for i := range e.logical {
 			if e.logical[i].ord < best && e.logical[i].eval(ctx) {
@@ -401,7 +438,8 @@ func (e *Engine) RouteConn(dst addr.Socksaddr, src netip.AddrPort, network, prot
 }
 
 // dimsBest 返回 dst 侧各维度(含 network、嗅探 protocol)命中的最小 ord(ordNone=未命中)。Route/RouteConn 共用。
-func (e *Engine) dimsBest(dst addr.Socksaddr, network, proto string) uint32 {
+// ips = 域名目标按需解析出的真 IP(IP 目标时忽略,用自身);域名维与 ip 维并行取全局 min(min-ordinal 天然正确)。
+func (e *Engine) dimsBest(dst addr.Socksaddr, ips []netip.Addr, network, proto string) uint32 {
 	best := ordNone
 	if network != "" {
 		if o, ok := e.netw[network]; ok && o < best {
@@ -439,8 +477,9 @@ func (e *Engine) dimsBest(dst addr.Socksaddr, network, proto string) uint32 {
 				best = e.geosite[j].ord
 			}
 		}
-	} else if dst.IsIP() {
-		ip := dst.Addr.Unmap()
+	}
+	// ip-cidr/geoip 维度:IP 目标用自身,域名目标用解析出的真 IP(崩点1;不 else 于域名维度,两类并行取 min)。
+	for _, ip := range ipSet(dst, ips) {
 		for j := range e.cidr {
 			if e.cidr[j].ord < best && e.cidr[j].p.Contains(ip) {
 				best = e.cidr[j].ord

@@ -128,6 +128,13 @@ func (r *Resolver) Reload(nameservers []Nameserver, policies []NameserverPolicy,
 
 // Exchange 整报文进出:缓存优先,miss 经策略查上游,成功按 min-TTL 入缓存。
 func (r *Resolver) Exchange(ctx context.Context, q *route.Message) (*route.Message, error) {
+	return r.exchange1(ctx, q, false)
+}
+
+// exchange1 是 Exchange 的实现。skipFake=true 时绕过 fake-ip 合成分支,走 hosts→cache→上游取【真 IP】——
+// 供 LookupReal(路由 ip-cidr/geoip 对域名目标匹配,崩点1)用。fake 响应从不入缓存(下方 fake 分支直接返回、
+// 不到 cache.put),故缓存里恒为真 IP,skipFake 复用缓存零风险;客户端 fake 路径(skipFake=false)完全不受影响。
+func (r *Resolver) exchange1(ctx context.Context, q *route.Message, skipFake bool) (*route.Message, error) {
 	p := r.p.Load()
 	if p == nil {
 		return nil, ErrDisabled
@@ -142,7 +149,7 @@ func (r *Resolver) Exchange(ctx context.Context, q *route.Message) (*route.Messa
 	}
 	// fake-ip:A/AAAA 且未排除 → 就地合成伪 IP 应答(记映射),不走上游、不入缓存(池即缓存)。
 	// hosts 优先于 fake(上面已判);AAAA 无 v6 段 → 空答(NOERROR 无记录),逼客户端用 v4 伪 IP、防 v6 泄漏。
-	if ok && r.fake != nil && (key.qtype == dnsmessage.TypeA || key.qtype == dnsmessage.TypeAAAA) && !r.fake.excluded(key.name) {
+	if !skipFake && ok && r.fake != nil && (key.qtype == dnsmessage.TypeA || key.qtype == dnsmessage.TypeAAAA) && !r.fake.excluded(key.name) {
 		if fip, got := r.fake.alloc(key.name, key.qtype); got {
 			if raw := buildHostsResponse(id, key.name, key.qtype, []netip.Addr{fip}); raw != nil {
 				return &route.Message{Raw: raw}, nil
@@ -238,6 +245,33 @@ func (r *Resolver) Lookup(ctx context.Context, host string, s route.Strategy) ([
 	}
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("dns: %q 无 A/AAAA 记录", host)
+	}
+	return addrs, nil
+}
+
+// LookupReal 解析 host 的【真 IP】,绕过 fake-ip 合成(崩点1:供路由 ip-cidr/geoip 对域名目标匹配)。
+// 与 Lookup 同(hosts→cache→上游、detour 强制具名防泄漏),仅走 skipFake 分支不铸伪 IP。拨号 dst 不受此影响
+// (调用方只拿返回的 IP 喂路由决策,拨号仍用原域名)—— 伪 IP 绝不出本机。
+func (r *Resolver) LookupReal(ctx context.Context, host string, s route.Strategy) ([]netip.Addr, error) {
+	if r.p.Load() == nil {
+		return nil, ErrDisabled
+	}
+	var addrs []netip.Addr
+	for _, qt := range queryTypes(s) {
+		raw, err := buildQuery(host, qt)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := r.exchange1(ctx, &route.Message{Raw: raw}, true)
+		if err != nil {
+			return nil, err
+		}
+		if na, ok := parseAddrs(resp.Raw); ok {
+			addrs = append(addrs, toNetip(na)...)
+		}
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("dns: %q 无 A/AAAA 记录(real)", host)
 	}
 	return addrs, nil
 }

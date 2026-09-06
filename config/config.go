@@ -1124,6 +1124,7 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		router = &service.RuleRouter{Engine: eng, Outs: outs}
 		if dnsResolver != nil { // fake-ip 反查:伪 IP dst 路由前换回域名(未启用 fake-ip 时 FakeIPToDomain 恒 false,无害)
 			router.Fake = dnsResolver.FakeIPToDomain
+			router.Resolver = dnsResolver // 崩点1:域名目标按需解析真 IP 供 ip-cidr/geoip 匹配(仅 eng.HasIPRules() 时触发)
 		}
 		if eng.HasProcess() { // 有 process 规则才装进程反查器(读 /proc,仅 Linux;其他平台优雅降级不命中)
 			router.Finder = service.NewProcessFinder()

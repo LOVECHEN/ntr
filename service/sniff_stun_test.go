@@ -50,8 +50,46 @@ func TestSniffPacket(t *testing.T) {
 	if p := sniffPacket([]byte("not stun at all, just bytes......")); p != endpoint.SniffNone {
 		t.Fatalf("非 STUN 应为 SniffNone,实为 %v", p)
 	}
+	if p := sniffPacket(mkQUIC(0x00000001)); p != endpoint.SniffQUIC {
+		t.Fatalf("QUIC v1 Initial 应嗅为 SniffQUIC,实为 %v", p)
+	}
 	if endpoint.SniffSTUN.String() != "stun" {
 		t.Fatal("SniffSTUN.String() 应为 stun")
+	}
+}
+
+// mkQUIC 造一个长包头 QUIC 首包(byte0 长包头+fixed 位,version 4B)。
+func mkQUIC(version uint32) []byte {
+	b := make([]byte, 20)
+	b[0] = 0xc0 // long header(0x80)+ fixed(0x40)
+	b[1] = byte(version >> 24)
+	b[2] = byte(version >> 16)
+	b[3] = byte(version >> 8)
+	b[4] = byte(version)
+	return b
+}
+
+// TestIsQUIC:QUIC 长包头首包识别(不解密,仅凭 long-header 位 + 已知版本号)。
+func TestIsQUIC(t *testing.T) {
+	if !isQUIC(mkQUIC(0x00000001)) {
+		t.Fatal("QUIC v1(0x00000001)应识别")
+	}
+	if !isQUIC(mkQUIC(0x6b3343cf)) {
+		t.Fatal("QUIC v2(0x6b3343cf)应识别")
+	}
+	if !isQUIC(mkQUIC(0xff00001d)) {
+		t.Fatal("draft-ietf-quic(0xff0000xx)应识别")
+	}
+	if isQUIC(mkQUIC(0x12345678)) {
+		t.Error("未知版本不应判 QUIC")
+	}
+	short := mkQUIC(0x00000001)
+	short[0] &^= 0x80 // 清长包头位 → 短包头(1-RTT),不作首包识别
+	if isQUIC(short) {
+		t.Error("短包头不应判 QUIC")
+	}
+	if isQUIC(make([]byte, 4)) {
+		t.Error("不足 5 字节不应判 QUIC")
 	}
 }
 

@@ -437,3 +437,35 @@ func TestRouteLogical(t *testing.T) {
 		}
 	}
 }
+
+// TestRouteResolveForRouting:崩点1 —— 域名目标 + 已解析真 IP 应能命中 ip-cidr 规则;不带解析 IP 则
+// ip 类维度对域名不命中(优雅降级)。同时验 HasIPRules() 门禁。
+func TestRouteResolveForRouting(t *testing.T) {
+	eng, err := Compile([]Rule{{IPCIDR: []string{"10.9.0.0/16"}, To: "block"}}, "direct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !eng.HasIPRules() {
+		t.Fatal("配了 ip-cidr,HasIPRules() 应为 true")
+	}
+	fqdn := addr.FromFqdn("target.internal", 80)
+	// 不带解析 IP:ip-cidr 对域名不命中 → default(=修复前行为,优雅降级)
+	if g := eng.RouteConn(fqdn, netip.AddrPort{}, "tcp", "", nil); g != "direct" {
+		t.Fatalf("无解析 IP 的域名目标应落 default,实为 %q", g)
+	}
+	// 带解析出真 IP(落在 10.9/16):命中 ip-cidr → block(崩点1 修复)
+	ips := []netip.Addr{netip.MustParseAddr("10.9.0.5")}
+	if g := eng.RouteConnIPs(fqdn, ips, netip.AddrPort{}, "tcp", "", nil); g != "block" {
+		t.Fatalf("解析出 10.9.0.5 的域名目标应命中 ip-cidr→block,实为 %q", g)
+	}
+	// 解析出不在 cidr 的 IP:不命中 → default(证不误伤)
+	off := []netip.Addr{netip.MustParseAddr("8.8.8.8")}
+	if g := eng.RouteConnIPs(fqdn, off, netip.AddrPort{}, "tcp", "", nil); g != "direct" {
+		t.Fatalf("解析出 8.8.8.8(不在 cidr)应落 default,实为 %q", g)
+	}
+	// 无 ip 规则的引擎:HasIPRules() false(上游据此跳过解析)
+	eng2, _ := Compile([]Rule{{DomainSuffix: []string{"example.com"}, To: "proxy"}}, "direct")
+	if eng2.HasIPRules() {
+		t.Fatal("无 ip 规则,HasIPRules() 应为 false")
+	}
+}

@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sys/cpu"
+
 	"github.com/LOVECHEN/ntr/core/cred"
 )
 
@@ -32,8 +34,14 @@ type connHandle struct {
 
 // Cell 是一个计费槽(用户)的原子计数 + 热开关状态(承 §6.5「计量树就是开关树」)。
 type Cell struct {
-	up         atomic.Uint64 // 应用层上行字节(client→target)
-	down       atomic.Uint64 // 应用层下行字节(target→client)
+	// ★ 伪共享隔离(§9.5.2):up 与 down 由一条连接的两个方向 relay goroutine 分别写,隔到不同 cache line
+	// 免跨核伪共享;热计数组再与下方冷 admit/config 组隔开。cpu.CacheLinePad 按 arch 自动(amd64=64B/arm64=128B)。
+	// 注:up/down 作为「本用户聚合点」的真共享(该 user 多连接汇聚同一 Cell)是设计使然,靠稀疏 drain(T=128K)
+	// 摊薄,非 padding 能治 —— 此处只消伪共享。
+	up atomic.Uint64 // 应用层上行字节(client→target)
+	_  cpu.CacheLinePad
+	down atomic.Uint64 // 应用层下行字节(target→client)
+	_    cpu.CacheLinePad
 	connsTotal atomic.Uint64 // 单调累计连接数
 	connsLive  atomic.Int64  // 当前活跃连接
 
@@ -44,6 +52,8 @@ type Cell struct {
 	lastUp  uint64
 	lastDn  uint64
 	lastRej uint64 // 上次采样的合计 rejected(WARN 边沿触发用)
+
+	_ cpu.CacheLinePad // 热计数组 ↑ / 冷 admit·config 组 ↓ 之间隔板
 
 	disabled atomic.Bool            // 热开关:停用(拒新 + 断老,承 §6.5.2)
 	liveMu   sync.Mutex             // 配对 disabled 检查与 live 增删(D-01 竞态修法,承 §6.5.5)

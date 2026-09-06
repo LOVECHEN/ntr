@@ -74,7 +74,33 @@ func sniffPacket(datagram []byte) endpoint.SniffProto {
 	if isDTLS(datagram) {
 		return endpoint.SniffDTLS
 	}
+	if isQUIC(datagram) {
+		return endpoint.SniffQUIC
+	}
 	return endpoint.SniffNone
+}
+
+// isQUIC 判定一份 UDP 报文是否为 QUIC 长包头首包(Initial/0-RTT/Handshake):byte[0] 最高位=1(long header
+// form)+ 版本号 bytes[1:5] ∈ 已知集(RFC 9000 v1=0x00000001、RFC 9369 v2=0x6b3343cf、draft 0xff0000xx)。
+// 版本号在明文区、不受 header protection 影响 —— 不解密即可判定的协议级铁证(对位 magic cookie 之于 STUN)。
+// 只识别不取 SNI(QUIC 用 header protection + AEAD,抠 SNI 须完整解密,超出协议级拦截所需)。供 protocol:[quic] 路由维度命中。
+func isQUIC(b []byte) bool {
+	if len(b) < 5 {
+		return false
+	}
+	if b[0]&0x80 == 0 { // 短包头(1-RTT):无版本字段,连接建立后才用,不作首包识别
+		return false
+	}
+	switch v := binary.BigEndian.Uint32(b[1:5]); {
+	case v == 0x00000001: // QUIC v1(RFC 9000)
+		return true
+	case v == 0x6b3343cf: // QUIC v2(RFC 9369)
+		return true
+	case v&0xff000000 == 0xff000000: // draft-ietf-quic(0xff0000xx)
+		return true
+	default:
+		return false
+	}
 }
 
 // isDTLS 判定一份 UDP 报文是否为 DTLS record(RFC 6347;WebRTC 媒体面 DTLS-SRTP 用之):≥13 字节固定头 +

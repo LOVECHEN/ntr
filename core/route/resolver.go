@@ -31,6 +31,8 @@ type Resolver interface {
 	LookupCached(host string, s Strategy) (addrs []netip.Addr, ok bool)
 	// Lookup 缓存优先;miss 向上游(ctx 带硬 deadline);失败 typed error(绝不把空集当成功)。
 	Lookup(ctx context.Context, host string, s Strategy) ([]netip.Addr, error)
+	// LookupReal 解析真 IP、绕过 fake-ip 合成(崩点1:供路由 ip-cidr/geoip 对域名目标匹配;拨号 dst 不变)。
+	LookupReal(ctx context.Context, host string, s Strategy) ([]netip.Addr, error)
 	// Exchange 整报文进出 —— 内置 dns 出站/监听用。
 	Exchange(ctx context.Context, q *Message) (*Message, error)
 	// FakeIPToDomain 反查 fake-ip(Phase 2;MVP 恒返回 ("",false))。
