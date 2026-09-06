@@ -26,6 +26,19 @@ type User struct {
 	Password string
 }
 
+type ctxUserKey struct{}
+
+// withUser 把 JLS 认证到的计费用户名挂进 ctx(ConnectionState().TLS.JLS.User)。
+func withUser(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, ctxUserKey{}, name)
+}
+
+// UserFromContext 读认证命中的计费用户名(供 config 的 SessionDispatch 回读 → cred.ID 计量)。
+func UserFromContext(ctx context.Context) (string, bool) {
+	name, ok := ctx.Value(ctxUserKey{}).(string)
+	return name, ok && name != ""
+}
+
 // Inbound 是 ShadowQUIC 入站:UDP 上跑 JLS-over-QUIC 监听,每条流读 [cmd][socks5addr] 后路由到出站。
 type Inbound struct {
 	tlsConf  *jlstls.Config
@@ -106,8 +119,12 @@ func (h *Inbound) Run(ctx context.Context, listenAddr string) error {
 	}
 }
 
-// handleConn 在一条 QUIC 连接上循环接受流(JLS 已在握手层认证)。
+// handleConn 在一条 QUIC 连接上循环接受流(JLS 已在握手层认证)。JLS 每连接认证一次,
+// 从 ConnectionState 取认证到的计费用户名挂进 ctx(该连接所有流共享,供 dispatch 计量回读)。
 func (h *Inbound) handleConn(ctx context.Context, conn *jlsquic.Conn) {
+	if name := conn.ConnectionState().TLS.JLS.User; name != "" {
+		ctx = withUser(ctx, name)
+	}
 	for {
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {

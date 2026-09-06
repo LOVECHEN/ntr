@@ -150,6 +150,7 @@ type h2Stream struct {
 	r       io.Reader
 	w       io.Writer
 	closeFn func() error
+	remote  net.Addr // 服务端侧:底层 TLS/TCP 真实客户端地址(h2 server 从 r.RemoteAddr 提供),供 max-ips;出站侧留空
 	once    sync.Once
 	cerr    error
 }
@@ -160,8 +161,13 @@ func (s *h2Stream) Close() error {
 	s.once.Do(func() { s.cerr = s.closeFn() })
 	return s.cerr
 }
-func (*h2Stream) LocalAddr() net.Addr              { return ttAddr{} }
-func (*h2Stream) RemoteAddr() net.Addr             { return ttAddr{} }
+func (*h2Stream) LocalAddr() net.Addr { return ttAddr{} }
+func (s *h2Stream) RemoteAddr() net.Addr {
+	if s.remote != nil {
+		return s.remote
+	}
+	return ttAddr{}
+}
 func (*h2Stream) SetDeadline(time.Time) error      { return nil }
 func (*h2Stream) SetReadDeadline(time.Time) error  { return nil }
 func (*h2Stream) SetWriteDeadline(time.Time) error { return nil }
@@ -171,3 +177,16 @@ type ttAddr struct{}
 
 func (ttAddr) Network() string { return "trusttunnel" }
 func (ttAddr) String() string  { return "trusttunnel-h2" }
+
+// remoteAddr 把 h2 server 提供的 r.RemoteAddr("ip:port")抬成 net.Addr,供 srcAddrPort 解真源;空 → nil。
+func remoteAddr(s string) net.Addr {
+	if s == "" {
+		return nil
+	}
+	return strAddr(s)
+}
+
+type strAddr string
+
+func (strAddr) Network() string  { return "tcp" }
+func (a strAddr) String() string { return string(a) }

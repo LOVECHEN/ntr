@@ -366,3 +366,16 @@ type masqueAddr struct{}
 
 func (masqueAddr) Network() string { return "masque" }
 func (masqueAddr) String() string  { return "masque-h3" }
+
+// remoteAddr 把 h3 server 提供的 r.RemoteAddr("ip:port")抬成 net.Addr,供 srcAddrPort 解真源;空 → nil。
+func remoteAddr(s string) net.Addr {
+	if s == "" {
+		return nil
+	}
+	return strAddr(s)
+}
+
+type strAddr string
+
+func (strAddr) Network() string  { return "udp" }
+func (a strAddr) String() string { return string(a) }

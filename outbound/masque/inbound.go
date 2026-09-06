@@ -29,6 +29,22 @@ type User struct {
 	Password string
 }
 
+type ctxUserKey struct{}
+
+// withUser 把 Basic 认证到的计费用户名挂进 ctx(供 dispatch 计量回读;未鉴权模式下名为空=Ambient)。
+func withUser(ctx context.Context, name string) context.Context {
+	if name == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxUserKey{}, name)
+}
+
+// UserFromContext 读认证命中的计费用户名(供 config 的 SessionDispatch 回读 → cred.ID 计量)。
+func UserFromContext(ctx context.Context) (string, bool) {
+	name, ok := ctx.Value(ctxUserKey{}).(string)
+	return name, ok && name != ""
+}
+
 // Inbound 是 MASQUE 入站:在 UDP socket 上跑 QUIC + HTTP/3 服务端,处理
 // connect-udp(RFC 9298,UDP over HTTP Datagram)与普通 CONNECT(RFC 9220,TCP over h3)。
 // 自管 UDP 监听(Run),不走 NTR 的 TCP 接入环。
@@ -103,19 +119,21 @@ func (h *Inbound) serve(w mhttp.ResponseWriter, r *mhttp.Request) {
 		mhttp.Error(w, "method not allowed", mhttp.StatusMethodNotAllowed)
 		return
 	}
-	if !h.checkAuth(r.Header.Get("Proxy-Authorization")) {
+	name, ok := h.authUser(r.Header.Get("Proxy-Authorization"))
+	if !ok {
 		mhttp.Error(w, "proxy auth required", mhttp.StatusProxyAuthRequired)
 		return
 	}
-	if r.Proto == connectUDPProto { // Extended CONNECT:RFC 9298
-		h.serveUDP(w, r)
+	ctx := withUser(r.Context(), name) // 认证到的计费用户名挂 ctx(未鉴权=Ambient),供 dispatch 计量回读
+	if r.Proto == connectUDPProto {    // Extended CONNECT:RFC 9298
+		h.serveUDP(ctx, w, r)
 		return
 	}
-	h.serveTCP(w, r)
+	h.serveTCP(ctx, w, r)
 }
 
 // serveUDP 处理 connect-udp:从 URI 模板解出目标,回 200 后接管流,用 HTTP Datagram 双向搬 UDP。
-func (h *Inbound) serveUDP(w mhttp.ResponseWriter, r *mhttp.Request) {
+func (h *Inbound) serveUDP(ctx context.Context, w mhttp.ResponseWriter, r *mhttp.Request) {
 	dst, err := parseConnectUDPPath(r.URL.Path)
 	if err != nil {
 		mhttp.Error(w, "bad target", mhttp.StatusBadRequest)
@@ -126,7 +144,6 @@ func (h *Inbound) serveUDP(w mhttp.ResponseWriter, r *mhttp.Request) {
 		mhttp.Error(w, "no hijack", mhttp.StatusInternalServerError)
 		return
 	}
-	ctx := r.Context()
 	pc, err := h.out.DialPacket(ctx, dst)
 	if err != nil {
 		mhttp.Error(w, "dial failed", mhttp.StatusBadGateway)
@@ -141,7 +158,7 @@ func (h *Inbound) serveUDP(w mhttp.ResponseWriter, r *mhttp.Request) {
 }
 
 // serveTCP 处理普通 CONNECT(RFC 9220):目标在 :authority,回 200 后接管流双向 relay。
-func (h *Inbound) serveTCP(w mhttp.ResponseWriter, r *mhttp.Request) {
+func (h *Inbound) serveTCP(ctx context.Context, w mhttp.ResponseWriter, r *mhttp.Request) {
 	authority := r.Host
 	if authority == "" {
 		authority = r.URL.Host
@@ -160,10 +177,9 @@ func (h *Inbound) serveTCP(w mhttp.ResponseWriter, r *mhttp.Request) {
 		mhttp.Error(w, "no hijack", mhttp.StatusInternalServerError)
 		return
 	}
-	ctx := r.Context()
 	w.WriteHeader(mhttp.StatusOK)
 	hs := streamer.HTTPStream()
-	st := &serverStream{s: hs}
+	st := &serverStream{s: hs, remote: remoteAddr(r.RemoteAddr)} // h3 server 提供真客户端地址 → max-ips
 	if h.dispatch != nil { // 反连 portal:已握手流交隧道派发,不落地出站
 		_ = h.dispatch(ctx, st, dst, endpoint.NetworkTCP)
 		return
@@ -266,28 +282,32 @@ func parseHostPort(hostPort string) (addr.Socksaddr, error) {
 	return addr.FromFqdn(h, uint16(port)), nil
 }
 
-// checkAuth:未配用户 = 不鉴权;配了则校验 "Basic base64(user:pass)"。
-func (h *Inbound) checkAuth(header string) bool {
+// authUser:未配用户 = 不鉴权(返回 "",true → Ambient);配了则校验 "Basic base64(user:pass)",
+// 成功返回命中的用户名。
+func (h *Inbound) authUser(header string) (string, bool) {
 	if len(h.users) == 0 {
-		return true
+		return "", true
 	}
 	const p = "Basic "
 	if !strings.HasPrefix(header, p) {
-		return false
+		return "", false
 	}
 	raw, err := base64.StdEncoding.DecodeString(header[len(p):])
 	if err != nil {
-		return false
+		return "", false
 	}
 	name, pass, ok := strings.Cut(string(raw), ":")
 	if !ok {
-		return false
+		return "", false
 	}
 	want, ok := h.users[name]
 	if !ok {
-		return false
+		return "", false
 	}
-	return subtle.ConstantTimeCompare([]byte(want), []byte(pass)) == 1
+	if subtle.ConstantTimeCompare([]byte(want), []byte(pass)) != 1 {
+		return "", false
+	}
+	return name, true
 }
 
 func basicAuth(user, password string) string {
@@ -295,14 +315,22 @@ func basicAuth(user, password string) string {
 }
 
 // serverStream 把服务端接管的 *http3.Stream 抬成 link.Stream。
-type serverStream struct{ s *http3.Stream }
+type serverStream struct {
+	s      *http3.Stream
+	remote net.Addr // 底层 QUIC 真实客户端地址(h3 server 从 r.RemoteAddr 提供),供 max-ips 按真源计
+}
 
-func (s *serverStream) Read(p []byte) (int, error)     { return s.s.Read(p) }
-func (s *serverStream) Write(p []byte) (int, error)    { return s.s.Write(p) }
-func (s *serverStream) Close() error                   { return s.s.Close() }
-func (*serverStream) LocalAddr() net.Addr              { return masqueAddr{} }
-func (*serverStream) RemoteAddr() net.Addr             { return masqueAddr{} }
-func (*serverStream) SetDeadline(time.Time) error      { return nil }
+func (s *serverStream) Read(p []byte) (int, error)  { return s.s.Read(p) }
+func (s *serverStream) Write(p []byte) (int, error) { return s.s.Write(p) }
+func (s *serverStream) Close() error                { return s.s.Close() }
+func (*serverStream) LocalAddr() net.Addr           { return masqueAddr{} }
+func (s *serverStream) RemoteAddr() net.Addr {
+	if s.remote != nil {
+		return s.remote
+	}
+	return masqueAddr{}
+}
+func (*serverStream) SetDeadline(time.Time) error { return nil }
 func (*serverStream) SetReadDeadline(time.Time) error  { return nil }
 func (*serverStream) SetWriteDeadline(time.Time) error { return nil }
 func (*serverStream) Unwrap() any                      { return nil }

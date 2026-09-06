@@ -4,9 +4,12 @@ package connectip
 
 import (
 	"context"
+	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"net"
 	"net/netip"
+	"strings"
 	"time"
 
 	mhttp "github.com/metacubex/http"
@@ -29,6 +32,8 @@ type Inbound struct {
 	srv       *http3.Server
 	assignIP  netip.Prefix // 下发给对端的隧道内地址(ADDRESS_ASSIGN)
 	mtu       uint32
+	users     map[string]string // name→password(可选 Basic;空=开放隧道)
+	hook      MeterHook         // 隧道级接入/计量(nil=不计量不设闸)
 }
 
 // InboundOptions 是 CONNECT-IP 入站配置。
@@ -38,11 +43,17 @@ type InboundOptions struct {
 	ExtraSettings map[uint64]uint64 // 与客户端对齐用(如 Cloudflare 的 0x276)
 }
 
-// NewInbound 构造 CONNECT-IP 入站。
-func NewInbound(o InboundOptions, tlsAny any, out endpoint.Outbound) (*Inbound, error) {
+// NewInbound 构造 CONNECT-IP 入站。users 非空 → 开启可选 HTTP Basic 鉴权;hook 非 nil → 隧道级接入+计量。
+func NewInbound(o InboundOptions, users []User, hook MeterHook, tlsAny any, out endpoint.Outbound) (*Inbound, error) {
 	tlsConfig, ok := tlsAny.(*mtls.Config)
 	if !ok {
 		return nil, errors.New("connect-ip: 需要 *metacubex/tls.Config")
+	}
+	um := make(map[string]string, len(users))
+	for _, u := range users {
+		if u.Name != "" {
+			um[u.Name] = u.Password
+		}
 	}
 	assign := netip.MustParsePrefix("10.9.0.2/32")
 	if o.AssignAddress != "" {
@@ -57,7 +68,7 @@ func NewInbound(o InboundOptions, tlsAny any, out endpoint.Outbound) (*Inbound, 
 		mtu = uint32(o.MTU)
 	}
 	tlsConfig.NextProtos = []string{http3.NextProtoH3}
-	h := &Inbound{tlsConfig: tlsConfig, out: out, assignIP: assign, mtu: mtu}
+	h := &Inbound{tlsConfig: tlsConfig, out: out, assignIP: assign, mtu: mtu, users: um, hook: hook}
 	h.srv = &http3.Server{
 		EnableDatagrams:    true,
 		AdditionalSettings: o.ExtraSettings,
@@ -117,6 +128,11 @@ func (h *Inbound) serve(w mhttp.ResponseWriter, r *mhttp.Request) {
 		mhttp.Error(w, "unsupported :protocol", mhttp.StatusBadRequest)
 		return
 	}
+	user, ok := h.authUser(r.Header.Get("Proxy-Authorization"))
+	if !ok {
+		mhttp.Error(w, "proxy auth required", mhttp.StatusProxyAuthRequired)
+		return
+	}
 	streamer, ok := w.(http3.HTTPStreamer)
 	if !ok {
 		mhttp.Error(w, "no hijack", mhttp.StatusInternalServerError)
@@ -135,6 +151,18 @@ func (h *Inbound) serve(w mhttp.ResponseWriter, r *mhttp.Request) {
 	w.WriteHeader(mhttp.StatusOK)            // RFC 9484 §4.5:2xx 即成功
 	hs := streamer.HTTPStream()
 	defer hs.Close()
+
+	// 隧道级接入 + 计量(hook 非 nil):认证用户 → 连接闸 + max-ips + 按整条隧道记 IP 包字节。
+	// closer=hs 交接入器,Disable/KillIP 时强杀本隧道。被拒(闸满/内存档)→ 关流退出。
+	var addUp, addDown func(int)
+	if h.hook != nil {
+		up, down, release, admitOK := h.hook(ctx, user, remoteAddr(r.RemoteAddr), hs)
+		if !admitOK {
+			return
+		}
+		defer release()
+		addUp, addDown = up, down
+	}
 
 	// 按 RFC 9484 §4.7 在流上下发 ADDRESS_ASSIGN + ROUTE_ADVERTISEMENT。
 	// (客户端也可用本地配置的地址;这里下发是标准行为,便于与标准实现互通。)
@@ -155,6 +183,9 @@ func (h *Inbound) serve(w mhttp.ResponseWriter, r *mhttp.Request) {
 			if !ok {
 				continue // 非零 Context ID:按 RFC 丢弃
 			}
+			if addUp != nil {
+				addUp(len(pkt)) // 上行:客户端 → 出站,记整条隧道字节
+			}
 			st.Inject(pkt)
 		}
 	}()
@@ -164,6 +195,9 @@ func (h *Inbound) serve(w mhttp.ResponseWriter, r *mhttp.Request) {
 			if !ok {
 				done <- struct{}{}
 				return
+			}
+			if addDown != nil {
+				addDown(len(pkt)) // 下行:出站 → 客户端
 			}
 			if err := hs.SendDatagram(prependContextID(pkt)); err != nil {
 				done <- struct{}{}
@@ -190,3 +224,44 @@ func (h *Inbound) initialCapsules() ([]byte, error) {
 	}
 	return append(assign, routes...), nil
 }
+
+// authUser:未配用户 = 不鉴权(返回 "",true → Ambient);配了则校验 "Basic base64(user:pass)",
+// 成功返回命中的用户名(= 计费 BillID,与 refs 键一致)。
+func (h *Inbound) authUser(header string) (string, bool) {
+	if len(h.users) == 0 {
+		return "", true
+	}
+	const p = "Basic "
+	if !strings.HasPrefix(header, p) {
+		return "", false
+	}
+	raw, err := base64.StdEncoding.DecodeString(header[len(p):])
+	if err != nil {
+		return "", false
+	}
+	name, pass, ok := strings.Cut(string(raw), ":")
+	if !ok {
+		return "", false
+	}
+	want, ok := h.users[name]
+	if !ok {
+		return "", false
+	}
+	if subtle.ConstantTimeCompare([]byte(want), []byte(pass)) != 1 {
+		return "", false
+	}
+	return name, true
+}
+
+// remoteAddr 把 h3 server 提供的 r.RemoteAddr("ip:port")抬成 net.Addr,供接入器解真源(max-ips);空 → nil。
+func remoteAddr(s string) net.Addr {
+	if s == "" {
+		return nil
+	}
+	return strAddr(s)
+}
+
+type strAddr string
+
+func (strAddr) Network() string  { return "udp" }
+func (a strAddr) String() string { return string(a) }

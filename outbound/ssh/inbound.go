@@ -19,6 +19,22 @@ import (
 
 var _ endpoint.InboundHandler = (*Inbound)(nil)
 
+// userExt 是认证回调写进 ssh.Permissions.Extensions 的键(值=计费用户名)。
+const userExt = "ntr-user"
+
+type ctxUserKey struct{}
+
+// withUser 把认证到的计费用户名挂进 ctx(SSH 每连接认证一次,该连接所有 channel 共享)。
+func withUser(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, ctxUserKey{}, name)
+}
+
+// UserFromContext 读认证命中的计费用户名(供 config 的 SessionDispatch 回读 → cred.ID 计量)。
+func UserFromContext(ctx context.Context) (string, bool) {
+	name, ok := ctx.Value(ctxUserKey{}).(string)
+	return name, ok && name != ""
+}
+
 // User 是 SSH 服务端用户(名 + 密码 或 授权公钥,至少其一)。
 type User struct {
 	Name      string
@@ -41,8 +57,8 @@ func NewInbound(users []User, hostKeyPEM string, out endpoint.Outbound, dispatch
 	if err != nil {
 		return nil, fmt.Errorf("ssh: 解析 host 私钥失败:%w", err)
 	}
-	pwUsers := map[string]string{} // name → password
-	keyUsers := map[string]bool{}  // marshaled authorized key → allowed
+	pwUsers := map[string]string{}  // name → password
+	keyUsers := map[string]string{} // marshaled authorized key → 计费用户名(计量归属)
 	for _, u := range users {
 		if u.Password != "" {
 			pwUsers[u.Name] = u.Password
@@ -52,22 +68,23 @@ func NewInbound(users []User, hostKeyPEM string, out endpoint.Outbound, dispatch
 			if err != nil {
 				return nil, fmt.Errorf("ssh: 用户 %q 公钥解析失败:%w", u.Name, err)
 			}
-			keyUsers[string(pk.Marshal())] = true
+			keyUsers[string(pk.Marshal())] = u.Name
 		}
 	}
 	if len(pwUsers) == 0 && len(keyUsers) == 0 {
 		return nil, errors.New("ssh: 入站需至少一个 user{password 或 public-key}")
 	}
+	// 认证回调把命中的【计费用户名】写进 Permissions.Extensions —— 握手后经 ctx 桥进 dispatch 计量。
 	cfg := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
 			if want, ok := pwUsers[c.User()]; ok && want == string(pass) {
-				return nil, nil
+				return &ssh.Permissions{Extensions: map[string]string{userExt: c.User()}}, nil
 			}
 			return nil, errors.New("ssh: 密码认证失败")
 		},
 		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			if keyUsers[string(key.Marshal())] {
-				return nil, nil
+			if name, ok := keyUsers[string(key.Marshal())]; ok {
+				return &ssh.Permissions{Extensions: map[string]string{userExt: name}}, nil
 			}
 			return nil, errors.New("ssh: 公钥认证失败")
 		},
@@ -84,6 +101,14 @@ func (h *Inbound) HandleStream(ctx context.Context, s link.Stream, _ *endpoint.M
 		return err
 	}
 	defer sconn.Close()
+	// 认证命中的计费用户名挂进 ctx(整条 SSH 连接共享),供 dispatch 计量回读;
+	// 真实客户端地址(底层 TCP 的 RemoteAddr)透给每条 channel,使 max-ips 按真源计。
+	if sconn.Permissions != nil {
+		if name := sconn.Permissions.Extensions[userExt]; name != "" {
+			ctx = withUser(ctx, name)
+		}
+	}
+	remote := s.RemoteAddr()
 	go ssh.DiscardRequests(reqs) // 丢弃全局请求(keepalive 等)
 	for newCh := range chans {
 		if newCh.ChannelType() != "direct-tcpip" {
@@ -101,7 +126,7 @@ func (h *Inbound) HandleStream(ctx context.Context, s link.Stream, _ *endpoint.M
 		}
 		go ssh.DiscardRequests(chReqs)
 		dst := toNTR(metadata.ParseSocksaddrHostPort(p.Host, uint16(p.Port)))
-		go h.route(ctx, ch, dst)
+		go h.route(ctx, ch, dst, remote)
 	}
 	return nil
 }
@@ -112,8 +137,8 @@ func (h *Inbound) HandlePacket(context.Context, link.PacketConn, *endpoint.Metad
 }
 
 // route 把一条已接受的 channel 路由:反连 dispatch 优先,否则 relay 到出站。
-func (h *Inbound) route(ctx context.Context, ch ssh.Channel, dst addr.Socksaddr) {
-	hs := connStream{channelConn{Channel: ch}}
+func (h *Inbound) route(ctx context.Context, ch ssh.Channel, dst addr.Socksaddr, remote net.Addr) {
+	hs := connStream{channelConn{Channel: ch, remote: remote}}
 	if h.dispatch != nil { // 反连 portal:已握手流交隧道派发,不落地出站
 		_ = h.dispatch(ctx, hs, dst, endpoint.NetworkTCP)
 		return
@@ -135,13 +160,20 @@ type directTCPIP struct {
 }
 
 // channelConn 把 ssh.Channel(io.ReadWriteCloser + CloseWrite)补足成 net.Conn:SSH channel 无
-// 地址/截止时间语义,用假地址 + no-op deadline(SSH 自带流控,relay 不依赖 deadline)。
+// 地址/截止时间语义,用底层 TCP 的真实 RemoteAddr(供 max-ips 按真源计)+ no-op deadline
+//(SSH 自带流控,relay 不依赖 deadline)。
 type channelConn struct {
 	ssh.Channel
+	remote net.Addr // 底层 SSH 连接的客户端地址(该连接所有 channel 共享)
 }
 
-func (channelConn) LocalAddr() net.Addr              { return sshAddr{} }
-func (channelConn) RemoteAddr() net.Addr             { return sshAddr{} }
+func (channelConn) LocalAddr() net.Addr { return sshAddr{} }
+func (c channelConn) RemoteAddr() net.Addr {
+	if c.remote != nil {
+		return c.remote
+	}
+	return sshAddr{}
+}
 func (channelConn) SetDeadline(time.Time) error      { return nil }
 func (channelConn) SetReadDeadline(time.Time) error  { return nil }
 func (channelConn) SetWriteDeadline(time.Time) error { return nil }

@@ -61,7 +61,9 @@ type InboundOptions struct {
 type Inbound struct{}
 
 // NewInbound 在未编入时直接报错。tlsConfig 用 any 以免 stub 引入 metacubex/tls。
-func NewInbound(InboundOptions, any, endpoint.Outbound) (*Inbound, error) { return nil, ErrNotBuilt }
+func NewInbound(InboundOptions, []User, MeterHook, any, endpoint.Outbound) (*Inbound, error) {
+	return nil, ErrNotBuilt
+}
 
 // Run 在未编入时直接报错。
 func (*Inbound) Run(context.Context, string) error { return ErrNotBuilt }

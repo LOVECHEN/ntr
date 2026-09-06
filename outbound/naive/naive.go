@@ -155,6 +155,7 @@ type paddedStream struct {
 	w       io.Writer
 	flush   func()
 	closeFn func() error
+	remote  net.Addr // 底层 TLS/TCP 的真实客户端地址(h2 server 从 r.RemoteAddr 提供),供 max-ips 按真源计
 	pad     paddingConn
 	rmu     sync.Mutex
 	wmu     sync.Mutex
@@ -183,14 +184,33 @@ func (s *paddedStream) Close() error {
 	return s.cerr
 }
 
-func (*paddedStream) LocalAddr() net.Addr              { return naiveAddr{} }
-func (*paddedStream) RemoteAddr() net.Addr             { return naiveAddr{} }
+func (*paddedStream) LocalAddr() net.Addr { return naiveAddr{} }
+func (s *paddedStream) RemoteAddr() net.Addr {
+	if s.remote != nil {
+		return s.remote
+	}
+	return naiveAddr{}
+}
 func (*paddedStream) SetDeadline(time.Time) error      { return nil }
 func (*paddedStream) SetReadDeadline(time.Time) error  { return nil }
 func (*paddedStream) SetWriteDeadline(time.Time) error { return nil }
 func (*paddedStream) Unwrap() any                      { return nil }
 
 type naiveAddr struct{}
+
+// remoteAddr 把 h2 server 提供的 r.RemoteAddr("ip:port" 字符串)抬成 net.Addr(String()="ip:port"),
+// 供 srcAddrPort→netip.ParseAddrPort 解出真源地址;空/异常 → nil(回退 naiveAddr,max-ips 记零源)。
+func remoteAddr(s string) net.Addr {
+	if s == "" {
+		return nil
+	}
+	return strAddr(s)
+}
+
+type strAddr string
+
+func (strAddr) Network() string  { return "tcp" }
+func (a strAddr) String() string { return string(a) }
 
 func (naiveAddr) Network() string { return "naive" }
 func (naiveAddr) String() string  { return "naive-h2" }

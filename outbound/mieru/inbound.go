@@ -29,6 +29,19 @@ type User struct {
 	Password string
 }
 
+type ctxUserKey struct{}
+
+// withUser 把认证到的计费用户名挂进 ctx(mieru accepted conn 自带 UserContext.UserName())。
+func withUser(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, ctxUserKey{}, name)
+}
+
+// UserFromContext 读认证命中的计费用户名(供 config 的 SessionDispatch 回读 → cred.ID 计量)。
+func UserFromContext(ctx context.Context) (string, bool) {
+	name, ok := ctx.Value(ctxUserKey{}).(string)
+	return name, ok && name != ""
+}
+
 // Inbound 是 mieru 入站:用官方 apis/server 自绑端口(TCP/UDP 传输),Accept 每条代理连接后回
 // socks5 成功应答(照 exampleapiserver 范式),再按目标路由到出站(或 dispatch 反连 portal)。
 // 它自管监听(Run),不走 NTR 的 TCP 接入环 —— 与 hy2/tuic 自绑范式一致。
@@ -102,7 +115,13 @@ func (h *Inbound) Run(ctx context.Context, listenAddr string) error {
 }
 
 // serve 处理一条已 Accept 的 mieru 代理连接:TCP CONNECT 走流中继;UDP-ASSOCIATE 走 UDP 中继。
+// accepted conn 实现 UserContext,取认证到的计费用户名挂进 ctx(供 dispatch 计量回读)。
 func (h *Inbound) serve(ctx context.Context, conn net.Conn, req *mierumodel.Request) {
+	if uc, ok := conn.(mierucommon.UserContext); ok {
+		if name := uc.UserName(); name != "" {
+			ctx = withUser(ctx, name)
+		}
+	}
 	switch req.Command {
 	case mieruconstant.Socks5ConnectCmd:
 		h.serveTCP(ctx, conn, toNTRAddr(req))

@@ -24,6 +24,19 @@ var _ endpoint.InboundHandler = (*Inbound)(nil)
 
 const naiveServerIdleTimeout = 5 * time.Minute
 
+type ctxUserKey struct{}
+
+// withUser 把 Basic 认证到的计费用户名挂进 ctx(供 dispatch 计量回读)。
+func withUser(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, ctxUserKey{}, name)
+}
+
+// UserFromContext 读认证命中的计费用户名(供 config 的 SessionDispatch 回读 → cred.ID 计量)。
+func UserFromContext(ctx context.Context) (string, bool) {
+	name, ok := ctx.Value(ctxUserKey{}).(string)
+	return name, ok && name != ""
+}
+
 // User 是 NaiveProxy 服务端用户(名 + 密码,HTTP Basic 认证)。
 type User struct {
 	Name     string
@@ -83,10 +96,12 @@ func (h *Inbound) serve(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if !h.checkAuth(r.Header.Get("Proxy-Authorization")) {
+	name, ok := h.authUser(r.Header.Get("Proxy-Authorization"))
+	if !ok {
 		http.Error(w, "proxy auth required", http.StatusProxyAuthRequired) // 407
 		return
 	}
+	ctx = withUser(ctx, name) // 认证到的计费用户名挂 ctx,供 dispatch 计量回读
 	authority := r.URL.Host
 	if authority == "" {
 		authority = r.Host
@@ -110,6 +125,7 @@ func (h *Inbound) serve(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		w:       w,
 		flush:   flusher.Flush,
 		closeFn: r.Body.Close,
+		remote:  remoteAddr(r.RemoteAddr), // h2 server 设的真客户端地址 → max-ips 按真源计
 	}
 	if h.dispatch != nil { // 反连 portal:已握手流交隧道派发,不落地出站
 		_ = h.dispatch(ctx, st, dst, endpoint.NetworkTCP)
@@ -123,25 +139,28 @@ func (h *Inbound) serve(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	_ = relay.Relay(st, up) // 阻塞至收尾,保持 handler(H2 流)存活
 }
 
-// checkAuth 校验 "Basic base64(user:pass)":解出用户查表,常量时间比对密码。
-func (h *Inbound) checkAuth(header string) bool {
+// authUser 校验 "Basic base64(user:pass)":解出用户查表,常量时间比对密码;成功返回命中的用户名。
+func (h *Inbound) authUser(header string) (string, bool) {
 	const p = "Basic "
 	if !strings.HasPrefix(header, p) {
-		return false
+		return "", false
 	}
 	raw, err := base64.StdEncoding.DecodeString(header[len(p):])
 	if err != nil {
-		return false
+		return "", false
 	}
 	name, pass, ok := strings.Cut(string(raw), ":")
 	if !ok {
-		return false
+		return "", false
 	}
 	want, ok := h.users[name]
 	if !ok {
-		return false
+		return "", false
 	}
-	return subtle.ConstantTimeCompare([]byte(want), []byte(pass)) == 1
+	if subtle.ConstantTimeCompare([]byte(want), []byte(pass)) != 1 {
+		return "", false
+	}
+	return name, true
 }
 
 func toNTR(a metadata.Socksaddr) addr.Socksaddr {
