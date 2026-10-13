@@ -26,6 +26,7 @@ import (
 	_ "github.com/LOVECHEN/ntr/proto/trojan"
 	_ "github.com/LOVECHEN/ntr/proto/vless"
 	_ "github.com/LOVECHEN/ntr/proto/vmess"
+	_ "github.com/LOVECHEN/ntr/transport/domainsocket"
 	_ "github.com/LOVECHEN/ntr/transport/grpc"
 	_ "github.com/LOVECHEN/ntr/transport/h2"
 	_ "github.com/LOVECHEN/ntr/transport/httpupgrade"
