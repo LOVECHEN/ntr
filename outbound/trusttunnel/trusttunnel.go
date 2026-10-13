@@ -38,6 +38,7 @@ type Options struct {
 	SNI         string
 	Insecure    bool
 	Fingerprint string // uTLS 客户端指纹(chrome/firefox/safari/ios/edge/random;空=标准 crypto/tls)
+	QUIC        bool   // true = 走 HTTP/3(QUIC)而非 H2(同 mihomo 的 quic: true)
 }
 
 // Outbound 是 TrustTunnel 出站:惰性建一条 TLS+H2 连接,DialStream 在其上开一条 CONNECT 流;
@@ -50,6 +51,7 @@ type Outbound struct {
 	tr          *http2.Transport
 	mu          sync.Mutex
 	cc          *http2.ClientConn
+	h3          *h3Client // QUIC 模式(非 nil 时 CONNECT 走 HTTP/3)
 }
 
 // NewOutbound 构造 TrustTunnel 出站。
@@ -58,6 +60,15 @@ func NewOutbound(o Options) (*Outbound, error) {
 		return nil, errors.New("trusttunnel: server 为空")
 	}
 	auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(o.User+":"+o.Password))
+	if o.QUIC {
+		sni := o.SNI
+		if sni == "" {
+			if h, _, err := net.SplitHostPort(o.Server); err == nil {
+				sni = h
+			}
+		}
+		return &Outbound{server: o.Server, authHeader: auth, h3: newH3Client(o.Server, sni, o.Insecure)}, nil
+	}
 	return &Outbound{
 		server:      o.Server,
 		tlsConfig:   &cryptotls.Config{ServerName: o.SNI, InsecureSkipVerify: o.Insecure, NextProtos: []string{"h2"}, MinVersion: cryptotls.VersionTLS12},
@@ -78,6 +89,9 @@ func (o *Outbound) DialStream(ctx context.Context, dst addr.Socksaddr) (link.Str
 }
 
 func (o *Outbound) connect(ctx context.Context, authority, userAgent string) (link.Stream, error) {
+	if o.h3 != nil {
+		return o.h3.connect(ctx, authority, o.authHeader, userAgent)
+	}
 	cc, err := o.getConn(ctx)
 	if err != nil {
 		return nil, err
@@ -146,6 +160,10 @@ func (o *Outbound) getConn(ctx context.Context) (*http2.ClientConn, error) {
 }
 
 func (o *Outbound) reset(_ *http2.ClientConn) {
+	if o.h3 != nil { // QUIC 连接可能已断 / GOAWAY:下次重建
+		o.h3.reset()
+		return
+	}
 	o.mu.Lock()
 	if o.cc != nil && !o.cc.CanTakeNewRequest() {
 		o.cc = nil

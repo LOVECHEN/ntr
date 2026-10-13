@@ -6,14 +6,15 @@ import (
 	"github.com/LOVECHEN/ntr/core/endpoint"
 	"github.com/LOVECHEN/ntr/core/registry"
 	"github.com/LOVECHEN/ntr/core/spec"
+	"github.com/LOVECHEN/ntr/internal/selfcert"
 )
 
 // 会话式协议插件自注册(registry.RegisterSession):运行时按 type: trusttunnel 查表,本包自解字段。
 // 入站是 TLS+H2 over TCP,由运行时的 TCP 接入环托管监听(NewHandler 形态)。
 //
-// 出站字段:server / user / secret(或 password)/ sni / insecure / client-fingerprint。
+// 出站字段:server / user / secret(或 password)/ sni / insecure / client-fingerprint / quic(走 HTTP/3)。
 // 入站用户 = Basic 名 + 口令(顶层 users 写 keys.trusttunnel,Basic 名 = 计量 tag;口内 users 写 name/password);
-// 服务端 TLS 由运行时从 tls: 块加载。
+// 服务端 TLS 由运行时从 tls: 块加载;quic: true 时同端口另开 UDP 跑 HTTP/3。
 func init() {
 	registry.RegisterSession(registry.Session{
 		Name:            "trusttunnel",
@@ -35,6 +36,7 @@ func newOutboundFromNode(n *spec.Node) (endpoint.Outbound, error) {
 		SNI:         n.Get("sni").Str(),
 		Insecure:    n.Get("insecure").Bool(),
 		Fingerprint: n.Get("client-fingerprint").Str(),
+		QUIC:        n.Get("quic").Bool(),
 	})
 }
 
@@ -57,5 +59,16 @@ func newHandlerFromSession(in registry.SessionInbound) (endpoint.InboundHandler,
 	if err != nil {
 		return nil, err
 	}
-	return NewInbound(users, tlsConf, in.Out, in.Dispatch, in.PacketDispatch)
+	inb, err := NewInbound(users, tlsConf, in.Out, in.Dispatch, in.PacketDispatch)
+	if err != nil {
+		return nil, err
+	}
+	if in.Node.Get("quic").Bool() { // quic: true → 同端口另开 UDP 跑 HTTP/3(证书与 H2 同一张)
+		h3TLS, err := selfcert.Metacubex(in.TLSCert, in.TLSKey)
+		if err != nil {
+			return nil, err
+		}
+		inb.EnableH3(h3TLS)
+	}
+	return inb, nil
 }

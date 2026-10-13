@@ -3,8 +3,9 @@
 #   ① 基线:mem-guard limit 1gb 起 NTR,经 /memguard 读空载 RSS = B
 #   ②a soft:soft = B+4MB、hard 设 99%(够不着),经 socks 每 10ms 开一条空闲连接(每条约 30KB RSS)慢速爬升 ——
 #       断言 soft 拒新(soft_rejected>0、客户端在 600 条前被拒)、已建连接不动(无一被断)、hard_evicted=0
-#   ②b hard:soft = B+5MB、hard = B+5.5MB,600 条快速突发(一个采样周期内越过 hard)—— 断言 hard 踢最久空闲
-#       (hard_evicted>0,且客户端确实观察到已建连接被断开)
+#   ②b hard:soft = B+5MB、hard = B+5.5MB,600 条快速突发越过 hard —— 断言 hard 踢最久空闲(hard_evicted>0),
+#       且账目自洽:客户端观察到的断开总数 = soft_rejected + hard_evicted(每一次断开都由服务端某道防线计过数)。
+#       突发快慢因机器而异:快则几乎全建成后被踢(本地 0+600),慢则先进 soft 拒掉大半、余下越过 hard 被踢(CI 551+49)。
 #   两道防线分开验:soft 一旦拒新 RSS 就不再涨、到不了 hard,同一负载无法兼测。
 #   ③ 反向对照:同样负载、limit 1gb → 600 条全开、soft_rejected=hard_evicted=0(证明拒/踢源于 mem-guard)
 # 专属隔离:network=ixmg 容器前缀=ixmg-
@@ -84,9 +85,10 @@ cfg _mg_h.yaml 256mb $(pct 5) $(pct 5.5); run ${PFX}h _mg_h.yaml; sleep 3
 OUT=$(open ${PFX}h 8 0)
 S=$(mg ${PFX}h); HE=$(field "$S" hard_evicted)
 SR=$(field "$S" soft_rejected); EARLY=$(echo "$OUT" | sed -n 's/.* early \([0-9]*\)/\1/p'); LATE=$(echo "$OUT" | sed -n 's/^late \([0-9]*\)/\1/p')
-CLOSED=$(( ${EARLY:-0} + ${LATE:-0} ))
+REJAT=$(echo "$OUT" | sed -n 's/.* rejected_at \(-*[0-9]*\).*/\1/p')
+CLOSED=$(( ${EARLY:-0} + ${LATE:-0} + ( ${REJAT:--1} >= 0 ? 1 : 0 ) )) # 打开器在握手后即探到被拒时,那条未入列表、另计
 echo "  hard 受测:$(echo "$OUT"|tr '\n' ' ')· memguard=$S"
-[ "${HE:-0}" -gt 0 ] && [ $CLOSED -gt 0 ] && [ "${SR:-1}" = 0 ] && echo "  ✅ hard 踢空闲:hard_evicted=$HE,客户端观察到 $CLOSED 条已建连接被断(突发全数建成,无准入拒绝)" || echo "  ❌ hard 未踢空闲(hard_evicted=${HE:-?} closed=$CLOSED soft_rejected=${SR:-?})"
+[ "${HE:-0}" -gt 0 ] && [ $CLOSED -eq $(( ${SR:-0} + ${HE:-0} )) ] && echo "  ✅ hard 踢空闲:hard_evicted=$HE;客户端观察到断开 $CLOSED = soft 拒绝 ${SR:-0} + hard 踢出 $HE(账目自洽)" || echo "  ❌ hard 未踢空闲或账目不符(hard_evicted=${HE:-?} closed=$CLOSED soft_rejected=${SR:-?})"
 docker rm -f ${PFX}h >/dev/null 2>&1
 
 # ③ 反向对照

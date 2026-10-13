@@ -6,10 +6,12 @@ import (
 	cryptotls "crypto/tls"
 	"encoding/base64"
 	"errors"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 
+	mtls "github.com/metacubex/tls"
 	"github.com/sagernet/sing/common/metadata"
 
 	"golang.org/x/net/http2"
@@ -51,6 +53,7 @@ type Inbound struct {
 	out       endpoint.Outbound
 	dispatch  endpoint.StreamDispatch
 	packet    endpoint.PacketDispatch
+	h3TLS     *mtls.Config // 非 nil = 同端口另开 UDP 跑 H3(见 h3.go)
 }
 
 // NewInbound 构造 TrustTunnel 入站(服务端证书 + Basic 用户 + 绑定出站)。
@@ -87,50 +90,80 @@ func (h *Inbound) HandlePacket(context.Context, link.PacketConn, *endpoint.Metad
 	return errors.New("trusttunnel: packet inbound not supported")
 }
 
-// serve 处理一条 H2 请求:必须是 CONNECT + Basic 认证通过;_check 心跳回 200;_udp2 交 PacketDispatch;_icmp 暂拒;
-// 其余按 :authority 目标建流路由。handler 阻塞至 relay 收尾(保持 H2 流存活)。
+// tunnelReq 是一条 CONNECT 请求的协议无关视图(H2 / H3 各自适配),让 handle 只写一份 TrustTunnel 语义。
+type tunnelReq struct {
+	method, host, auth string
+	remote             net.Addr
+	reject             func(code int, msg string)  // 拒绝(不进隧道)
+	accept             func() (link.Stream, error) // 回 200 并交出双向流
+}
+
+// serve 把一条 H2 请求适配成 tunnelReq。handler 阻塞至隧道收尾(保持 H2 流存活)。
 func (h *Inbound) serve(ctx context.Context, w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodConnect {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	host := r.Host
+	if host == "" {
+		host = r.URL.Host
+	}
+	remote := remoteAddr(r.RemoteAddr) // h2 server 设的真客户端地址 → max-ips 按真源计
+	h.handle(ctx, tunnelReq{
+		method: r.Method,
+		host:   host,
+		auth:   r.Header.Get("proxy-authorization"),
+		remote: remote,
+		reject: func(code int, msg string) { http.Error(w, msg, code) },
+		accept: func() (link.Stream, error) {
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				http.Error(w, "no flush", http.StatusInternalServerError)
+				return nil, errors.New("trusttunnel: h2 无 Flusher")
+			}
+			w.WriteHeader(http.StatusOK)
+			flusher.Flush()
+			return &h2Stream{r: r.Body, w: serverWriteFlusher{w: w, f: flusher}, closeFn: r.Body.Close, remote: remote}, nil
+		},
+	})
+}
+
+// handle 是 TrustTunnel 服务端语义:必须 CONNECT + Basic 认证通过;_check 心跳回 200;_udp2 交 PacketDispatch;
+// _icmp 暂拒;其余按 :authority 目标建流路由(计量 / 反连 portal 经 dispatch)。
+func (h *Inbound) handle(ctx context.Context, q tunnelReq) {
+	if q.method != http.MethodConnect {
+		q.reject(http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	name, ok := h.authUser(r.Header.Get("proxy-authorization"))
+	name, ok := h.authUser(q.auth)
 	if !ok {
-		http.Error(w, "proxy auth required", http.StatusProxyAuthRequired) // 407
+		q.reject(http.StatusProxyAuthRequired, "proxy auth required") // 407
 		return
 	}
 	ctx = withUser(ctx, name) // 认证到的计费用户名挂 ctx,供 dispatch 计量回读
-	authority := r.Host
-	if authority == "" {
-		authority = r.URL.Host
-	}
-	switch authority {
+	switch q.host {
 	case "_check": // 健康检查心跳
-		w.WriteHeader(http.StatusOK)
+		if st, err := q.accept(); err == nil {
+			_ = st.Close()
+		}
 		return
 	case udpMagic:
-		h.serveUDP(ctx, w, r)
+		if h.packet == nil {
+			q.reject(http.StatusNotImplemented, "udp not enabled")
+			return
+		}
+		st, err := q.accept()
+		if err != nil {
+			return
+		}
+		_ = h.packet(ctx, newFrameConn(st, false, q.remote)) // 运行时准入计量 + 按包目标路由;portal 口桥进隧道
 		return
 	case "_icmp":
-		http.Error(w, "icmp not implemented", http.StatusNotImplemented)
+		q.reject(http.StatusNotImplemented, "icmp not implemented")
 		return
 	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "no flush", http.StatusInternalServerError)
+	st, err := q.accept()
+	if err != nil {
 		return
 	}
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	dst := toNTR(metadata.ParseSocksaddr(authority))
-	st := &h2Stream{
-		r:       r.Body,
-		w:       serverWriteFlusher{w: w, f: flusher},
-		closeFn: r.Body.Close,
-		remote:  remoteAddr(r.RemoteAddr), // h2 server 设的真客户端地址 → max-ips 按真源计
-	}
-	if h.dispatch != nil { // 反连 portal:已握手流交隧道派发,不落地出站
+	dst := toNTR(metadata.ParseSocksaddr(q.host))
+	if h.dispatch != nil { // 计量 / 反连 portal:已握手流交 dispatch
 		_ = h.dispatch(ctx, st, dst, endpoint.NetworkTCP)
 		return
 	}
@@ -139,21 +172,7 @@ func (h *Inbound) serve(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		_ = st.Close()
 		return
 	}
-	_ = relay.Relay(st, up) // 阻塞至收尾,保持 handler(H2 流)存活
-}
-
-// serveUDP 处理 _udp2:回 200 后把流上的长度前缀帧包成多目标 link.PacketConn 交 PacketDispatch
-// (运行时准入计量 + 按包目标路由;portal 口桥进隧道)。handler 阻塞至会话结束(保持 H2 流存活)。
-func (h *Inbound) serveUDP(ctx context.Context, w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if h.packet == nil || !ok {
-		http.Error(w, "udp not enabled", http.StatusNotImplemented)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-	st := &h2Stream{r: r.Body, w: serverWriteFlusher{w: w, f: flusher}, closeFn: r.Body.Close, remote: remoteAddr(r.RemoteAddr)}
-	_ = h.packet(ctx, newFrameConn(st, false, remoteAddr(r.RemoteAddr)))
+	_ = relay.Relay(st, up) // 阻塞至收尾,保持 handler(流)存活
 }
 
 // authUser 校验 "Basic base64(user:pass)":解出用户查表,常量时间比对密码;成功返回命中的用户名。
