@@ -5,6 +5,7 @@ package manifest
 
 import (
 	_ "github.com/LOVECHEN/ntr/outbound/anytls"      // 会话式协议插件(registry.RegisterSession)
+	_ "github.com/LOVECHEN/ntr/outbound/hysteria1"   // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/hysteria2"   // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/juicity"     // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/naive"       // 会话式协议插件

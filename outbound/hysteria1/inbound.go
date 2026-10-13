@@ -14,6 +14,7 @@ import (
 	"github.com/LOVECHEN/ntr/core/endpoint"
 	"github.com/LOVECHEN/ntr/core/link"
 	"github.com/LOVECHEN/ntr/core/relay"
+	"github.com/LOVECHEN/ntr/internal/sagerudp"
 )
 
 // User 是 Hysteria v1 服务端用户(名 + 密码;Name 用作 sing 库内 tag,顶层 users 场景 = BillID)。
@@ -34,8 +35,9 @@ type Inbound struct {
 
 // NewInbound 构造 Hysteria v1 入站(服务端 TLS + 用户 + salamander 混淆 + 绑定出站)。admit 非 nil 时每条
 // 已握手流先过接入(闸+计量+mem-guard),拿计量流后再回协议握手信令 relay(承世界 C;不代管 relay 因 hy1
-// 落地前必须 ReportConnHandshakeSuccess)。
-func NewInbound(users []User, obfs string, upMbps, downMbps uint64, tlsConfig *cryptotls.Config, out endpoint.Outbound, dispatch endpoint.StreamDispatch, admit endpoint.AdmitHook) (*Inbound, error) {
+// 落地前必须 ReportConnHandshakeSuccess);admit 为 nil 而 dispatch 非 nil = 反连 portal(流改派进隧道)。
+// packet 接手客户端 UDP 会话;nil = 拒 UDP。
+func NewInbound(users []User, obfs string, upMbps, downMbps uint64, tlsConfig *cryptotls.Config, out endpoint.Outbound, dispatch endpoint.StreamDispatch, admit endpoint.AdmitHook, packet endpoint.PacketDispatch) (*Inbound, error) {
 	tlsConfig.NextProtos = []string{"hysteria"}
 	up, down := upMbps, downMbps
 	if up == 0 {
@@ -51,7 +53,7 @@ func NewInbound(users []User, obfs string, upMbps, downMbps uint64, tlsConfig *c
 		ReceiveBPS:    mbpsToBPS(up),
 		XPlusPassword: obfs,
 		TLSConfig:     &serverTLS{config: tlsConfig},
-		Handler:       &routeHandler{out: out, dispatch: dispatch, admit: admit},
+		Handler:       &routeHandler{out: out, dispatch: dispatch, admit: admit, packet: packet},
 	})
 	if err != nil {
 		return nil, err
@@ -95,11 +97,22 @@ type routeHandler struct {
 	out      endpoint.Outbound
 	dispatch endpoint.StreamDispatch
 	admit    endpoint.AdmitHook
+	packet   endpoint.PacketDispatch
 }
 
 func (h *routeHandler) NewConnectionEx(ctx context.Context, conn net.Conn, _, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	dst := toNTR(destination)
-	if h.dispatch != nil { // 反连 portal:已握手流交隧道派发,不落地出站
+	if h.admit == nil && h.dispatch != nil { // 反连 portal:已握手流交隧道派发,不落地出站
+		// 原生 hy1 客户端(apernet/mihomo)发完请求后阻塞读 ServerResponse 才发载荷;portal 的落地在 Bridge 侧,
+		// 本机无从先知拨号结果,故先回 OK 再改派 —— 否则 serverConn 的懒应答要等首次下行写,对「客户端先说话」
+		// 的协议(HTTP)互等死锁。
+		if hErr := N.ReportConnHandshakeSuccess(conn, nil); hErr != nil {
+			_ = conn.Close()
+			if onClose != nil {
+				onClose(hErr)
+			}
+			return
+		}
 		err := h.dispatch(ctx, connStream{conn}, dst, endpoint.NetworkTCP)
 		if onClose != nil {
 			onClose(err)
@@ -152,9 +165,17 @@ func (h *routeHandler) NewConnectionEx(ctx context.Context, conn net.Conn, _, de
 	}
 }
 
-func (h *routeHandler) NewPacketConnectionEx(_ context.Context, conn N.PacketConn, _, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
-	_ = conn.Close()
+// NewPacketConnectionEx:客户端 UDP 会话(库已回 ServerResponse{UDPSessionID})交运行时 PacketDispatch
+// (ctx 带库写入的鉴权用户,据此计量)。拒绝时必须关 conn(库侧 go 调本回调、不兜底 Close)。
+func (h *routeHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
+	var err error
+	if h.packet == nil {
+		_ = conn.Close()
+		err = errUDPNotReady
+	} else {
+		err = h.packet(ctx, sagerudp.New(sagerudp.UnwrapTimeout(conn), sagerudp.SourceAddr(source)))
+	}
 	if onClose != nil {
-		onClose(errUDPNotReady)
+		onClose(err)
 	}
 }

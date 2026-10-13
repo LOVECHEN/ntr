@@ -48,7 +48,6 @@ import (
 	"github.com/LOVECHEN/ntr/outbound/direct"
 	dnsout "github.com/LOVECHEN/ntr/outbound/dns"
 	"github.com/LOVECHEN/ntr/outbound/group"
-	"github.com/LOVECHEN/ntr/outbound/hysteria1"
 	"github.com/LOVECHEN/ntr/outbound/hysteria2"
 	"github.com/LOVECHEN/ntr/outbound/masque"
 	"github.com/LOVECHEN/ntr/outbound/mieru"
@@ -394,7 +393,6 @@ func (o Outbound) synthLayers() ([]service.LayerSpec, error) {
 // 登记后 Desugar 会为其口产 CredBinding,build 分支据 binding 建库内多用户 + 计量 dispatch。
 // ★只登记真正接完线的协议(诚实纪律:未接的留空 → 其顶层 users 不生效,别假装)。
 var sessionAuthProtos = map[string]bool{
-	"hysteria1":  true,
 	"mieru":      true,
 	"shadowquic": true,
 	"masque":     true,
@@ -423,11 +421,6 @@ func (in Inbound) isPortal() bool {
 	m, _ := in.Extra["mode"].(string)
 	return m == "portal"
 }
-
-// obfsPassword 读 hysteria1/hysteria2 的 salamander 混淆口令(标量 obfs:)。与 simple-obfs 传输层块
-// (obfs: 映射)同键但值形状不重叠:会话式协议读标量、simple-obfs 的 map 走 synthStack 成层。
-func (in Inbound) obfsPassword() string { s, _ := in.Extra["obfs"].(string); return s }
-func (o Outbound) obfsPassword() string { s, _ := o.Extra["obfs"].(string); return s }
 
 // portalControl 反连 portal 的注册域:空则回落默认 reverse.ntr(须与 Bridge 一致)。
 func portalControl(cd string) string {
@@ -1057,12 +1050,6 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			} else {
 				outs[o.Name] = up
 			}
-		case "hysteria1":
-			up, err := hysteria1.NewOutbound(hysteria1.Options{Server: o.Server, Password: o.Secret, Obfs: o.obfsPassword(), SNI: o.SNI, Insecure: o.Insecure})
-			if err != nil {
-				return nil, fmt.Errorf("config: 出站 %q(hysteria1):%w", o.Name, err)
-			}
-			outs[o.Name] = up
 		case "shadowquic":
 			up, err := shadowquic.NewOutbound(shadowquic.Options{Server: o.Server, Username: o.User, Password: o.Secret, SNI: o.SNI})
 			if err != nil {
@@ -1267,14 +1254,6 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			default:
 				handler = h
 			}
-		case "hysteria1":
-			inb, err := f.buildHy1Inbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
-			if err != nil {
-				return nil, fmt.Errorf("config: 入站 %s(hysteria1):%w", in.Listen, err)
-			}
-			listen := in.Listen
-			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
-			continue
 		case "shadowquic":
 			inb, err := f.buildShadowquicInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
 			if err != nil {
@@ -2025,49 +2004,6 @@ func (f *File) buildMasqueInbound(in Inbound, out endpoint.Outbound, binds []pri
 	return masque.NewInbound(users, tlsConfig, out, dispatch)
 }
 
-// buildHy1Inbound 建 Hysteria v1 会话入站。顶层 users(binds 非空):tag=BillID 喂库内多用户,命中后
-// hysteria1.UserFromContext 回读 → cred.ID;因 hy1 落地前须回 ReportConnHandshakeSuccess,用 AdmitHook
-// (接入+计量但不代管 relay)而非 SessionDispatch。无 binds 退回口内 in.Users 垫片(身份 Ambient,闸/mem-guard 仍生效)。
-func (f *File) buildHy1Inbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (*hysteria1.Inbound, error) {
-	tlsConfig, err := anytls.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
-	if err != nil {
-		return nil, err
-	}
-	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
-	if err != nil {
-		return nil, err
-	}
-	var users []hysteria1.User
-	var refs map[string]cred.ID
-	if len(binds) > 0 {
-		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
-		if err != nil {
-			return nil, err
-		}
-		refs = r
-		for _, su := range sus {
-			users = append(users, hysteria1.User{Name: su.Tag, Password: su.Secret})
-		}
-	} else {
-		for _, u := range in.Users {
-			pw, _ := u["password"].(string)
-			if pw == "" {
-				continue
-			}
-			name, _ := u["name"].(string)
-			users = append(users, hysteria1.User{Name: name, Password: pw})
-		}
-	}
-	if len(users) == 0 {
-		return nil, fmt.Errorf("hysteria1 入站需至少一个用户(顶层 users.keys.hysteria1 或口内 user{password})")
-	}
-	var admit endpoint.AdmitHook
-	if !in.isPortal() { // 反连 portal 口不计量(隧道载体),与 hy2/anytls 一致
-		admit = service.SessionAdmit(adm, refs, hysteria1.UserFromContext)
-	}
-	return hysteria1.NewInbound(users, in.obfsPassword(), 0, 0, tlsConfig, out, sessionPortalDispatch(in), admit)
-}
-
 // sessionUser 是会话式口从顶层 users 脱糖出的一个库内用户(Tag=BillID 供 ctx 回读映射)。标量协议用
 // Secret(该层原始密钥);复合键协议(tuic/ssh…)用 Fields(具名字段 uuid/password/…)。二者互斥。
 type sessionUser struct {
@@ -2157,18 +2093,29 @@ func (f *File) sessionPluginEnv(sp registry.Session, in Inbound, out endpoint.Ou
 	if err != nil {
 		return registry.SessionInbound{}, err
 	}
-	return registry.SessionInbound{
-		Node:           node,
-		TLSNode:        tlsNode,
-		TLSCert:        tlsCert,
-		TLSKey:         tlsKey,
-		ServerTLS:      func() (*cryptotls.Config, error) { return anytls.ServerTLSConfig(tlsCert, tlsKey) },
-		Users:          users,
-		Out:            out,
-		Dispatch:       f.sessionDispatch(in, out, adm, refs, sp.UserFromContext),
-		Admit:          service.SessionAdmit(adm, refs, sp.UserFromContext),
-		PacketDispatch: service.SessionPacketDispatch(out, adm, refs, sp.UserFromContext),
-	}, nil
+	env := registry.SessionInbound{
+		Node:      node,
+		TLSNode:   tlsNode,
+		TLSCert:   tlsCert,
+		TLSKey:    tlsKey,
+		ServerTLS: func() (*cryptotls.Config, error) { return anytls.ServerTLSConfig(tlsCert, tlsKey) },
+		Users:     users,
+		Out:       out,
+	}
+	if in.isPortal() {
+		// 反连 portal:TCP 流与 UDP 会话都改派进隧道(共用同一个 Portal 的 Bridge 池,Bridge 侧落地);
+		// 隧道载体不计量(与流式 portal 一致)。Admit 留 nil —— portal 流不得自管 relay 在本机落地。
+		p := &reverse.Portal{Control: portalControl(in.ControlDomain)}
+		env.Dispatch = func(ctx context.Context, s link.Stream, dst addr.Socksaddr, network endpoint.Network) error {
+			return p.Dispatch(ctx, s, dst, network, nil)
+		}
+		env.PacketDispatch = p.DispatchPacket
+		return env, nil
+	}
+	env.Dispatch = service.SessionDispatch(out, adm, refs, sp.UserFromContext)
+	env.Admit = service.SessionAdmit(adm, refs, sp.UserFromContext)
+	env.PacketDispatch = service.SessionPacketDispatch(out, adm, refs, sp.UserFromContext)
+	return env, nil
 }
 
 // buildSessionPluginInbound 建自管监听形态的会话式插件入站(Runner)。

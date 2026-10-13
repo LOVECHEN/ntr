@@ -13,6 +13,7 @@ import (
 
 	"github.com/LOVECHEN/ntr/core/endpoint"
 	"github.com/LOVECHEN/ntr/core/relay"
+	"github.com/LOVECHEN/ntr/internal/sagerudp"
 )
 
 // User 是 TUIC 服务端用户(库内 tag Name + UUID + 密码;复合键 = UUID+Password)。Name 用作 sing 库内
@@ -32,14 +33,15 @@ type Inbound struct {
 	service *stuic.Service[string]
 }
 
-// NewInbound 构造 TUIC 入站(服务端 TLS + 用户 + 绑定出站)。
-func NewInbound(users []User, tlsConfig *cryptotls.Config, out endpoint.Outbound, dispatch endpoint.StreamDispatch) (*Inbound, error) {
+// NewInbound 构造 TUIC 入站(服务端 TLS + 用户 + 绑定出站)。packet 接手客户端 UDP 会话(native / quic
+// 两种中继模式由库按客户端选择处理);nil = 拒 UDP。
+func NewInbound(users []User, tlsConfig *cryptotls.Config, out endpoint.Outbound, dispatch endpoint.StreamDispatch, packet endpoint.PacketDispatch) (*Inbound, error) {
 	tlsConfig.NextProtos = []string{"h3"}
 	svc, err := stuic.NewService[string](stuic.ServiceOptions{
 		Context:           context.Background(),
 		Logger:            logger.NOP(),
 		TLSConfig:         &serverTLS{config: tlsConfig},
-		Handler:           &routeHandler{out: out, dispatch: dispatch},
+		Handler:           &routeHandler{out: out, dispatch: dispatch, packet: packet},
 		CongestionControl: "bbr",
 	})
 	if err != nil {
@@ -93,6 +95,7 @@ func (h *Inbound) Serve(ctx context.Context, pc net.PacketConn) error {
 type routeHandler struct {
 	out      endpoint.Outbound
 	dispatch endpoint.StreamDispatch
+	packet   endpoint.PacketDispatch
 }
 
 func (h *routeHandler) NewConnectionEx(ctx context.Context, conn net.Conn, _, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
@@ -118,9 +121,17 @@ func (h *routeHandler) NewConnectionEx(ctx context.Context, conn net.Conn, _, de
 	}
 }
 
-func (h *routeHandler) NewPacketConnectionEx(_ context.Context, conn N.PacketConn, _, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
-	_ = conn.Close()
+// NewPacketConnectionEx:客户端 UDP 会话交运行时 PacketDispatch(ctx 带库写入的鉴权用户,据此计量)。
+// 拒绝时必须关 conn(库侧 go 调本回调、不兜底 Close,不关则会话滞留 udpConnMap)。
+func (h *routeHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
+	var err error
+	if h.packet == nil {
+		_ = conn.Close()
+		err = errUDPNotReady
+	} else {
+		err = h.packet(ctx, sagerudp.New(sagerudp.UnwrapTimeout(conn), sagerudp.SourceAddr(source)))
+	}
 	if onClose != nil {
-		onClose(errUDPNotReady)
+		onClose(err)
 	}
 }

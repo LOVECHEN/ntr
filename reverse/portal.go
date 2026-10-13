@@ -144,6 +144,18 @@ func (p *Portal) TunnelCount() int { return p.pool.size() }
 // relayUDP 把用户侧多目标 PacketConn(user)⇄ 反连隧道的 mux PacketConn(mux)双向搬:
 // 上行按 dst 经 mux 开/复用 UDP 子流送到 Bridge 落地;下行 mux 回程按子流 target 还原 src
 // 写回用户。任一端出错即收尾关两端。
+// DispatchPacket 把会话式入站解出的用户侧多目标数据报连接(hy2/tuic/juicity 的 UDP 会话)桥进反连隧道
+// (一条 mux UDP 子流,Bridge 侧按包目标落地)—— 与 Dispatch 的 UDP 分支同一路径,只是用户侧本身就是
+// PacketConn、无承载流。无可用 Bridge 返回 ErrNoBridge。返回时 pc 已关。
+func (p *Portal) DispatchPacket(_ context.Context, pc link.PacketConn) error {
+	w := p.pool.pick()
+	if w == nil {
+		_ = pc.Close()
+		return ErrNoBridge
+	}
+	return relayUDP(pc, w.NewPacketConn())
+}
+
 func relayUDP(user link.PacketConn, mux net.PacketConn) error {
 	defer user.Close()
 	defer mux.Close()

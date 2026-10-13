@@ -23,11 +23,12 @@ import (
 	"github.com/LOVECHEN/ntr/addr"
 	"github.com/LOVECHEN/ntr/core/endpoint"
 	"github.com/LOVECHEN/ntr/core/link"
+	"github.com/LOVECHEN/ntr/internal/sagerudp"
 )
 
 var _ endpoint.Outbound = (*Outbound)(nil)
 
-var errUDPNotReady = errors.New("tuic: UDP over QUIC not implemented yet")
+var errUDPNotReady = errors.New("tuic: 本端未启用 UDP")
 
 // Options 是 TUIC 出站配置(auth = UUID + Password)。
 type Options struct {
@@ -37,6 +38,7 @@ type Options struct {
 	SNI               string
 	Insecure          bool
 	CongestionControl string // bbr(默认)/ cubic / new_reno
+	UDPRelayMode      string // native(默认,QUIC datagram)/ quic(每包一条单向流,无损)
 }
 
 // Outbound 是 TUIC 出站。
@@ -63,6 +65,7 @@ func NewOutbound(o Options) (*Outbound, error) {
 		Password:          o.Password,
 		CongestionControl: cc,
 		Heartbeat:         10 * time.Second,
+		UDPStream:         o.UDPRelayMode == "quic",
 	})
 	if err != nil {
 		return nil, err
@@ -79,9 +82,19 @@ func (o *Outbound) DialStream(ctx context.Context, dst addr.Socksaddr) (link.Str
 	return connStream{conn}, nil
 }
 
-// DialPacket:TUIC UDP over QUIC 待接入。
-func (o *Outbound) DialPacket(context.Context, addr.Socksaddr) (link.PacketConn, error) {
-	return nil, errUDPNotReady
+// DialPacket 在 TUIC QUIC 连接上开一个 UDP 会话(assocID;每包自带目标,可多目标)。dst 仅作首包目标提示,
+// 不绑定 —— 返回的连接按 WritePacket 的 dst 逐包投递。
+func (o *Outbound) DialPacket(ctx context.Context, _ addr.Socksaddr) (link.PacketConn, error) {
+	pc, err := o.client.ListenPacket(ctx)
+	if err != nil {
+		return nil, err
+	}
+	spc, ok := pc.(N.PacketConn)
+	if !ok {
+		_ = pc.Close()
+		return nil, errUDPNotReady
+	}
+	return sagerudp.New(spc, nil), nil
 }
 
 func parseUUID(s string) ([16]byte, error) {

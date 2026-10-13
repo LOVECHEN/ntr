@@ -43,8 +43,10 @@ type SessionInbound struct {
 	// Dispatch 处理已握手的 TCP 流(准入 + 计量 + relay;反连 portal 时改派隧道)。
 	Dispatch endpoint.StreamDispatch
 	// Admit 对需要协议自管 relay 的流(如落地前须回协议信令的流)做准入 + 计量,不代管 relay。
+	// 反连 portal 口为 nil:portal 流必须经 Dispatch 改派进隧道,不得在本机落地。
 	Admit endpoint.AdmitHook
-	// PacketDispatch 接手客户端侧多目标数据报连接(准入 + 计量 + 按包目标拆分路由;身份同 Dispatch 从 ctx 回读)。
+	// PacketDispatch 接手客户端侧多目标数据报连接(准入 + 计量 + 按包目标拆分路由;身份同 Dispatch 从 ctx 回读;
+	// 反连 portal 口则整条会话桥进隧道,Bridge 侧落地)。
 	PacketDispatch endpoint.PacketDispatch
 }
 

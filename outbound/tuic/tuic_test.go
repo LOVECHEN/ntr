@@ -36,7 +36,7 @@ func TestTuicRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inb, err := NewInbound([]User{{UUID: testUUID, Password: "pw"}}, tlsConfig, direct.Outbound{}, nil)
+	inb, err := NewInbound([]User{{UUID: testUUID, Password: "pw"}}, tlsConfig, direct.Outbound{}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

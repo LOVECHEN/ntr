@@ -210,3 +210,32 @@ outbounds:
 		t.Fatal("handler 形态插件未成为 Instance.Handler(应交运行时 TCP 接入环托管)")
 	}
 }
+
+// 反连 portal 口:运行时不给 Admit(portal 流不得在本机自管 relay 落地),Dispatch / PacketDispatch 都改派进隧道。
+func TestSessionPluginPortalMode(t *testing.T) {
+	capturedIn = nil
+	buildYAML(t, `
+inbounds:
+  - name: fs-portal
+    type: fakesess
+    mode: portal
+    control-domain: reverse.test
+    listen: 127.0.0.1:0
+    users:
+      - name: dave
+        password: pw-d
+outbounds:
+  - name: direct
+    type: direct
+`)
+	if len(capturedIn) != 1 {
+		t.Fatalf("插件 NewInbound 调用 %d 次,期望 1", len(capturedIn))
+	}
+	in := capturedIn[0]
+	if in.Admit != nil {
+		t.Fatal("portal 口不应给 Admit(流须改派进隧道)")
+	}
+	if in.Dispatch == nil || in.PacketDispatch == nil {
+		t.Fatalf("portal 口须给 Dispatch/PacketDispatch: Dispatch=%v PacketDispatch=%v", in.Dispatch != nil, in.PacketDispatch != nil)
+	}
+}

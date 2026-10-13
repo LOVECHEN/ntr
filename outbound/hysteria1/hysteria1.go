@@ -21,11 +21,12 @@ import (
 	"github.com/LOVECHEN/ntr/addr"
 	"github.com/LOVECHEN/ntr/core/endpoint"
 	"github.com/LOVECHEN/ntr/core/link"
+	"github.com/LOVECHEN/ntr/internal/sagerudp"
 )
 
 var _ endpoint.Outbound = (*Outbound)(nil)
 
-var errUDPNotReady = errors.New("hysteria1: UDP over QUIC not implemented yet")
+var errUDPNotReady = errors.New("hysteria1: 本端未启用 UDP")
 
 // defaultMbps 是缺省上下行带宽(Brutal 拥塞控制需要一个值;仅影响限速,不影响互通)。
 const defaultMbps = 100
@@ -83,9 +84,19 @@ func (o *Outbound) DialStream(ctx context.Context, dst addr.Socksaddr) (link.Str
 	return connStream{conn}, nil
 }
 
-// DialPacket:Hysteria UDP over QUIC 待接入。
-func (o *Outbound) DialPacket(context.Context, addr.Socksaddr) (link.PacketConn, error) {
-	return nil, errUDPNotReady
+// DialPacket 在 Hysteria QUIC 连接上开一个 UDP 会话(请求流换 UDPSessionID,数据走 QUIC datagram;每包
+// 自带目标,可多目标)。dst 填进会话请求(协议要求),不绑定 —— 返回的连接按 WritePacket 的 dst 逐包投递。
+func (o *Outbound) DialPacket(ctx context.Context, dst addr.Socksaddr) (link.PacketConn, error) {
+	pc, err := o.client.ListenPacket(ctx, toSing(dst))
+	if err != nil {
+		return nil, err
+	}
+	spc, ok := pc.(N.PacketConn)
+	if !ok {
+		_ = pc.Close()
+		return nil, errUDPNotReady
+	}
+	return sagerudp.New(spc, nil), nil
 }
 
 func toSing(a addr.Socksaddr) M.Socksaddr {

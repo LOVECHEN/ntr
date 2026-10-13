@@ -11,7 +11,7 @@ import (
 
 // 会话式协议插件自注册(registry.RegisterSession):运行时按 type: tuic 查表,本包自解字段。
 //
-// 出站字段:server / uuid / secret(或 password)/ sni / insecure / congestion-control。
+// 出站字段:server / uuid / secret(或 password)/ sni / insecure / congestion-control / udp-relay-mode(native|quic)。
 // 入站用户 = 复合键 uuid + password(顶层 users 写 keys.tuic 的 uuid/password,口内 users 同名字段);
 // 服务端 TLS 由运行时从 tls: 块加载(未配则临时自签)。
 func init() {
@@ -35,6 +35,7 @@ func newOutboundFromNode(n *spec.Node) (endpoint.Outbound, error) {
 		SNI:               n.Get("sni").Str(),
 		Insecure:          n.Get("insecure").Bool(),
 		CongestionControl: n.Get("congestion-control").Str(),
+		UDPRelayMode:      n.Get("udp-relay-mode").Str(),
 	})
 }
 
@@ -58,5 +59,5 @@ func newInboundFromSession(in registry.SessionInbound) (registry.Runner, error) 
 	if err != nil {
 		return nil, err
 	}
-	return NewInbound(users, tlsConf, in.Out, in.Dispatch)
+	return NewInbound(users, tlsConf, in.Out, in.Dispatch, in.PacketDispatch)
 }
