@@ -20,3 +20,19 @@ type User struct {
 // Disable/KillIP 时强杀本隧道。user 为空 = 未鉴权(计量落 Ambient)。ok=false = 接入被拒(闸满/内存档),
 // 调用方应关流。hook 为 nil = 不计量不设闸(纯开放隧道)。
 type MeterHook func(ctx context.Context, user string, src net.Addr, closer io.Closer) (addUp, addDown func(int), release func(), ok bool)
+
+type ctxUserKey struct{}
+
+// withUser 把 Basic 认证到的计费用户名挂进 ctx(运行时的隧道接入据此回读身份;空 = 未鉴权 → Ambient)。
+func withUser(ctx context.Context, name string) context.Context {
+	if name == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxUserKey{}, name)
+}
+
+// UserFromContext 读认证命中的计费用户名(供运行时 TunnelAdmit 回读 → cred.ID 计量)。
+func UserFromContext(ctx context.Context) (string, bool) {
+	name, ok := ctx.Value(ctxUserKey{}).(string)
+	return name, ok && name != ""
+}

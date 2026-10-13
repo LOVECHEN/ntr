@@ -48,6 +48,9 @@ type SessionInbound struct {
 	// PacketDispatch 接手客户端侧多目标数据报连接(准入 + 计量 + 按包目标拆分路由;身份同 Dispatch 从 ctx 回读;
 	// 反连 portal 口则整条会话桥进隧道,Bridge 侧落地)。
 	PacketDispatch endpoint.PacketDispatch
+	// AdmitTunnel 供整包 L3 隧道(不按目标建流)在建隧道时一次接入 + 按字节记账。反连 portal 口为 nil
+	// (L3 隧道无法逐流改派进反连隧道)。
+	AdmitTunnel endpoint.TunnelAdmit
 }
 
 // Runner 是自管监听的会话式入站:绑定 listen 并服务,阻塞至 ctx 取消。

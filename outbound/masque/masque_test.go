@@ -11,6 +11,7 @@ import (
 	"github.com/LOVECHEN/ntr/addr"
 	"github.com/LOVECHEN/ntr/buf"
 	"github.com/LOVECHEN/ntr/outbound/direct"
+	"github.com/LOVECHEN/ntr/service"
 	"github.com/LOVECHEN/ntr/outbound/hysteria2"
 )
 
@@ -120,7 +121,7 @@ func TestMasqueRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inb, err := NewInbound(nil, tlsConfig, direct.Outbound{}, nil)
+	inb, err := NewInbound(nil, tlsConfig, direct.Outbound{}, nil, service.SessionPacketDispatch(direct.Outbound{}, nil, nil, nil))
 	if err != nil {
 		t.Fatal(err)
 	}

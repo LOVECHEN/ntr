@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/netip"
 
@@ -127,6 +128,25 @@ func SessionPacketDispatch(out endpoint.Outbound, adm *Admitter, refs map[string
 			}
 		}
 		return udpNAT(ctx, pc, StaticOutbound{Out: out})
+	}
+}
+
+// SessionTunnelAdmit 建 endpoint.TunnelAdmit(整包 L3 隧道一次接入):ctx 回读身份 → AdmitConn(闸 + max-ips +
+// 计量,closer 供强杀)→ 返回 Meter 的上/下行记账回调。未开计量且无闸时记账回调为 nil、release 仍有效。
+func SessionTunnelAdmit(adm *Admitter, refs map[string]cred.ID, readUser func(context.Context) (string, bool)) endpoint.TunnelAdmit {
+	return func(ctx context.Context, src net.Addr, closer io.Closer) (func(int), func(int), func(), bool) {
+		var ap netip.AddrPort
+		if src != nil {
+			ap, _ = netip.ParseAddrPort(src.String())
+		}
+		m, release, err := adm.AdmitConn(sessionWho(ctx, refs, readUser), addr.Socksaddr{Addr: ap.Addr(), Port: ap.Port()}, closer)
+		if err != nil {
+			return nil, nil, nil, false // 闸满 / 内存档 / 停用:拒新隧道(closer 已关)
+		}
+		if m == nil {
+			return nil, nil, release, true
+		}
+		return m.AddUp, m.AddDown, release, true
 	}
 }
 

@@ -5,11 +5,14 @@ package manifest
 
 import (
 	_ "github.com/LOVECHEN/ntr/outbound/anytls"      // 会话式协议插件(registry.RegisterSession)
+	_ "github.com/LOVECHEN/ntr/outbound/connectip"   // 会话式协议插件(未编入 with_connectip 时注册桩,配了即报错)
 	_ "github.com/LOVECHEN/ntr/outbound/hysteria1"   // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/hysteria2"   // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/juicity"     // 会话式协议插件
+	_ "github.com/LOVECHEN/ntr/outbound/masque"      // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/mieru"       // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/naive"       // 会话式协议插件
+	_ "github.com/LOVECHEN/ntr/outbound/shadowquic"  // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/ssh"         // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/trusttunnel" // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/tuic"        // 会话式协议插件

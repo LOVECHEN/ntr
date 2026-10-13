@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	yaml "gopkg.in/yaml.v3"
@@ -237,5 +238,26 @@ outbounds:
 	}
 	if in.Dispatch == nil || in.PacketDispatch == nil {
 		t.Fatalf("portal 口须给 Dispatch/PacketDispatch: Dispatch=%v PacketDispatch=%v", in.Dispatch != nil, in.PacketDispatch != nil)
+	}
+}
+
+// connect-ip(整包 L3 隧道)不能当反连 portal:运行时不给 AdmitTunnel,插件明确报错而非静默忽略 mode: portal。
+func TestConnectIPPortalRejected(t *testing.T) {
+	var f File
+	if err := yaml.Unmarshal([]byte(`
+inbounds:
+  - name: cip-portal
+    type: connect-ip
+    mode: portal
+    listen: 127.0.0.1:0
+outbounds:
+  - name: direct
+    type: direct
+`), &f); err != nil {
+		t.Fatal(err)
+	}
+	_, err := f.Build(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "portal") {
+		t.Fatalf("connect-ip 当 portal 应报错,得到 %v", err)
 	}
 }

@@ -12,7 +12,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -41,18 +40,14 @@ import (
 	"github.com/LOVECHEN/ntr/inbound/transparent"
 	"github.com/LOVECHEN/ntr/inbound/tun"
 	"github.com/LOVECHEN/ntr/inbound/tunnel"
+	"github.com/LOVECHEN/ntr/internal/selfcert"
 	"github.com/LOVECHEN/ntr/meter"
-	"github.com/LOVECHEN/ntr/outbound/anytls"
 	"github.com/LOVECHEN/ntr/outbound/block"
-	"github.com/LOVECHEN/ntr/outbound/connectip"
 	"github.com/LOVECHEN/ntr/outbound/direct"
 	dnsout "github.com/LOVECHEN/ntr/outbound/dns"
 	"github.com/LOVECHEN/ntr/outbound/group"
-	"github.com/LOVECHEN/ntr/outbound/hysteria2"
-	"github.com/LOVECHEN/ntr/outbound/masque"
 	"github.com/LOVECHEN/ntr/outbound/mux"
 	muxcool "github.com/LOVECHEN/ntr/outbound/muxcool"
-	"github.com/LOVECHEN/ntr/outbound/shadowquic"
 	"github.com/LOVECHEN/ntr/outbound/upstream"
 	"github.com/LOVECHEN/ntr/outbound/wireguard"
 	"github.com/LOVECHEN/ntr/reverse"
@@ -387,24 +382,11 @@ func (o Outbound) synthLayers() ([]service.LayerSpec, error) {
 	return synthStack(o.Type, extra, nil)
 }
 
-// sessionAuthProtos 是【已接入第4章顶层 users + 计量】的会话式协议集(世界 C 逐个开通)。这些协议
-// 不走 proxy.Server/registry 泛型路径,authProto 无法经 newFormat/registry 认出,须在此显式登记 ——
-// 登记后 Desugar 会为其口产 CredBinding,build 分支据 binding 建库内多用户 + 计量 dispatch。
-// ★只登记真正接完线的协议(诚实纪律:未接的留空 → 其顶层 users 不生效,别假装)。
-var sessionAuthProtos = map[string]bool{
-	"shadowquic": true,
-	"masque":     true,
-	"connect-ip": true,
-}
-
 // authProto 该口的 per-user 认证协议(= 终端协议名,供 Desugar 按协议取密钥,§4.4 规则 3)。
-// 第4章:type 即终端协议(含 mode=portal 的 portal,其承载协议就是 type);已接入的会话式返回其 type
-// (见 sessionAuthProtos)。空 = 不产 binding。多层认证(shadowtls 外层)待骨头 4,当前单层。
+// 第4章:type 即终端协议(含 mode=portal 的 portal,其承载协议就是 type);会话式插件(registry.RegisterSession
+// 自注册且提供入站)返回其 type。空 = 不产 binding。多层认证(shadowtls 外层)待骨头 4,当前单层。
 func (in Inbound) authProto() string {
 	if in.newFormat() {
-		return in.Type
-	}
-	if sessionAuthProtos[in.Type] {
 		return in.Type
 	}
 	if sp, ok := registry.LookupSession(in.Type); ok && sp.HasInbound() { // 会话式插件:自注册即接入顶层 users
@@ -1048,35 +1030,6 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			} else {
 				outs[o.Name] = up
 			}
-		case "shadowquic":
-			up, err := shadowquic.NewOutbound(shadowquic.Options{Server: o.Server, Username: o.User, Password: o.Secret, SNI: o.SNI})
-			if err != nil {
-				return nil, fmt.Errorf("config: 出站 %q(shadowquic):%w", o.Name, err)
-			}
-			outs[o.Name] = up
-		case "connect-ip":
-			opts := connectip.Options{
-				Server: o.Server, SNI: o.SNI, Insecure: o.Insecure,
-				Protocol: o.Protocol, URITemplate: o.URITemplate,
-				IgnoreExtendedConnect: o.IgnoreExtendedConnect,
-				LocalAddress:          o.LocalAddress, DNS: o.DNS, MTU: o.MTU,
-				ClientCert: o.ClientCert, ClientKey: o.ClientKey,
-			}
-			// preset=cloudflare:套用 WARP 的三处非标差异(仍可被显式字段覆盖)。
-			// 依据:mihomo transport/masque/masque.go —— :protocol 用 cf-connect-ip、
-			// 发已废弃的 SETTINGS_H3_DATAGRAM_00(0x276)、跳过 Extended CONNECT 校验。
-			if o.Preset == "cloudflare" {
-				if opts.Protocol == "" {
-					opts.Protocol = "cf-connect-ip"
-				}
-				opts.ExtraSettings = map[uint64]uint64{0x276: 1}
-				opts.IgnoreExtendedConnect = true
-			}
-			up, err := connectip.NewOutbound(opts)
-			if err != nil {
-				return nil, fmt.Errorf("config: 出站 %q(connect-ip):%w", o.Name, err)
-			}
-			outs[o.Name] = up
 		case "wireguard":
 			up, err := wireguard.NewOutbound(wireguard.Options{
 				PrivateKey: o.PrivateKey, PeerPublicKey: o.PeerPublicKey, PresharedKey: o.PresharedKey,
@@ -1085,12 +1038,6 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			})
 			if err != nil {
 				return nil, fmt.Errorf("config: 出站 %q(wireguard):%w", o.Name, err)
-			}
-			outs[o.Name] = up
-		case "masque":
-			up, err := masque.NewOutbound(masque.Options{Server: o.Server, User: o.User, Password: o.Secret, SNI: o.SNI, Insecure: o.Insecure})
-			if err != nil {
-				return nil, fmt.Errorf("config: 出站 %q(masque):%w", o.Name, err)
 			}
 			outs[o.Name] = up
 		default:
@@ -1246,22 +1193,6 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			default:
 				handler = h
 			}
-		case "shadowquic":
-			inb, err := f.buildShadowquicInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
-			if err != nil {
-				return nil, fmt.Errorf("config: 入站 %s(shadowquic):%w", in.Listen, err)
-			}
-			listen := in.Listen
-			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
-			continue
-		case "connect-ip":
-			inb, err := f.buildConnectIPInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
-			if err != nil {
-				return nil, fmt.Errorf("config: 入站 %s(connect-ip):%w", in.Listen, err)
-			}
-			listen := in.Listen
-			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
-			continue
 		case "dns":
 			if dnsResolver == nil {
 				return nil, fmt.Errorf("config: 入站 %s(dns)需启用 dns:(dns.enabled=true 提供 resolver)", in.Listen)
@@ -1296,14 +1227,6 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			inb, err := transparent.NewInbound(transparent.Options{Mode: in.Type, Network: in.Network}, out)
 			if err != nil {
 				return nil, fmt.Errorf("config: 入站 %s(%s):%w", in.Listen, in.Type, err)
-			}
-			listen := in.Listen
-			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
-			continue
-		case "masque":
-			inb, err := f.buildMasqueInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
-			if err != nil {
-				return nil, fmt.Errorf("config: 入站 %s(masque):%w", in.Listen, err)
 			}
 			listen := in.Listen
 			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
@@ -1886,108 +1809,6 @@ func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver servi
 	return handler, base, nil
 }
 
-// buildConnectIPInbound 建 CONNECT-IP 入站(QUIC/h3 证书 + 下发地址 + 绑定出站)。CONNECT-IP 是整包 IP
-// 隧道(非按流代理),不走 SessionDispatch,而经 MeterHook 按【整条隧道】记账(承世界 C 的诚实路径):
-// 顶层 users(binds 非空)→ tag=BillID 作可选 Basic 用户名,认证命中 → refs[tag]→cred.ID → AdmitConn
-// (连接闸 + max-ips + Meter),datagram 泵按 IP 包字节 AddUp/AddDown。无 users = 开放隧道(与 Cloudflare
-// 等无认证客户端互通,身份 Ambient)。
-func (f *File) buildConnectIPInbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (*connectip.Inbound, error) {
-	tlsConfig, err := hysteria2.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
-	if err != nil {
-		return nil, err
-	}
-	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
-	if err != nil {
-		return nil, err
-	}
-	var users []connectip.User
-	var refs map[string]cred.ID
-	if len(binds) > 0 {
-		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
-		if err != nil {
-			return nil, err
-		}
-		refs = r
-		for _, su := range sus {
-			pw := su.Secret
-			if su.Fields != nil {
-				pw = su.Fields["password"]
-			}
-			users = append(users, connectip.User{Name: su.Tag, Password: pw}) // ★Basic 名=tag,与 refs 键一致
-		}
-	}
-	hook := func(_ context.Context, user string, src net.Addr, closer io.Closer) (addUp, addDown func(int), release func(), ok bool) {
-		who := cred.Ambient
-		if id, k := refs[user]; k {
-			who = id
-		}
-		m, rel, err := adm.AdmitConn(who, netAddrToSocks(src), closer)
-		if err != nil {
-			return nil, nil, nil, false // 闸满/内存档:拒新隧道
-		}
-		if m == nil { // 未开计量且无闸:零成本放行
-			return nil, nil, rel, true
-		}
-		return m.AddUp, m.AddDown, rel, true
-	}
-	return connectip.NewInbound(connectip.InboundOptions{
-		AssignAddress: in.AssignAddress,
-		MTU:           in.MTU,
-	}, users, hook, tlsConfig, out)
-}
-
-// netAddrToSocks 把 net.Addr("ip:port")解析成 addr.Socksaddr(供 AdmitConn 的 max-ips 取源 IP);异常 → 空。
-func netAddrToSocks(a net.Addr) addr.Socksaddr {
-	if a == nil {
-		return addr.Socksaddr{}
-	}
-	if ap, err := netip.ParseAddrPort(a.String()); err == nil {
-		return addr.FromIPPort(ap)
-	}
-	return addr.Socksaddr{}
-}
-
-// buildMasqueInbound 建 MASQUE 会话入站(QUIC/h3 证书 + 可选 Basic 用户 + 绑定出站)。用户可为空 =
-// 不鉴权(MASQUE 无标准认证层,身份落 Ambient)。顶层 users:tag=BillID 作 Basic 用户名,认证命中经
-// masque.UserFromContext 回读 → cred.ID → SessionDispatch 计量。
-func (f *File) buildMasqueInbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (*masque.Inbound, error) {
-	tlsConfig, err := hysteria2.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
-	if err != nil {
-		return nil, err
-	}
-	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
-	if err != nil {
-		return nil, err
-	}
-	var users []masque.User
-	var refs map[string]cred.ID
-	if len(binds) > 0 {
-		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
-		if err != nil {
-			return nil, err
-		}
-		refs = r
-		for _, su := range sus {
-			pw := su.Secret
-			if su.Fields != nil {
-				pw = su.Fields["password"]
-			}
-			users = append(users, masque.User{Name: su.Tag, Password: pw}) // ★Basic 名=tag,与 refs 键一致
-		}
-	} else {
-		for _, u := range in.Users {
-			name, _ := u["name"].(string)
-			pw, _ := u["password"].(string)
-			if name == "" {
-				continue
-			}
-			users = append(users, masque.User{Name: name, Password: pw})
-		}
-	}
-	dispatch := f.sessionDispatch(in, out, adm, refs, masque.UserFromContext)
-	return masque.NewInbound(users, tlsConfig, out, dispatch)
-}
-
 // sessionUser 是会话式口从顶层 users 脱糖出的一个库内用户(Tag=BillID 供 ctx 回读映射)。标量协议用
 // Secret(该层原始密钥);复合键协议(tuic/ssh…)用 Fields(具名字段 uuid/password/…)。二者互斥。
 type sessionUser struct {
@@ -2082,7 +1903,7 @@ func (f *File) sessionPluginEnv(sp registry.Session, in Inbound, out endpoint.Ou
 		TLSNode:   tlsNode,
 		TLSCert:   tlsCert,
 		TLSKey:    tlsKey,
-		ServerTLS: func() (*cryptotls.Config, error) { return anytls.ServerTLSConfig(tlsCert, tlsKey) },
+		ServerTLS: func() (*cryptotls.Config, error) { return selfcert.Std(tlsCert, tlsKey) },
 		Users:     users,
 		Out:       out,
 	}
@@ -2099,6 +1920,7 @@ func (f *File) sessionPluginEnv(sp registry.Session, in Inbound, out endpoint.Ou
 	env.Dispatch = service.SessionDispatch(out, adm, refs, sp.UserFromContext)
 	env.Admit = service.SessionAdmit(adm, refs, sp.UserFromContext)
 	env.PacketDispatch = service.SessionPacketDispatch(out, adm, refs, sp.UserFromContext)
+	env.AdmitTunnel = service.SessionTunnelAdmit(adm, refs, sp.UserFromContext)
 	return env, nil
 }
 
@@ -2178,51 +2000,6 @@ func (f *File) sessionDispatch(in Inbound, out endpoint.Outbound, adm *service.A
 		return sessionPortalDispatch(in)
 	}
 	return service.SessionDispatch(out, adm, refs, readUser)
-}
-
-// buildShadowquicInbound 建 ShadowQUIC 入站(JLS PSK 用户 + sni)。sni 从 tls.sni 取(JLS ServerName,
-// 须与客户端 servername 一致);dest 兜底 sni(v1 无回落 relay,dest 仅供 sni 推导)。顶层 users
-// (binds 非空):tag=BillID 作 JLS Username,握手认证命中经 ConnectionState().TLS.JLS.User →
-// shadowquic.UserFromContext 回读 → cred.ID → SessionDispatch 计量(承世界 C)。无 binds 退回口内垫片。
-func (f *File) buildShadowquicInbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (*shadowquic.Inbound, error) {
-	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
-	if err != nil {
-		return nil, err
-	}
-	var users []shadowquic.User
-	var refs map[string]cred.ID
-	if len(binds) > 0 {
-		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
-		if err != nil {
-			return nil, err
-		}
-		refs = r
-		for _, su := range sus {
-			// ★JLS Username = tag(=BillID):ConnectionState().TLS.JLS.User 回读的正是它,须与 refs 键一致。
-			pw := su.Secret
-			if su.Fields != nil {
-				pw = su.Fields["password"]
-			}
-			if pw == "" {
-				return nil, fmt.Errorf("config: 入站 %s 用户 %s 的 keys.shadowquic 缺 password", in.inboundName(), su.Tag)
-			}
-			users = append(users, shadowquic.User{Username: su.Tag, Password: pw})
-		}
-	} else {
-		for _, u := range in.Users {
-			un, _ := u["username"].(string)
-			pw, _ := u["password"].(string)
-			if un == "" {
-				continue
-			}
-			users = append(users, shadowquic.User{Username: un, Password: pw})
-		}
-	}
-	if len(users) == 0 {
-		return nil, fmt.Errorf("shadowquic 入站需至少一个用户(顶层 users.keys.shadowquic{password} 或口内 user{username,password})")
-	}
-	dispatch := f.sessionDispatch(in, out, adm, refs, shadowquic.UserFromContext)
-	return shadowquic.NewInbound(users, fileOrStr(in.TLS, "sni"), in.Target, nil, out, dispatch)
 }
 
 // sessionPortalDispatch:会话式协议(anytls/hy1/hy2/tuic —— 自管监听、每流已握手)作 reverse portal

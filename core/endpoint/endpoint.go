@@ -8,6 +8,8 @@ package endpoint
 
 import (
 	"context"
+	"io"
+	"net"
 
 	"github.com/LOVECHEN/ntr/addr"
 	"github.com/LOVECHEN/ntr/core/cred"
@@ -146,6 +148,12 @@ type AdmitHook func(ctx context.Context, s link.Stream) (link.Stream, func(), er
 // 自管监听的会话式入站(UDP over stream / datagram)免 import service 即可把 UDP 交给内核分流。
 // 阻塞至 pc 结束;返回时 pc 已关。nil = 该入站不支持 UDP。
 type PacketDispatch func(ctx context.Context, pc link.PacketConn) error
+
+// TunnelAdmit 供【整包 L3 隧道】类会话式协议(如 CONNECT-IP:一条长隧道搬任意 IP 包,不按目标建流)在隧道
+// 建立时做一次接入(连接闸 + max-ips + 按用户计量,身份同其它契约从 ctx 回读):返回上/下行字节记账回调 +
+// release(调用方 defer);closer 供停用/踢 IP 时强杀本隧道。ok=false = 接入被拒,调用方应关隧道。
+// addUp/addDown 为 nil = 不计量(仍须调 release)。与 StreamDispatch / PacketDispatch 对位的第三种落地契约。
+type TunnelAdmit func(ctx context.Context, src net.Addr, closer io.Closer) (addUp, addDown func(int), release func(), ok bool)
 
 // Outbound 是出站:拨到 dst、给一个传输。它以本机身份出示凭据向上游认证,不进凭据树。
 type Outbound interface {

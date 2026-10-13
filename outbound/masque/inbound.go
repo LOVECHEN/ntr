@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	mhttp "github.com/metacubex/http"
@@ -53,12 +54,14 @@ type Inbound struct {
 	users     map[string]string
 	out       endpoint.Outbound
 	dispatch  endpoint.StreamDispatch
+	packet    endpoint.PacketDispatch
 	srv       *http3.Server
 }
 
 // NewInbound 构造 MASQUE 入站(服务端 TLS + 可选 Basic 用户 + 绑定出站)。
-// dispatch 非 nil 时 TCP 流改派给它(反连 portal)。
-func NewInbound(users []User, tlsConfig *mtls.Config, out endpoint.Outbound, dispatch endpoint.StreamDispatch) (*Inbound, error) {
+// dispatch 非 nil 时 TCP 流改派给它(计量 / 反连 portal)。packet 接手 connect-udp 会话(运行时准入计量 +
+// 路由;portal 口桥进隧道);nil = connect-udp 回 501。
+func NewInbound(users []User, tlsConfig *mtls.Config, out endpoint.Outbound, dispatch endpoint.StreamDispatch, packet endpoint.PacketDispatch) (*Inbound, error) {
 	m := make(map[string]string, len(users))
 	for _, u := range users {
 		if u.Name != "" {
@@ -66,7 +69,7 @@ func NewInbound(users []User, tlsConfig *mtls.Config, out endpoint.Outbound, dis
 		}
 	}
 	tlsConfig.NextProtos = []string{http3.NextProtoH3}
-	h := &Inbound{tlsConfig: tlsConfig, users: m, out: out, dispatch: dispatch}
+	h := &Inbound{tlsConfig: tlsConfig, users: m, out: out, dispatch: dispatch, packet: packet}
 	// Extended CONNECT 在 metacubex/quic-go 的 h3 服务端是硬编码常开的;datagram 要显式开。
 	h.srv = &http3.Server{
 		EnableDatagrams: true,
@@ -132,11 +135,16 @@ func (h *Inbound) serve(w mhttp.ResponseWriter, r *mhttp.Request) {
 	h.serveTCP(ctx, w, r)
 }
 
-// serveUDP 处理 connect-udp:从 URI 模板解出目标,回 200 后接管流,用 HTTP Datagram 双向搬 UDP。
+// serveUDP 处理 connect-udp:从 URI 模板解出目标,回 200 后接管流,把 HTTP Datagram 会话包成单目标
+// link.PacketConn 交运行时 PacketDispatch(准入 + 计量 + 路由;portal 口整条桥进隧道)。
 func (h *Inbound) serveUDP(ctx context.Context, w mhttp.ResponseWriter, r *mhttp.Request) {
 	dst, err := parseConnectUDPPath(r.URL.Path)
 	if err != nil {
 		mhttp.Error(w, "bad target", mhttp.StatusBadRequest)
+		return
+	}
+	if h.packet == nil {
+		mhttp.Error(w, "connect-udp disabled", mhttp.StatusNotImplemented)
 		return
 	}
 	streamer, ok := w.(http3.HTTPStreamer)
@@ -144,17 +152,10 @@ func (h *Inbound) serveUDP(ctx context.Context, w mhttp.ResponseWriter, r *mhttp
 		mhttp.Error(w, "no hijack", mhttp.StatusInternalServerError)
 		return
 	}
-	pc, err := h.out.DialPacket(ctx, dst)
-	if err != nil {
-		mhttp.Error(w, "dial failed", mhttp.StatusBadGateway)
-		return
-	}
 	w.Header().Set("Capsule-Protocol", "?1")
 	w.WriteHeader(mhttp.StatusOK)
-	hs := streamer.HTTPStream() // 接管:内部置 hijacked 并 flush 响应头,此后由本方负责 Close
-	defer hs.Close()
-	defer pc.Close()
-	_ = relayDatagram(ctx, hs, pc, dst)
+	hs := streamer.HTTPStream()                                                                    // 接管:内部置 hijacked 并 flush 响应头,此后由本方负责 Close
+	_ = h.packet(ctx, &datagramConn{hs: hs, dst: dst, remote: remoteAddr(r.RemoteAddr), ctx: ctx}) // 返回时已关 hs
 }
 
 // serveTCP 处理普通 CONNECT(RFC 9220):目标在 :authority,回 200 后接管流双向 relay。
@@ -180,7 +181,7 @@ func (h *Inbound) serveTCP(ctx context.Context, w mhttp.ResponseWriter, r *mhttp
 	w.WriteHeader(mhttp.StatusOK)
 	hs := streamer.HTTPStream()
 	st := &serverStream{s: hs, remote: remoteAddr(r.RemoteAddr)} // h3 server 提供真客户端地址 → max-ips
-	if h.dispatch != nil { // 反连 portal:已握手流交隧道派发,不落地出站
+	if h.dispatch != nil {                                       // 反连 portal:已握手流交隧道派发,不落地出站
 		_ = h.dispatch(ctx, st, dst, endpoint.NetworkTCP)
 		return
 	}
@@ -192,56 +193,66 @@ func (h *Inbound) serveTCP(ctx context.Context, w mhttp.ResponseWriter, r *mhttp
 	_ = relay.Relay(st, up) // Relay 内部收尾两端
 }
 
-// relayDatagram 在一条 connect-udp 流与上游 UDP 之间双向搬包:
-// 上行剥 Context-ID → WritePacket;下行 ReadPacket → 前置 Context-ID 0 发出。
-func relayDatagram(ctx context.Context, hs *http3.Stream, pc link.PacketConn, dst addr.Socksaddr) error {
-	errc := make(chan error, 2)
-	go func() { // 上行:客户端 datagram → 上游 UDP
-		for {
-			data, err := hs.ReceiveDatagram(ctx)
-			if err != nil {
-				errc <- err
-				return
-			}
-			payload, ok := stripContextID(data)
-			if !ok {
-				continue // 非零 context-id / 畸形,按 RFC 丢弃
-			}
-			b := buf.New()
-			if _, werr := b.Write(payload); werr != nil {
-				b.Release()
-				continue // 超缓冲的巨型包,丢弃而非截断发错
-			}
-			err = pc.WritePacket(b, dst)
-			b.Release()
-			if err != nil {
-				errc <- err
-				return
-			}
-		}
-	}()
-	go func() { // 下行:上游 UDP → 客户端 datagram
-		b := buf.New()
-		defer b.Release()
-		for {
-			b.Reset()
-			if _, err := pc.ReadPacket(b); err != nil {
-				errc <- err
-				return
-			}
-			if b.Len() > udpPayloadMax {
-				continue // 超 RFC 上限,丢弃
-			}
-			hdr := b.ExtendHeader(1)
-			hdr[0] = 0x00 // Context ID = 0
-			if err := hs.SendDatagram(b.Bytes()); err != nil {
-				errc <- err
-				return
-			}
-		}
-	}()
-	return <-errc
+// datagramConn 把一条 connect-udp 流(RFC 9298:HTTP Datagram,Context-ID 0 + UDP 载荷)适配成单目标
+// link.PacketConn(服务端侧客户端连接):ReadPacket 剥 Context-ID、恒报握手目标;WritePacket 前置 Context-ID 0
+// 发出。deadline 经 ctx 落到 ReceiveDatagram(运行时 udpNAT 每读前 arm 空闲超时)。
+type datagramConn struct {
+	hs     *http3.Stream
+	dst    addr.Socksaddr
+	remote net.Addr
+	ctx    context.Context
+
+	mu       sync.Mutex
+	deadline time.Time
 }
+
+var _ link.PacketConn = (*datagramConn)(nil)
+
+func (c *datagramConn) ReadPacket(b *buf.Buffer) (addr.Socksaddr, error) {
+	for {
+		c.mu.Lock()
+		d := c.deadline
+		c.mu.Unlock()
+		ctx, cancel := c.ctx, context.CancelFunc(func() {})
+		if !d.IsZero() {
+			ctx, cancel = context.WithDeadline(c.ctx, d)
+		}
+		data, err := c.hs.ReceiveDatagram(ctx)
+		cancel()
+		if err != nil {
+			return addr.Socksaddr{}, err
+		}
+		payload, ok := stripContextID(data)
+		if !ok || len(payload) > b.Tailroom() {
+			continue // 非零 context-id / 畸形 / 超缓冲:按 RFC 丢弃
+		}
+		copy(b.ExtendTail(len(payload)), payload)
+		return c.dst, nil
+	}
+}
+
+func (c *datagramConn) WritePacket(b *buf.Buffer, _ addr.Socksaddr) error {
+	if b.Len() > udpPayloadMax {
+		return nil // 超 RFC 上限,丢弃
+	}
+	if b.Headroom() >= 1 {
+		hdr := b.ExtendHeader(1)
+		hdr[0] = 0x00 // Context ID = 0
+		return c.hs.SendDatagram(b.Bytes())
+	}
+	return c.hs.SendDatagram(append([]byte{0x00}, b.Bytes()...))
+}
+
+func (c *datagramConn) Close() error         { return c.hs.Close() }
+func (c *datagramConn) LocalAddr() net.Addr  { return masqueAddr{} }
+func (c *datagramConn) RemoteAddr() net.Addr { return c.remote }
+func (c *datagramConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+	return nil
+}
+func (c *datagramConn) Unwrap() any { return nil }
 
 // parseConnectUDPPath 从 RFC 9298 URI 模板解出目标:
 // /.well-known/masque/udp/{target_host}/{target_port}/ (path 已由 http3 解码,IPv6 冒号已还原)。
@@ -330,7 +341,7 @@ func (s *serverStream) RemoteAddr() net.Addr {
 	}
 	return masqueAddr{}
 }
-func (*serverStream) SetDeadline(time.Time) error { return nil }
+func (*serverStream) SetDeadline(time.Time) error      { return nil }
 func (*serverStream) SetReadDeadline(time.Time) error  { return nil }
 func (*serverStream) SetWriteDeadline(time.Time) error { return nil }
 func (*serverStream) Unwrap() any                      { return nil }
