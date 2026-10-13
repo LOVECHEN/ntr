@@ -33,15 +33,16 @@ type Inbound struct {
 }
 
 // NewInbound 构造 Hysteria2 入站(服务端 TLS + 用户 + 绑定出站)。dispatch 非 nil 时每条已握手流
-// 改派给它(反连 portal),否则 relay 到 out。
-func NewInbound(users []User, tlsConfig *mtls.Config, salamander string, out endpoint.Outbound, dispatch endpoint.StreamDispatch) (*Inbound, error) {
+// 改派给它(反连 portal / 计量),否则 relay 到 out。packet 接手客户端 UDP 会话(按包目标路由);
+// nil = 拒 UDP。
+func NewInbound(users []User, tlsConfig *mtls.Config, salamander string, out endpoint.Outbound, dispatch endpoint.StreamDispatch, packet endpoint.PacketDispatch) (*Inbound, error) {
 	tlsConfig.NextProtos = []string{"h3"} // hy2 ALPN
 	svc, err := hysteria2.NewService[string](hysteria2.ServiceOptions{
 		Context:            context.Background(),
 		Logger:             logger.NOP(),
 		TLSConfig:          tlsConfig,
 		SalamanderPassword: salamander,
-		Handler:            &routeHandler{out: out, dispatch: dispatch},
+		Handler:            &routeHandler{out: out, dispatch: dispatch, packet: packet},
 		UDPTimeout:         5 * time.Minute,
 		UdpMTU:             1200,
 	})
@@ -83,10 +84,11 @@ func (h *Inbound) Serve(ctx context.Context, pc net.PacketConn) error {
 }
 
 // routeHandler 路由每条解复用的代理流:按 destination 拨出站 + 双向中继;dispatch 非 nil 则改派
-// 给它(反连 portal 把已握手流交隧道,不落地出站)。
+// 给它(反连 portal 把已握手流交隧道,不落地出站)。UDP 会话交 packet(运行时 udpNAT)。
 type routeHandler struct {
 	out      endpoint.Outbound
 	dispatch endpoint.StreamDispatch
+	packet   endpoint.PacketDispatch
 }
 
 func (h *routeHandler) NewConnection(ctx context.Context, conn net.Conn, md M.Metadata) error {
@@ -102,10 +104,13 @@ func (h *routeHandler) NewConnection(ctx context.Context, conn net.Conn, md M.Me
 	return relay.Relay(connStream{conn}, up)
 }
 
-func (h *routeHandler) NewPacketConnection(_ context.Context, conn N.PacketConn, _ M.Metadata) error {
+func (h *routeHandler) NewPacketConnection(ctx context.Context, conn N.PacketConn, md M.Metadata) error {
 	// 拒绝 UDP 前必须关 conn:库侧 go 调本回调且丢弃返回值、不兜底 Close,不关则该 udpPacketConn
 	// (含缓冲 channel)滞留 serverSession.udpConnMap 直到整条 QUIC 连接结束,认证后可累积泄漏。
-	// 与 tuic/hysteria1 的 NewPacketConnectionEx 一致(它们都显式 Close)。
-	_ = conn.Close()
-	return errUDPNotReady
+	if h.packet == nil {
+		_ = conn.Close()
+		return errUDPNotReady
+	}
+	// ctx 带库写入的鉴权用户(auth.ContextWithUser),运行时据此计量;返回时 conn 已关。
+	return h.packet(ctx, &packetConn{pc: unwrapTimeout(conn), remote: sourceAddr(md.Source)})
 }

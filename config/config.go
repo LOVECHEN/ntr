@@ -54,9 +54,7 @@ import (
 	"github.com/LOVECHEN/ntr/outbound/mieru"
 	"github.com/LOVECHEN/ntr/outbound/mux"
 	muxcool "github.com/LOVECHEN/ntr/outbound/muxcool"
-	"github.com/LOVECHEN/ntr/outbound/naive"
 	"github.com/LOVECHEN/ntr/outbound/shadowquic"
-	"github.com/LOVECHEN/ntr/outbound/trusttunnel"
 	"github.com/LOVECHEN/ntr/outbound/upstream"
 	"github.com/LOVECHEN/ntr/outbound/wireguard"
 	"github.com/LOVECHEN/ntr/reverse"
@@ -396,14 +394,11 @@ func (o Outbound) synthLayers() ([]service.LayerSpec, error) {
 // 登记后 Desugar 会为其口产 CredBinding,build 分支据 binding 建库内多用户 + 计量 dispatch。
 // ★只登记真正接完线的协议(诚实纪律:未接的留空 → 其顶层 users 不生效,别假装)。
 var sessionAuthProtos = map[string]bool{
-	"hysteria2":   true,
-	"hysteria1":   true,
-	"mieru":       true,
-	"shadowquic":  true,
-	"naive":       true,
-	"trusttunnel": true,
-	"masque":      true,
-	"connect-ip":  true,
+	"hysteria1":  true,
+	"mieru":      true,
+	"shadowquic": true,
+	"masque":     true,
+	"connect-ip": true,
 }
 
 // authProto 该口的 per-user 认证协议(= 终端协议名,供 Desugar 按协议取密钥,§4.4 规则 3)。
@@ -1068,28 +1063,10 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 				return nil, fmt.Errorf("config: 出站 %q(hysteria1):%w", o.Name, err)
 			}
 			outs[o.Name] = up
-		case "hysteria2":
-			up, err := hysteria2.NewOutbound(hysteria2.Options{Server: o.Server, Password: o.Secret, SNI: o.SNI, Insecure: o.Insecure, Obfs: o.obfsPassword()})
-			if err != nil {
-				return nil, fmt.Errorf("config: 出站 %q(hysteria2):%w", o.Name, err)
-			}
-			outs[o.Name] = up
 		case "shadowquic":
 			up, err := shadowquic.NewOutbound(shadowquic.Options{Server: o.Server, Username: o.User, Password: o.Secret, SNI: o.SNI})
 			if err != nil {
 				return nil, fmt.Errorf("config: 出站 %q(shadowquic):%w", o.Name, err)
-			}
-			outs[o.Name] = up
-		case "trusttunnel":
-			up, err := trusttunnel.NewOutbound(trusttunnel.Options{Server: o.Server, User: o.User, Password: o.Secret, SNI: o.SNI, Insecure: o.Insecure, Fingerprint: o.Fingerprint})
-			if err != nil {
-				return nil, fmt.Errorf("config: 出站 %q(trusttunnel):%w", o.Name, err)
-			}
-			outs[o.Name] = up
-		case "naive":
-			up, err := naive.NewOutbound(naive.Options{Server: o.Server, User: o.User, Password: o.Secret, SNI: o.SNI, Insecure: o.Insecure, Fingerprint: o.Fingerprint})
-			if err != nil {
-				return nil, fmt.Errorf("config: 出站 %q(naive):%w", o.Name, err)
 			}
 			outs[o.Name] = up
 		case "mieru":
@@ -1290,30 +1267,10 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			default:
 				handler = h
 			}
-		case "trusttunnel":
-			h, err := f.buildTrusttunnelInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
-			if err != nil {
-				return nil, fmt.Errorf("config: 入站 %s(trusttunnel):%w", in.Listen, err)
-			}
-			handler = h
-		case "naive":
-			h, err := f.buildNaiveInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
-			if err != nil {
-				return nil, fmt.Errorf("config: 入站 %s(naive):%w", in.Listen, err)
-			}
-			handler = h
 		case "hysteria1":
 			inb, err := f.buildHy1Inbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
 			if err != nil {
 				return nil, fmt.Errorf("config: 入站 %s(hysteria1):%w", in.Listen, err)
-			}
-			listen := in.Listen
-			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
-			continue
-		case "hysteria2":
-			inb, err := f.buildHy2Inbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
-			if err != nil {
-				return nil, fmt.Errorf("config: 入站 %s(hysteria2):%w", in.Listen, err)
 			}
 			listen := in.Listen
 			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
@@ -1966,93 +1923,6 @@ func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver servi
 	return handler, base, nil
 }
 
-// buildTrusttunnelInbound 建 TrustTunnel 会话入站(服务端证书 + Basic 用户 + 绑定出站)。顶层 users
-// (binds 非空):tag=BillID 作 Basic 用户名,认证命中经 trusttunnel.UserFromContext 回读 → cred.ID →
-// SessionDispatch 计量(承世界 C)。无 binds 退回口内 in.Users 垫片(身份 Ambient)。
-func (f *File) buildTrusttunnelInbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (*trusttunnel.Inbound, error) {
-	tlsConfig, err := anytls.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
-	if err != nil {
-		return nil, err
-	}
-	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
-	if err != nil {
-		return nil, err
-	}
-	var users []trusttunnel.User
-	var refs map[string]cred.ID
-	if len(binds) > 0 {
-		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
-		if err != nil {
-			return nil, err
-		}
-		refs = r
-		for _, su := range sus {
-			pw := su.Secret
-			if su.Fields != nil {
-				pw = su.Fields["password"]
-			}
-			users = append(users, trusttunnel.User{Name: su.Tag, Password: pw}) // ★Basic 名=tag,与 refs 键一致
-		}
-	} else {
-		for _, u := range in.Users {
-			name, _ := u["name"].(string)
-			pw, _ := u["password"].(string)
-			if name == "" {
-				continue
-			}
-			users = append(users, trusttunnel.User{Name: name, Password: pw})
-		}
-	}
-	if len(users) == 0 {
-		return nil, fmt.Errorf("trusttunnel 入站需至少一个用户(顶层 users.keys.trusttunnel{password} 或口内 user{name,password})")
-	}
-	dispatch := f.sessionDispatch(in, out, adm, refs, trusttunnel.UserFromContext)
-	return trusttunnel.NewInbound(users, tlsConfig, out, dispatch)
-}
-
-// buildNaiveInbound 建 NaiveProxy 会话入站(服务端证书 + Basic 用户 + 绑定出站)。顶层 users:tag=BillID
-// 作 Basic 用户名,认证命中经 naive.UserFromContext 回读 → cred.ID → SessionDispatch 计量。
-func (f *File) buildNaiveInbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (*naive.Inbound, error) {
-	tlsConfig, err := anytls.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
-	if err != nil {
-		return nil, err
-	}
-	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
-	if err != nil {
-		return nil, err
-	}
-	var users []naive.User
-	var refs map[string]cred.ID
-	if len(binds) > 0 {
-		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
-		if err != nil {
-			return nil, err
-		}
-		refs = r
-		for _, su := range sus {
-			pw := su.Secret
-			if su.Fields != nil {
-				pw = su.Fields["password"]
-			}
-			users = append(users, naive.User{Name: su.Tag, Password: pw}) // ★Basic 名=tag,与 refs 键一致
-		}
-	} else {
-		for _, u := range in.Users {
-			name, _ := u["name"].(string)
-			pw, _ := u["password"].(string)
-			if name == "" {
-				continue
-			}
-			users = append(users, naive.User{Name: name, Password: pw})
-		}
-	}
-	if len(users) == 0 {
-		return nil, fmt.Errorf("naive 入站需至少一个用户(顶层 users.keys.naive{password} 或口内 user{name,password})")
-	}
-	dispatch := f.sessionDispatch(in, out, adm, refs, naive.UserFromContext)
-	return naive.NewInbound(users, tlsConfig, out, dispatch)
-}
-
 // buildConnectIPInbound 建 CONNECT-IP 入站(QUIC/h3 证书 + 下发地址 + 绑定出站)。CONNECT-IP 是整包 IP
 // 隧道(非按流代理),不走 SessionDispatch,而经 MeterHook 按【整条隧道】记账(承世界 C 的诚实路径):
 // 顶层 users(binds 非空)→ tag=BillID 作可选 Basic 用户名,认证命中 → refs[tag]→cred.ID → AdmitConn
@@ -2250,7 +2120,7 @@ func buildSessionAdmitter(in Inbound, reg *meter.Registry, globalGate *meter.Gat
 // sessionPluginEnv 组装【会话式协议插件】入站的协议无关输入(两种入站形态共用),config 不认协议名。
 // 用户:顶层 users(binds 非空)→ tag=BillID + 结构化 keys(复合键)/标量 secret,经 UserFromContext 回读
 // 计量;无 binds 时退回口内 users 垫片(标量字段原样作 Fields,身份落 Ambient)。TCP 走 sessionDispatch
-// (计量/反连 portal),UDP 承载流过 SessionAdmit 计量、数据报交 SessionPacketDispatch(udpNAT)。
+// (计量/反连 portal),UDP 会话交 SessionPacketDispatch(准入 + 计量 + udpNAT,与 TCP 同一身份回读)。
 func (f *File) sessionPluginEnv(sp registry.Session, in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (registry.SessionInbound, error) {
 	tlsCert, tlsKey := fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key")
 	tlsNode, err := mapToNode(in.TLS, "")
@@ -2297,7 +2167,7 @@ func (f *File) sessionPluginEnv(sp registry.Session, in Inbound, out endpoint.Ou
 		Out:            out,
 		Dispatch:       f.sessionDispatch(in, out, adm, refs, sp.UserFromContext),
 		Admit:          service.SessionAdmit(adm, refs, sp.UserFromContext),
-		PacketDispatch: service.SessionPacketDispatch(out),
+		PacketDispatch: service.SessionPacketDispatch(out, adm, refs, sp.UserFromContext),
 	}, nil
 }
 
@@ -2377,46 +2247,6 @@ func (f *File) sessionDispatch(in Inbound, out endpoint.Outbound, adm *service.A
 		return sessionPortalDispatch(in)
 	}
 	return service.SessionDispatch(out, adm, refs, readUser)
-}
-
-// buildHy2Inbound 建 Hysteria2 入站。顶层 users(binds 非空):tag=BillID 喂库内多用户(svc.UpdateUsers),
-// 命中后经 hysteria2.UserFromContext 回读 tag → cred.ID → SessionDispatch 计量(承世界 C)。无 binds 时退回
-// 口内 in.Users 垫片(身份落 Ambient,但连接闸 + mem-guard 仍生效)。
-func (f *File) buildHy2Inbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (*hysteria2.Inbound, error) {
-	tlsConfig, err := hysteria2.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
-	if err != nil {
-		return nil, err
-	}
-	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
-	if err != nil {
-		return nil, err
-	}
-	var users []hysteria2.User
-	var refs map[string]cred.ID
-	if len(binds) > 0 {
-		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
-		if err != nil {
-			return nil, err
-		}
-		refs = r
-		for _, su := range sus {
-			users = append(users, hysteria2.User{Name: su.Tag, Password: su.Secret})
-		}
-	} else {
-		for _, u := range in.Users { // 垫片:口内旧写法;身份落 Ambient
-			pw, _ := u["password"].(string)
-			if pw == "" {
-				continue
-			}
-			name, _ := u["name"].(string)
-			users = append(users, hysteria2.User{Name: name, Password: pw})
-		}
-	}
-	if len(users) == 0 {
-		return nil, fmt.Errorf("hysteria2 入站需至少一个用户(顶层 users.keys.hysteria2 或口内 user{password})")
-	}
-	dispatch := f.sessionDispatch(in, out, adm, refs, hysteria2.UserFromContext)
-	return hysteria2.NewInbound(users, tlsConfig, in.obfsPassword(), out, dispatch)
 }
 
 // buildMieruInbound 建 mieru 会话入站(官方库自绑端口,用户名+口令,TCP/UDP 传输)。顶层 users

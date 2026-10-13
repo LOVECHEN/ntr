@@ -84,7 +84,6 @@ func newInboundFromSession(in registry.SessionInbound) (registry.Runner, error) 
 		TLS:            tlsConf,
 		Out:            in.Out,
 		Dispatch:       in.Dispatch,
-		Admit:          in.Admit,
 		PacketDispatch: in.PacketDispatch,
 	})
 }

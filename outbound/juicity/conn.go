@@ -77,6 +77,9 @@ type packetConn struct {
 
 var _ link.PacketConn = (*packetConn)(nil)
 
+// RemoteAddr 报承载流的对端(服务端侧 = 客户端 QUIC 源地址;运行时准入据此取来源 IP)。
+func (p *packetConn) RemoteAddr() net.Addr { return p.s.RemoteAddr() }
+
 var framePool = sync.Pool{New: func() any { b := make([]byte, 0, 2048); return &b }}
 
 func (p *packetConn) ReadPacket(b *buf.Buffer) (addr.Socksaddr, error) {

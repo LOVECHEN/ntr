@@ -17,6 +17,7 @@ import (
 	"github.com/metacubex/sing-quic/hysteria2"
 	"github.com/metacubex/sing/common/logger"
 	M "github.com/metacubex/sing/common/metadata"
+	N "github.com/metacubex/sing/common/network"
 	mtls "github.com/metacubex/tls"
 
 	"github.com/LOVECHEN/ntr/addr"
@@ -26,7 +27,7 @@ import (
 
 var _ endpoint.Outbound = (*Outbound)(nil)
 
-var errUDPNotReady = errors.New("hysteria2: UDP over QUIC datagram not implemented yet")
+var errUDPNotReady = errors.New("hysteria2: 对端/本端未启用 UDP")
 
 // Options 是 Hysteria2 出站配置。
 type Options struct {
@@ -104,9 +105,19 @@ func (o *Outbound) DialStream(ctx context.Context, dst addr.Socksaddr) (link.Str
 	return connStream{conn}, nil
 }
 
-// DialPacket:hy2 UDP over QUIC datagram 待接入。
-func (o *Outbound) DialPacket(context.Context, addr.Socksaddr) (link.PacketConn, error) {
-	return nil, errUDPNotReady
+// DialPacket 在 hy2 QUIC 连接上开一个 UDP 会话(QUIC datagram;每包自带目标,可多目标)。dst 仅作首包
+// 目标提示,不绑定 —— 返回的连接按 WritePacket 的 dst 逐包投递。
+func (o *Outbound) DialPacket(ctx context.Context, _ addr.Socksaddr) (link.PacketConn, error) {
+	pc, err := o.client.ListenPacket(ctx)
+	if err != nil {
+		return nil, err
+	}
+	spc, ok := pc.(N.PacketConn)
+	if !ok {
+		_ = pc.Close()
+		return nil, errUDPNotReady
+	}
+	return &packetConn{pc: spc}, nil
 }
 
 func toSing(a addr.Socksaddr) M.Socksaddr {

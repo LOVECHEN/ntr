@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"net"
+	"net/netip"
 
 	"github.com/LOVECHEN/ntr/addr"
 	"github.com/LOVECHEN/ntr/core/cred"
@@ -88,27 +90,56 @@ func (a *Admitter) Admit(who cred.ID, src addr.Socksaddr, s link.Stream, closers
 // 自己的 ReportConnHandshakeSuccess(在裸 conn 上),再 relay(计量流)。readUser/refs 语义同 SessionDispatch。
 func SessionAdmit(adm *Admitter, refs map[string]cred.ID, readUser func(context.Context) (string, bool)) endpoint.AdmitHook {
 	return func(ctx context.Context, s link.Stream) (link.Stream, func(), error) {
-		who := cred.Ambient
-		if readUser != nil {
-			if tag, ok := readUser(ctx); ok {
-				if id, ok2 := refs[tag]; ok2 {
-					who = id
-				}
-			}
-		}
 		ap := srcAddrPort(s)
-		return adm.Admit(who, addr.Socksaddr{Addr: ap.Addr(), Port: ap.Port()}, s)
+		return adm.Admit(sessionWho(ctx, refs, readUser), addr.Socksaddr{Addr: ap.Addr(), Port: ap.Port()}, s)
 	}
 }
 
-// SessionPacketDispatch 建 endpoint.PacketDispatch:会话式入站解出的客户端侧数据报连接交 udpNAT,按包目标
-// 拆分、逐目标经 out 路由并回写来源(与流式入站 UDP 同一条 udpNAT 路径)。准入 + 计量不在此做:由协议侧对
-// 承载体(如 UDP over stream 的承载流)先过 SessionAdmit,UDP 字节随承载体计入用户。返回时 pc 已关。
-func SessionPacketDispatch(out endpoint.Outbound) endpoint.PacketDispatch {
+// sessionWho 按 readUser 从 ctx 读身份 tag,命中 refs 得 cred.ID,否则 Ambient。
+func sessionWho(ctx context.Context, refs map[string]cred.ID, readUser func(context.Context) (string, bool)) cred.ID {
+	if readUser != nil {
+		if tag, ok := readUser(ctx); ok {
+			if id, ok2 := refs[tag]; ok2 {
+				return id
+			}
+		}
+	}
+	return cred.Ambient
+}
+
+// SessionPacketDispatch 建 endpoint.PacketDispatch(与 SessionDispatch 对位的 UDP 版):会话式入站解出的客户端
+// 侧数据报连接,先按 readUser 从 ctx 读身份 → 过 Admitter(连接闸 + 按用户计量 + mem-guard,一个 UDP 会话
+// 计一条连接)→ 包计量(payload 口径:ReadPacket 计上行、WritePacket 计下行)→ udpNAT 按包目标拆分、逐目标
+// 经 out 路由并回写来源(与流式入站 UDP 同一条路径)。来源 IP 取自 pc 的 RemoteAddr()(实现了才有;供 max-ips)。
+// adm 为 nil 时不准入不计量。返回时 pc 已关。
+func SessionPacketDispatch(out endpoint.Outbound, adm *Admitter, refs map[string]cred.ID, readUser func(context.Context) (string, bool)) endpoint.PacketDispatch {
 	return func(ctx context.Context, pc link.PacketConn) error {
 		defer pc.Close()
+		if adm != nil {
+			ap := packetSrc(pc)
+			m, release, err := adm.AdmitConn(sessionWho(ctx, refs, readUser), addr.Socksaddr{Addr: ap.Addr(), Port: ap.Port()}, pc)
+			if err != nil {
+				return err // 被拒时 pc 已关
+			}
+			defer release()
+			if m != nil {
+				pc = meter.WrapPacket(pc, m)
+			}
+		}
 		return udpNAT(ctx, pc, StaticOutbound{Out: out})
 	}
+}
+
+// packetSrc 取数据报连接的客户端来源(pc 实现 RemoteAddr() 才有;否则零值)。
+func packetSrc(pc link.PacketConn) netip.AddrPort {
+	if r, ok := pc.(interface{ RemoteAddr() net.Addr }); ok {
+		if ra := r.RemoteAddr(); ra != nil {
+			if ap, err := netip.ParseAddrPort(ra.String()); err == nil {
+				return ap
+			}
+		}
+	}
+	return netip.AddrPort{}
 }
 
 // SessionDispatch 建【会话式协议】的计量版 endpoint.StreamDispatch:每条库内解复用出的已握手流,先按
@@ -121,16 +152,8 @@ func SessionPacketDispatch(out endpoint.Outbound) endpoint.PacketDispatch {
 // 故读取也须用同一 fork);refs 为空(垫片/无顶层 users)时恒落 Ambient,gate + mem-guard 仍照常生效。
 func SessionDispatch(out endpoint.Outbound, adm *Admitter, refs map[string]cred.ID, readUser func(context.Context) (string, bool)) endpoint.StreamDispatch {
 	return func(ctx context.Context, s link.Stream, dst addr.Socksaddr, _ endpoint.Network) error {
-		who := cred.Ambient
-		if readUser != nil {
-			if tag, ok := readUser(ctx); ok {
-				if id, ok2 := refs[tag]; ok2 {
-					who = id
-				}
-			}
-		}
 		ap := srcAddrPort(s)
-		ms, release, err := adm.Admit(who, addr.Socksaddr{Addr: ap.Addr(), Port: ap.Port()}, s)
+		ms, release, err := adm.Admit(sessionWho(ctx, refs, readUser), addr.Socksaddr{Addr: ap.Addr(), Port: ap.Port()}, s)
 		if err != nil {
 			return err // Admit 被拒时已关 s
 		}

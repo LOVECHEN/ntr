@@ -13,7 +13,6 @@ import (
 	"github.com/sagernet/quic-go"
 
 	"github.com/LOVECHEN/ntr/core/endpoint"
-	"github.com/LOVECHEN/ntr/core/link"
 	"github.com/LOVECHEN/ntr/core/relay"
 )
 
@@ -49,9 +48,7 @@ type InboundOptions struct {
 
 	// Dispatch 处理 TCP 代理流(计量 / 反连 portal);nil = relay 到 Out。
 	Dispatch endpoint.StreamDispatch
-	// Admit 对 UDP 承载流做准入 + 计量(UDP 字节随承载流计入用户);nil = 不计量。
-	Admit endpoint.AdmitHook
-	// PacketDispatch 接手 UDP 会话(按包目标拆分路由 = udpNAT);nil = 不支持 UDP(关流)。
+	// PacketDispatch 接手 UDP 会话(运行时做准入 + 计量 + 按包目标拆分路由);nil = 不支持 UDP(关流)。
 	PacketDispatch endpoint.PacketDispatch
 }
 
@@ -226,21 +223,12 @@ func (h *Inbound) handleStream(ctx context.Context, conn *quic.Conn, st *quic.St
 	}
 }
 
-// handleUDP:承载流先过准入 + 计量,再以 UDP 帧语义交给 PacketDispatch 按包目标路由。
+// handleUDP:承载流以 UDP 帧语义交给 PacketDispatch(运行时准入 + 计量 + 按包目标路由;ctx 带鉴权用户)。
 // 流首里的地址只是客户端开流时的首目标,真正目标逐帧给出(官方服务端同样按首帧目标起拨)。
 func (h *Inbound) handleUDP(ctx context.Context, sc *streamConn) {
 	if h.o.PacketDispatch == nil {
 		_ = sc.Close()
 		return
 	}
-	var carrier link.Stream = sc
-	if h.o.Admit != nil {
-		ms, release, err := h.o.Admit(ctx, sc)
-		if err != nil {
-			return // 被拒时 Admit 已关流
-		}
-		defer release()
-		carrier = ms
-	}
-	_ = h.o.PacketDispatch(ctx, &packetConn{s: carrier})
+	_ = h.o.PacketDispatch(ctx, &packetConn{s: sc})
 }
