@@ -9,6 +9,8 @@ cleanup(){ docker rm -f ${P}target ${P}sshd ${P}ntrcli ${P}ntrsrv ${P}singbox ${
 probe(){ local proxy=$1 out; for i in 1 2 3; do
   out=$(docker run --rm --network $NET curlimages/curl:latest -s --max-time 12 -x "socks5h://$proxy" http://${P}target/ 2>&1)
   echo "$out" | grep -q Hostname && { echo "$out" | grep Hostname; return 0; }; sleep 2; done; echo "$out"; return 1; }
+# host 私钥自举(脚本自包含:不依赖别的脚本先生成;缺失时 docker 会把单文件挂载点建成空目录)
+[ -d $D/ssh_hostkey ] && rmdir $D/ssh_hostkey; [ -f $D/ssh_hostkey ] || ssh-keygen -t ed25519 -f $D/ssh_hostkey -N "" -q
 trap cleanup EXIT
 cleanup
 docker network create $NET >/dev/null 2>&1

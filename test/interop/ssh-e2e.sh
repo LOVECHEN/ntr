@@ -1,6 +1,8 @@
 #!/bin/bash
 set -u
 NET=ntr-interop; D=/tmp/ntr-interop; PW=sshpw; U=nt
+# host 私钥自举(脚本自包含:不依赖别的脚本先生成;缺失时 docker 会把单文件挂载点建成空目录)
+[ -d $D/ssh_hostkey ] && rmdir $D/ssh_hostkey; [ -f $D/ssh_hostkey ] || ssh-keygen -t ed25519 -f $D/ssh_hostkey -N "" -q
 docker network create $NET >/dev/null 2>&1; docker rm -f target sshsrv sshcli >/dev/null 2>&1
 docker run -d --name target --network $NET traefik/whoami >/dev/null
 # SSH 服务端:type=ssh + host 私钥(tls.key) + 密码用户 + direct 落地

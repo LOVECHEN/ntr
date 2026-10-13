@@ -8,6 +8,7 @@ package config
 import (
 	"context"
 	"crypto/sha256"
+	cryptotls "crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -55,9 +56,7 @@ import (
 	muxcool "github.com/LOVECHEN/ntr/outbound/muxcool"
 	"github.com/LOVECHEN/ntr/outbound/naive"
 	"github.com/LOVECHEN/ntr/outbound/shadowquic"
-	sshproto "github.com/LOVECHEN/ntr/outbound/ssh"
 	"github.com/LOVECHEN/ntr/outbound/trusttunnel"
-	"github.com/LOVECHEN/ntr/outbound/tuic"
 	"github.com/LOVECHEN/ntr/outbound/upstream"
 	"github.com/LOVECHEN/ntr/outbound/wireguard"
 	"github.com/LOVECHEN/ntr/reverse"
@@ -399,9 +398,6 @@ func (o Outbound) synthLayers() ([]service.LayerSpec, error) {
 var sessionAuthProtos = map[string]bool{
 	"hysteria2":   true,
 	"hysteria1":   true,
-	"anytls":      true,
-	"tuic":        true,
-	"ssh":         true,
 	"mieru":       true,
 	"shadowquic":  true,
 	"naive":       true,
@@ -420,7 +416,7 @@ func (in Inbound) authProto() string {
 	if sessionAuthProtos[in.Type] {
 		return in.Type
 	}
-	if sp, ok := registry.LookupSession(in.Type); ok && sp.NewInbound != nil { // 会话式插件:自注册即接入顶层 users
+	if sp, ok := registry.LookupSession(in.Type); ok && sp.HasInbound() { // 会话式插件:自注册即接入顶层 users
 		return in.Type
 	}
 	return ""
@@ -1066,12 +1062,6 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			} else {
 				outs[o.Name] = up
 			}
-		case "anytls":
-			up, err := anytls.NewOutbound(anytls.Options{Server: o.Server, Password: o.Secret, SNI: o.SNI, Insecure: o.Insecure})
-			if err != nil {
-				return nil, fmt.Errorf("config: 出站 %q(anytls):%w", o.Name, err)
-			}
-			outs[o.Name] = up
 		case "hysteria1":
 			up, err := hysteria1.NewOutbound(hysteria1.Options{Server: o.Server, Password: o.Secret, Obfs: o.obfsPassword(), SNI: o.SNI, Insecure: o.Insecure})
 			if err != nil {
@@ -1084,22 +1074,10 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 				return nil, fmt.Errorf("config: 出站 %q(hysteria2):%w", o.Name, err)
 			}
 			outs[o.Name] = up
-		case "tuic":
-			up, err := tuic.NewOutbound(tuic.Options{Server: o.Server, UUID: o.UUID, Password: o.Secret, SNI: o.SNI, Insecure: o.Insecure})
-			if err != nil {
-				return nil, fmt.Errorf("config: 出站 %q(tuic):%w", o.Name, err)
-			}
-			outs[o.Name] = up
 		case "shadowquic":
 			up, err := shadowquic.NewOutbound(shadowquic.Options{Server: o.Server, Username: o.User, Password: o.Secret, SNI: o.SNI})
 			if err != nil {
 				return nil, fmt.Errorf("config: 出站 %q(shadowquic):%w", o.Name, err)
-			}
-			outs[o.Name] = up
-		case "ssh":
-			up, err := sshproto.NewOutbound(sshproto.Options{Server: o.Server, User: o.User, Password: o.Secret, PrivateKey: o.PrivateKey, HostKey: o.HostKey})
-			if err != nil {
-				return nil, fmt.Errorf("config: 出站 %q(ssh):%w", o.Name, err)
 			}
 			outs[o.Name] = up
 		case "trusttunnel":
@@ -1312,18 +1290,6 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			default:
 				handler = h
 			}
-		case "anytls":
-			h, err := f.buildAnytlsInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
-			if err != nil {
-				return nil, fmt.Errorf("config: 入站 %s(anytls):%w", in.Listen, err)
-			}
-			handler = h
-		case "ssh":
-			h, err := f.buildSshInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
-			if err != nil {
-				return nil, fmt.Errorf("config: 入站 %s(ssh):%w", in.Listen, err)
-			}
-			handler = h
 		case "trusttunnel":
 			h, err := f.buildTrusttunnelInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
 			if err != nil {
@@ -1348,14 +1314,6 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			inb, err := f.buildHy2Inbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
 			if err != nil {
 				return nil, fmt.Errorf("config: 入站 %s(hysteria2):%w", in.Listen, err)
-			}
-			listen := in.Listen
-			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
-			continue
-		case "tuic":
-			inb, err := f.buildTuicInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
-			if err != nil {
-				return nil, fmt.Errorf("config: 入站 %s(tuic):%w", in.Listen, err)
 			}
 			listen := in.Listen
 			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
@@ -1431,7 +1389,16 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
 			continue
 		default:
-			return nil, fmt.Errorf("config: 入站 %s 未知 type %q", in.Listen, in.Type)
+			// 运行时托管 TCP 监听形态的会话式插件:产出 handler,落到下方通用收尾(limits 校验 + 交 TCP 接入环)。
+			sp, ok := registry.LookupSession(in.Type)
+			if !ok || sp.NewHandler == nil {
+				return nil, fmt.Errorf("config: 入站 %s 未知 type %q", in.Listen, in.Type)
+			}
+			h, err := f.buildSessionPluginHandler(sp, in, out, binds, reg, globalGate, memGuard, metricReg != nil)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(%s):%w", in.Listen, in.Type, err)
+			}
+			handler = h
 		}
 		// 全局 + 每口连接闸(§6.2 层1/2):建每口闸,叠成 [全局, 口] 挂到 ProxyInbound。
 		inboundGate, err := buildGate(in.Limits)
@@ -1999,99 +1966,6 @@ func (f *File) buildProxyInbound(ctx context.Context, in Inbound, resolver servi
 	return handler, base, nil
 }
 
-// buildAnytlsInbound 建 AnyTLS 会话入站(TLS 证书 + 用户 + 绑定出站)。
-// buildAnytlsInbound 建 AnyTLS 入站。顶层 users(binds 非空):tag=BillID 喂 sing-anytls 多用户,命中后
-// anytls.UserFromContext 回读 → cred.ID → SessionDispatch 计量。无 binds 退回口内 in.Users 垫片(身份 Ambient,
-// 闸+mem-guard 仍生效)。注:UDP(UoT)当前走协议内 serveUOT 直落,不经本 dispatch → 暂不计量(TCP 已计)。
-func (f *File) buildAnytlsInbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (endpoint.InboundHandler, error) {
-	tlsConfig, err := anytls.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
-	if err != nil {
-		return nil, err
-	}
-	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
-	if err != nil {
-		return nil, err
-	}
-	var users []anytls.User
-	var refs map[string]cred.ID
-	if len(binds) > 0 {
-		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
-		if err != nil {
-			return nil, err
-		}
-		refs = r
-		for _, su := range sus {
-			users = append(users, anytls.User{Name: su.Tag, Password: su.Secret})
-		}
-	} else {
-		for _, u := range in.Users {
-			pw, _ := u["password"].(string)
-			if pw == "" {
-				continue
-			}
-			name, _ := u["name"].(string)
-			users = append(users, anytls.User{Name: name, Password: pw})
-		}
-	}
-	if len(users) == 0 {
-		return nil, fmt.Errorf("anytls 入站需至少一个用户(顶层 users.keys.anytls 或口内 user{password})")
-	}
-	dispatch := f.sessionDispatch(in, out, adm, refs, anytls.UserFromContext)
-	return anytls.NewInbound(users, tlsConfig, out, dispatch)
-}
-
-// buildSshInbound 建 SSH 会话入站(host 私钥 = tls.key + 用户{password/public-key} + 绑定出站)。
-// 顶层 users(binds 非空):tag=BillID 建库内多用户,认证命中经 sshproto.UserFromContext 回读 →
-// cred.ID → SessionDispatch 计量(承世界 C);ssh 密钥可标量(password)或结构化 {password,public-key}。
-// 无 binds 时退回口内 in.Users 垫片(身份落 Ambient,连接闸 + mem-guard 仍生效)。
-func (f *File) buildSshInbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (*sshproto.Inbound, error) {
-	hostKey := fileOrStr(in.TLS, "key")
-	if hostKey == "" {
-		return nil, fmt.Errorf("ssh 入站需 tls.key(host 私钥 PEM)")
-	}
-	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
-	if err != nil {
-		return nil, err
-	}
-	var users []sshproto.User
-	var refs map[string]cred.ID
-	if len(binds) > 0 {
-		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
-		if err != nil {
-			return nil, err
-		}
-		refs = r
-		for _, su := range sus {
-			u := sshproto.User{Name: su.Tag}
-			if su.Fields != nil { // 结构化 keys.ssh{password,public-key}
-				u.Password = su.Fields["password"]
-				u.PublicKey = su.Fields["public-key"]
-			} else { // 标量 = 密码
-				u.Password = su.Secret
-			}
-			if u.Password == "" && u.PublicKey == "" {
-				return nil, fmt.Errorf("config: 入站 %s 用户 %s 的 keys.ssh 缺 password/public-key", in.inboundName(), su.Tag)
-			}
-			users = append(users, u)
-		}
-	} else {
-		for _, u := range in.Users { // 垫片:口内旧写法;身份落 Ambient
-			name, _ := u["name"].(string)
-			pw, _ := u["password"].(string)
-			pk, _ := u["public-key"].(string)
-			if pw == "" && pk == "" {
-				continue
-			}
-			users = append(users, sshproto.User{Name: name, Password: pw, PublicKey: pk})
-		}
-	}
-	if len(users) == 0 {
-		return nil, fmt.Errorf("ssh 入站需至少一个用户(顶层 users.keys.ssh{password/public-key} 或口内 user)")
-	}
-	dispatch := f.sessionDispatch(in, out, adm, refs, sshproto.UserFromContext)
-	return sshproto.NewInbound(users, hostKey, out, dispatch)
-}
-
 // buildTrusttunnelInbound 建 TrustTunnel 会话入站(服务端证书 + Basic 用户 + 绑定出站)。顶层 users
 // (binds 非空):tag=BillID 作 Basic 用户名,认证命中经 trusttunnel.UserFromContext 回读 → cred.ID →
 // SessionDispatch 计量(承世界 C)。无 binds 退回口内 in.Users 垫片(身份 Ambient)。
@@ -2373,25 +2247,26 @@ func buildSessionAdmitter(in Inbound, reg *meter.Registry, globalGate *meter.Gat
 
 // sessionDispatch:反连 portal(mode=portal)保持原样(隧道载体不计量,不回归);否则用 service 的计量版
 // dispatch(身份回读 → Admit(闸+计量+mem-guard)→ wrap → relay)。
-// buildSessionPluginInbound 建【会话式协议插件】入站:把协议无关的输入打包交给插件,config 不认协议名。
+// sessionPluginEnv 组装【会话式协议插件】入站的协议无关输入(两种入站形态共用),config 不认协议名。
 // 用户:顶层 users(binds 非空)→ tag=BillID + 结构化 keys(复合键)/标量 secret,经 UserFromContext 回读
 // 计量;无 binds 时退回口内 users 垫片(标量字段原样作 Fields,身份落 Ambient)。TCP 走 sessionDispatch
 // (计量/反连 portal),UDP 承载流过 SessionAdmit 计量、数据报交 SessionPacketDispatch(udpNAT)。
-func (f *File) buildSessionPluginInbound(sp registry.Session, in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (registry.Runner, error) {
-	tlsConfig, err := anytls.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
+func (f *File) sessionPluginEnv(sp registry.Session, in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (registry.SessionInbound, error) {
+	tlsCert, tlsKey := fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key")
+	tlsNode, err := mapToNode(in.TLS, "")
 	if err != nil {
-		return nil, err
+		return registry.SessionInbound{}, fmt.Errorf("tls 块:%w", err)
 	}
 	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
 	if err != nil {
-		return nil, err
+		return registry.SessionInbound{}, err
 	}
 	var users []registry.SessionUser
 	var refs map[string]cred.ID
 	if len(binds) > 0 {
 		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
 		if err != nil {
-			return nil, err
+			return registry.SessionInbound{}, err
 		}
 		refs = r
 		for _, su := range sus {
@@ -2408,41 +2283,93 @@ func (f *File) buildSessionPluginInbound(sp registry.Session, in Inbound, out en
 			users = append(users, registry.SessionUser{Tag: fields["name"], Secret: fields["password"], Fields: fields})
 		}
 	}
-	node, err := mapToNode(in.Extra, "")
+	node, err := sessionInboundNode(in)
 	if err != nil {
-		return nil, err
+		return registry.SessionInbound{}, err
 	}
-	return sp.NewInbound(registry.SessionInbound{
+	return registry.SessionInbound{
 		Node:           node,
-		TLS:            tlsConfig,
+		TLSNode:        tlsNode,
+		TLSCert:        tlsCert,
+		TLSKey:         tlsKey,
+		ServerTLS:      func() (*cryptotls.Config, error) { return anytls.ServerTLSConfig(tlsCert, tlsKey) },
 		Users:          users,
 		Out:            out,
 		Dispatch:       f.sessionDispatch(in, out, adm, refs, sp.UserFromContext),
 		Admit:          service.SessionAdmit(adm, refs, sp.UserFromContext),
 		PacketDispatch: service.SessionPacketDispatch(out),
-	})
+	}, nil
 }
 
-// sessionOutboundNode 把会话式插件出站的配置合成一个 spec 映射节点交插件自解:口内未声明键(Extra)+ 通用
-// 具名字段(server/secret/uuid/sni/insecure/user/client-fingerprint;yaml 具名优先会把它们截胡出 Extra,
-// 这里非空即补回)。
-func sessionOutboundNode(o Outbound) (*spec.Node, error) {
-	m := make(map[string]any, len(o.Extra)+7)
-	for k, v := range o.Extra {
-		m[k] = v
+// buildSessionPluginInbound 建自管监听形态的会话式插件入站(Runner)。
+func (f *File) buildSessionPluginInbound(sp registry.Session, in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (registry.Runner, error) {
+	env, err := f.sessionPluginEnv(sp, in, out, binds, reg, globalGate, memGuard, metering)
+	if err != nil {
+		return nil, err
 	}
-	for k, v := range map[string]string{
-		"server": o.Server, "secret": o.Secret, "uuid": o.UUID, "sni": o.SNI,
-		"user": o.User, "client-fingerprint": o.Fingerprint,
-	} {
-		if v != "" {
-			m[k] = v
+	return sp.NewInbound(env)
+}
+
+// buildSessionPluginHandler 建运行时托管 TCP 监听形态的会话式插件入站(InboundHandler)。
+func (f *File) buildSessionPluginHandler(sp registry.Session, in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (endpoint.InboundHandler, error) {
+	env, err := f.sessionPluginEnv(sp, in, out, binds, reg, globalGate, memGuard, metering)
+	if err != nil {
+		return nil, err
+	}
+	return sp.NewHandler(env)
+}
+
+// sessionOutboundNode 把会话式插件出站的全部配置(具名字段 + 口内未声明键)按 yaml 键名合成一个 spec 映射
+// 节点交插件自解 —— 通用序列化,不枚举任何协议的字段(具名字段被结构体截胡出 Extra 也照样回到 Node)。
+func sessionOutboundNode(o Outbound) (*spec.Node, error) {
+	return structToNode(o, "name", "type")
+}
+
+// sessionInboundNode 同上,入站侧:users / tls 由运行时单独解析交插件,不进 Node。
+func sessionInboundNode(in Inbound) (*spec.Node, error) {
+	return structToNode(in, "name", "type", "users", "tls")
+}
+
+// structToNode 把配置结构体按其 yaml 标签序列化成映射(去零值 / 去 drop 键),再转 spec 节点。
+func structToNode(v any, drop ...string) (*spec.Node, error) {
+	b, err := yaml.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	if err := yaml.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	for _, k := range drop {
+		delete(m, k)
+	}
+	for k, val := range m {
+		if isZeroYAML(val) {
+			delete(m, k)
 		}
 	}
-	if o.Insecure {
-		m["insecure"] = true
-	}
 	return mapToNode(m, "")
+}
+
+// isZeroYAML 报一个 yaml 解出值是否为零值(nil / "" / false / 0 / 空表 / 空映射)。
+func isZeroYAML(v any) bool {
+	switch t := v.(type) {
+	case nil:
+		return true
+	case string:
+		return t == ""
+	case bool:
+		return !t
+	case int:
+		return t == 0
+	case float64:
+		return t == 0
+	case []any:
+		return len(t) == 0
+	case map[string]any:
+		return len(t) == 0
+	}
+	return false
 }
 
 func (f *File) sessionDispatch(in Inbound, out endpoint.Outbound, adm *service.Admitter, refs map[string]cred.ID, readUser func(context.Context) (string, bool)) endpoint.StreamDispatch {
@@ -2535,53 +2462,6 @@ func (f *File) buildMieruInbound(in Inbound, out endpoint.Outbound, binds []prin
 	}
 	dispatch := f.sessionDispatch(in, out, adm, refs, mieru.UserFromContext)
 	return mieru.NewInbound(users, in.Transport, out, dispatch)
-}
-
-// buildTuicInbound 建 TUIC 会话入站。TUIC 是【复合键】(uuid+password):顶层 users 用结构化 keys
-// `keys.tuic: {uuid, password}`,tag=BillID 喂库内多用户,命中后 tuic.UserFromContext 回读 → cred.ID →
-// SessionDispatch 计量。无 binds 退回口内 in.Users 垫片(身份 Ambient,闸/mem-guard 仍生效)。
-func (f *File) buildTuicInbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (*tuic.Inbound, error) {
-	tlsConfig, err := anytls.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
-	if err != nil {
-		return nil, err
-	}
-	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
-	if err != nil {
-		return nil, err
-	}
-	var users []tuic.User
-	var refs map[string]cred.ID
-	if len(binds) > 0 {
-		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
-		if err != nil {
-			return nil, err
-		}
-		refs = r
-		for _, su := range sus {
-			if su.Fields == nil {
-				return nil, fmt.Errorf("config: 入站 %s 的 tuic 需结构化 keys{uuid,password}(复合键),不能用标量", in.inboundName())
-			}
-			uuid := su.Fields["uuid"]
-			if uuid == "" {
-				return nil, fmt.Errorf("config: 入站 %s 用户 %s 的 keys.tuic 缺 uuid", in.inboundName(), su.Tag)
-			}
-			users = append(users, tuic.User{Name: su.Tag, UUID: uuid, Password: su.Fields["password"]})
-		}
-	} else {
-		for _, u := range in.Users {
-			uuid, _ := u["uuid"].(string)
-			if uuid == "" {
-				continue
-			}
-			pw, _ := u["password"].(string)
-			users = append(users, tuic.User{UUID: uuid, Password: pw})
-		}
-	}
-	if len(users) == 0 {
-		return nil, fmt.Errorf("tuic 入站需至少一个用户(顶层 users.keys.tuic{uuid,password} 或口内 user{uuid,password})")
-	}
-	dispatch := f.sessionDispatch(in, out, adm, refs, tuic.UserFromContext)
-	return tuic.NewInbound(users, tlsConfig, out, dispatch)
 }
 
 // buildShadowquicInbound 建 ShadowQUIC 入站(JLS PSK 用户 + sni)。sni 从 tls.sni 取(JLS ServerName,

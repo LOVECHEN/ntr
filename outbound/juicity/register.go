@@ -75,9 +75,13 @@ func newInboundFromSession(in registry.SessionInbound) (registry.Runner, error) 
 		}
 		users = append(users, User{Name: u.Tag, UUID: id, Password: pw})
 	}
+	tlsConf, err := in.ServerTLS()
+	if err != nil {
+		return nil, err
+	}
 	return NewInbound(InboundOptions{
 		Users:          users,
-		TLS:            in.TLS,
+		TLS:            tlsConf,
 		Out:            in.Out,
 		Dispatch:       in.Dispatch,
 		Admit:          in.Admit,

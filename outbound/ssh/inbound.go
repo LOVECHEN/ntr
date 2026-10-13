@@ -161,7 +161,7 @@ type directTCPIP struct {
 
 // channelConn 把 ssh.Channel(io.ReadWriteCloser + CloseWrite)补足成 net.Conn:SSH channel 无
 // 地址/截止时间语义,用底层 TCP 的真实 RemoteAddr(供 max-ips 按真源计)+ no-op deadline
-//(SSH 自带流控,relay 不依赖 deadline)。
+// (SSH 自带流控,relay 不依赖 deadline)。
 type channelConn struct {
 	ssh.Channel
 	remote net.Addr // 底层 SSH 连接的客户端地址(该连接所有 channel 共享)

@@ -25,9 +25,17 @@ type SessionUser struct {
 }
 
 // SessionInbound 是构造会话式入站时运行时提供的全部输入(协议无关)。
+//
+// TLS 只给原始材料 + 按需构建:各协议对 tls: 块的用法不同(标准库 TLS / metacubex TLS / SSH host 私钥 /
+// JLS 的 sni…),运行时不预设 —— 需要标准库服务端 TLS 的调 ServerTLS(),其余直接取 PEM / TLSNode。
 type SessionInbound struct {
-	Node  *spec.Node  // 协议自有字段(口内未声明键;插件自解)
-	TLS   *tls.Config // 服务端证书(运行时从 tls: 块加载;为 nil = 口内未配)
+	Node *spec.Node // 协议自有字段(口内未声明键;插件自解)
+
+	TLSNode   *spec.Node                  // 口内 tls: 块(sni/alpn 等;*-file 已读入);未配为空映射
+	TLSCert   string                      // tls 证书 PEM(cert 内联 > cert-file);空 = 未配
+	TLSKey    string                      // tls 私钥 PEM(key 内联 > key-file);空 = 未配
+	ServerTLS func() (*tls.Config, error) // 按需建标准库服务端 TLS(用 TLSCert/TLSKey;二者都空 = 临时自签)
+
 	Users []SessionUser
 
 	Out endpoint.Outbound // 默认出站(已含路由:有 routing 块时按目标分流)
@@ -45,11 +53,16 @@ type Runner interface {
 	Run(ctx context.Context, listen string) error
 }
 
-// Session 是一个会话式协议插件的声明。NewOutbound / NewInbound 可只提供其一(纯客户端或纯服务端)。
+// Session 是一个会话式协议插件的声明。入站有两种形态,二选一:
+//   - NewInbound:自管监听(QUIC/UDP 系,自己绑 socket),返回 Runner;
+//   - NewHandler:由运行时的 TCP 接入环托管监听(TLS-over-TCP 系),返回 endpoint.InboundHandler。
+//
+// NewOutbound 与入站可只提供其一(纯客户端或纯服务端)。
 type Session struct {
 	Name        string
 	NewOutbound func(n *spec.Node) (endpoint.Outbound, error)
 	NewInbound  func(in SessionInbound) (Runner, error)
+	NewHandler  func(in SessionInbound) (endpoint.InboundHandler, error)
 	// UserFromContext 回读鉴权命中的用户 tag(运行时据此把流量计入对应用户);nil = 不支持多用户计量。
 	UserFromContext func(context.Context) (string, bool)
 }
@@ -58,8 +71,11 @@ var sessions = map[string]Session{}
 
 // RegisterSession 注册一个会话式协议插件(协议包 init() 调用)。重名(含与分层注册表同名)panic。
 func RegisterSession(s Session) {
-	if s.Name == "" || (s.NewOutbound == nil && s.NewInbound == nil) {
-		panic("registry: Session 缺 Name 或 NewOutbound/NewInbound")
+	if s.Name == "" || (s.NewOutbound == nil && s.NewInbound == nil && s.NewHandler == nil) {
+		panic("registry: Session 缺 Name 或 NewOutbound/NewInbound/NewHandler")
+	}
+	if s.NewInbound != nil && s.NewHandler != nil {
+		panic(fmt.Sprintf("registry: session protocol %q 的 NewInbound 与 NewHandler 只能二选一", s.Name))
 	}
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
@@ -71,6 +87,9 @@ func RegisterSession(s Session) {
 	}
 	sessions[s.Name] = s
 }
+
+// HasInbound 报该插件是否提供入站(任一形态)。
+func (s Session) HasInbound() bool { return s.NewInbound != nil || s.NewHandler != nil }
 
 // LookupSession 按 type 名查会话式协议插件。
 func LookupSession(name string) (Session, bool) {

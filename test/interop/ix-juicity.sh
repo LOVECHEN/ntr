@@ -29,8 +29,8 @@ PASS=0; FAIL=0
 ok(){ echo "  ✅ $1"; PASS=$((PASS+1)); }
 ng(){ echo "  ❌ $1"; FAIL=$((FAIL+1)); }
 
-# ---- 自举:证书(有效期 ≤398 天,chmod 644 供非 root 读)----
-[ -s "$D/cert.pem" ] || docker run --rm -v "$D":/w -w /w alpine sh -c 'apk add -q openssl >/dev/null 2>&1; openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 90 -nodes -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1; chmod 644 cert.pem key.pem'
+# ---- 自举:证书(与 CI workflow 同法:自签兼作 ca.pem;有效期 ≤398 天,chmod 644 供非 root 读)----
+[ -s "$D/cert.pem" ] || docker run --rm -v "$D":/w -w /w alpine sh -c 'apk add -q openssl >/dev/null 2>&1; openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 90 -nodes -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1; cp cert.pem ca.pem; chmod 644 cert.pem key.pem ca.pem'
 
 # ---- 自举:官方 juicity server/client(源码编,按 tag 钉版本,缓存)----
 if [ ! -x "$JS" ] || [ ! -x "$JC" ]; then
