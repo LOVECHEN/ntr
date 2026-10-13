@@ -19,6 +19,7 @@ import (
 	"github.com/LOVECHEN/ntr/addr"
 	"github.com/LOVECHEN/ntr/buf"
 	"github.com/LOVECHEN/ntr/core/link"
+	"github.com/LOVECHEN/ntr/service"
 )
 
 // freePort 抢一个空闲 TCP 端口号(关掉监听后交给 mieru 服务端自绑;测试内轻量,竞态可忽略)。
@@ -145,7 +146,7 @@ func TestMieruInboundRoundTrip(t *testing.T) {
 
 	// NTR mieru 入站(自绑端口),路由到 dialOutbound。
 	mieruPort := freePort(t)
-	inb, err := NewInbound([]User{{Name: user, Password: pass}}, "TCP", dialOutbound{}, nil)
+	inb, err := NewInbound([]User{{Name: user, Password: pass}}, "TCP", dialOutbound{}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,12 +236,13 @@ func (c *echoPacketConn) Unwrap() any                   { return nil }
 
 var _ link.PacketConn = (*echoPacketConn)(nil)
 
-// TestMieruInboundUDPRoundTrip:NTR mieru 出站 DialPacket → NTR mieru 入站 serveUDP → 内存 echo,
+// TestMieruInboundUDPRoundTrip:NTR mieru 出站 DialPacket → NTR mieru 入站 serveUDP → 运行时 PacketDispatch
+// (udpNAT)→ 内存 echo,
 // 验 NTR 自身 mieru UDP 载荷两侧(出站 DialPacket + 入站 serveUDP)线级自洽。-race 干净。
 func TestMieruInboundUDPRoundTrip(t *testing.T) {
 	const user, pass = "inudpuser", "inudppass"
 	mieruPort := freePort(t)
-	inb, err := NewInbound([]User{{Name: user, Password: pass}}, "TCP", echoUDPOutbound{}, nil)
+	inb, err := NewInbound([]User{{Name: user, Password: pass}}, "TCP", echoUDPOutbound{}, nil, service.SessionPacketDispatch(echoUDPOutbound{}, nil, nil, nil))
 	if err != nil {
 		t.Fatal(err)
 	}

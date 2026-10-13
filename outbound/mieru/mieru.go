@@ -162,6 +162,7 @@ func (o *Outbound) DialPacket(ctx context.Context, dst addr.Socksaddr) (link.Pac
 type udpPacketConn struct {
 	pc    net.PacketConn
 	below net.Conn
+	ips   ipOnly // 包头只许 IP:FQDN 目标先解析(见 ipOnly)
 }
 
 var _ link.PacketConn = (*udpPacketConn)(nil)
@@ -177,8 +178,12 @@ func (c *udpPacketConn) ReadPacket(b *buf.Buffer) (addr.Socksaddr, error) {
 }
 
 func (c *udpPacketConn) WritePacket(b *buf.Buffer, dst addr.Socksaddr) error {
-	// UDPAssociateWrapper.WriteTo 用 NetAddrSpec.From 解 addr(值传保留 FQDN),再前置 socks5 UDP 头。
-	_, err := c.pc.WriteTo(b.Bytes(), toMieruAddr(dst, "udp"))
+	// UDPAssociateWrapper.WriteTo 前置 socks5 UDP 头;头里只许 IP(对端官方实现拒 FQDN),故先解析。
+	dst, err := c.ips.resolve(dst)
+	if err != nil {
+		return err
+	}
+	_, err = c.pc.WriteTo(b.Bytes(), toMieruAddr(dst, "udp"))
 	return err
 }
 

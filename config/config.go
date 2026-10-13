@@ -50,7 +50,6 @@ import (
 	"github.com/LOVECHEN/ntr/outbound/group"
 	"github.com/LOVECHEN/ntr/outbound/hysteria2"
 	"github.com/LOVECHEN/ntr/outbound/masque"
-	"github.com/LOVECHEN/ntr/outbound/mieru"
 	"github.com/LOVECHEN/ntr/outbound/mux"
 	muxcool "github.com/LOVECHEN/ntr/outbound/muxcool"
 	"github.com/LOVECHEN/ntr/outbound/shadowquic"
@@ -393,7 +392,6 @@ func (o Outbound) synthLayers() ([]service.LayerSpec, error) {
 // 登记后 Desugar 会为其口产 CredBinding,build 分支据 binding 建库内多用户 + 计量 dispatch。
 // ★只登记真正接完线的协议(诚实纪律:未接的留空 → 其顶层 users 不生效,别假装)。
 var sessionAuthProtos = map[string]bool{
-	"mieru":      true,
 	"shadowquic": true,
 	"masque":     true,
 	"connect-ip": true,
@@ -1056,12 +1054,6 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 				return nil, fmt.Errorf("config: 出站 %q(shadowquic):%w", o.Name, err)
 			}
 			outs[o.Name] = up
-		case "mieru":
-			up, err := mieru.NewOutbound(mieru.Options{Server: o.Server, Transport: o.Transport, Username: o.User, Password: o.Secret, Multiplexing: o.Multiplexing})
-			if err != nil {
-				return nil, fmt.Errorf("config: 出站 %q(mieru):%w", o.Name, err)
-			}
-			outs[o.Name] = up
 		case "connect-ip":
 			opts := connectip.Options{
 				Server: o.Server, SNI: o.SNI, Insecure: o.Insecure,
@@ -1258,14 +1250,6 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			inb, err := f.buildShadowquicInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
 			if err != nil {
 				return nil, fmt.Errorf("config: 入站 %s(shadowquic):%w", in.Listen, err)
-			}
-			listen := in.Listen
-			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
-			continue
-		case "mieru":
-			inb, err := f.buildMieruInbound(in, out, binds, reg, globalGate, memGuard, metricReg != nil)
-			if err != nil {
-				return nil, fmt.Errorf("config: 入站 %s(mieru):%w", in.Listen, err)
 			}
 			listen := in.Listen
 			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return inb.Run(ctx, listen) }})
@@ -2194,51 +2178,6 @@ func (f *File) sessionDispatch(in Inbound, out endpoint.Outbound, adm *service.A
 		return sessionPortalDispatch(in)
 	}
 	return service.SessionDispatch(out, adm, refs, readUser)
-}
-
-// buildMieruInbound 建 mieru 会话入站(官方库自绑端口,用户名+口令,TCP/UDP 传输)。顶层 users
-// (binds 非空):tag=BillID 建库内多用户,accepted conn 的 UserContext.UserName() 经 mieru.UserFromContext
-// 回读 → cred.ID → SessionDispatch 计量(承世界 C)。无 binds 退回口内 in.Users 垫片(身份 Ambient)。
-func (f *File) buildMieruInbound(in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (*mieru.Inbound, error) {
-	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
-	if err != nil {
-		return nil, err
-	}
-	var users []mieru.User
-	var refs map[string]cred.ID
-	if len(binds) > 0 {
-		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
-		if err != nil {
-			return nil, err
-		}
-		refs = r
-		for _, su := range sus {
-			// ★mieru 库内认证用户名 = tag(=BillID):UserName() 回读的正是它,须与 refs 键一致,
-			// 否则计量落 Ambient。故 keys.mieru 只需口令(标量或 {password}),用户名即该凭据的 BillID。
-			pw := su.Secret
-			if su.Fields != nil {
-				pw = su.Fields["password"]
-			}
-			if pw == "" {
-				return nil, fmt.Errorf("config: 入站 %s 用户 %s 的 keys.mieru 缺 password", in.inboundName(), su.Tag)
-			}
-			users = append(users, mieru.User{Name: su.Tag, Password: pw})
-		}
-	} else {
-		for _, u := range in.Users {
-			name, _ := u["name"].(string)
-			pw, _ := u["password"].(string)
-			if name == "" || pw == "" {
-				continue
-			}
-			users = append(users, mieru.User{Name: name, Password: pw})
-		}
-	}
-	if len(users) == 0 {
-		return nil, fmt.Errorf("mieru 入站需至少一个用户(顶层 users.keys.mieru{password} 或口内 user{name,password})")
-	}
-	dispatch := f.sessionDispatch(in, out, adm, refs, mieru.UserFromContext)
-	return mieru.NewInbound(users, in.Transport, out, dispatch)
 }
 
 // buildShadowquicInbound 建 ShadowQUIC 入站(JLS PSK 用户 + sni)。sni 从 tls.sni 取(JLS ServerName,

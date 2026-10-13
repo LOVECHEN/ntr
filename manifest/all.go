@@ -8,6 +8,7 @@ import (
 	_ "github.com/LOVECHEN/ntr/outbound/hysteria1"   // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/hysteria2"   // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/juicity"     // 会话式协议插件
+	_ "github.com/LOVECHEN/ntr/outbound/mieru"       // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/naive"       // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/ssh"         // 会话式协议插件
 	_ "github.com/LOVECHEN/ntr/outbound/trusttunnel" // 会话式协议插件

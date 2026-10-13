@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"time"
 
 	mierucommon "github.com/enfein/mieru/v3/apis/common"
 	mieruconstant "github.com/enfein/mieru/v3/apis/constant"
@@ -50,17 +51,19 @@ type Inbound struct {
 	transport string // TCP | UDP
 	out       endpoint.Outbound
 	dispatch  endpoint.StreamDispatch
+	packet    endpoint.PacketDispatch
 }
 
-// NewInbound 构造 mieru 入站。dispatch 非 nil 时每条已握手流改派给它(反连 portal),否则 relay 到 out。
-func NewInbound(users []User, transport string, out endpoint.Outbound, dispatch endpoint.StreamDispatch) (*Inbound, error) {
+// NewInbound 构造 mieru 入站。dispatch 非 nil 时每条已握手流改派给它(计量 / 反连 portal),否则 relay 到 out。
+// packet 接手 UDP-ASSOCIATE 会话(运行时按包目标路由 + 准入计量;portal 口桥进隧道);nil = 拒 UDP。
+func NewInbound(users []User, transport string, out endpoint.Outbound, dispatch endpoint.StreamDispatch, packet endpoint.PacketDispatch) (*Inbound, error) {
 	if len(users) == 0 {
 		return nil, fmt.Errorf("mieru: 入站需至少一个用户")
 	}
 	if transport == "" {
 		transport = "TCP"
 	}
-	return &Inbound{users: users, transport: transport, out: out, dispatch: dispatch}, nil
+	return &Inbound{users: users, transport: transport, out: out, dispatch: dispatch, packet: packet}, nil
 }
 
 // Run 启动 mieru 服务端(自绑 listenAddr 的端口)并循环 Accept,阻塞至 ctx 取消。
@@ -151,68 +154,62 @@ func (h *Inbound) serveTCP(ctx context.Context, conn net.Conn, dst addr.Socksadd
 	_ = relay.Relay(connStream{conn}, up)
 }
 
-// serveUDP:UDP-over-tunnel 中继。回 success 后套 PacketOverStreamTunnel;上行读客户端 socks5-UDP
-// 分帧包(目标+载荷)→ NTR 出站 DialPacket(多目标);下行把出站回包重新分帧回隧道。目标解析交给
-// 出站(支持 FQDN),回包源恒 IP。
+// serveUDP:UDP-over-tunnel。回 success 后套 PacketOverStreamTunnel,包成多目标 link.PacketConn
+// (每包 socks5-UDP 分帧自带目标)交运行时 PacketDispatch —— 逐包按目标路由、回包按真实来源回写、
+// 准入 + 计量随身份(ctx)走;portal 口整条会话桥进隧道。
 func (h *Inbound) serveUDP(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
+	if h.packet == nil {
+		writeReply(conn, mieruconstant.Socks5ReplyCommandNotSupported)
+		_ = conn.Close()
+		return
+	}
 	writeReply(conn, mieruconstant.Socks5ReplySuccess)
-	tunnel := mierucommon.NewPacketOverStreamTunnel(conn)
+	_ = h.packet(ctx, &tunnelPacketConn{conn: conn, tunnel: mierucommon.NewPacketOverStreamTunnel(conn)})
+}
 
-	var (
-		mu     sync.Mutex
-		pc     link.PacketConn
-		dlOnce sync.Once
-	)
-	rbuf := make([]byte, 64*1024)
+// tunnelPacketConn 把 mieru 的 UDP-over-tunnel(socks5-UDP 分帧)适配成 link.PacketConn(服务端侧客户端连接):
+// ReadPacket 解出目标 + 载荷;WritePacket 以回包来源分帧写回。写并发安全(运行时多目标回写会并发)。
+type tunnelPacketConn struct {
+	conn   net.Conn
+	tunnel net.PacketConn
+	wmu    sync.Mutex
+	rbuf   [64 * 1024]byte
+	ips    ipOnly // 回包头只许 IP(官方客户端拒 FQDN):目标以域名进来时回包来源须还原成 IP
+}
+
+var _ link.PacketConn = (*tunnelPacketConn)(nil)
+
+func (c *tunnelPacketConn) ReadPacket(b *buf.Buffer) (addr.Socksaddr, error) {
 	for {
-		n, _, err := tunnel.ReadFrom(rbuf)
+		n, _, err := c.tunnel.ReadFrom(c.rbuf[:])
 		if err != nil {
-			break
+			return addr.Socksaddr{}, err
 		}
-		target, data, err := parseSocks5UDP(rbuf[:n])
-		if err != nil {
+		target, data, err := parseSocks5UDP(c.rbuf[:n])
+		if err != nil || len(data) > b.Tailroom() { // 坏帧 / 超缓冲:丢弃,读下一个(保包边界)
 			continue
 		}
-		mu.Lock()
-		if pc == nil {
-			pc, err = h.out.DialPacket(ctx, target)
-			if err != nil {
-				mu.Unlock()
-				break
-			}
-			cur := pc
-			dlOnce.Do(func() { go h.udpDownlink(cur, tunnel) })
-		}
-		cur := pc
-		mu.Unlock()
-
-		wb := buf.New()
-		_, _ = wb.Write(data)
-		if err := cur.WritePacket(wb, target); err != nil {
-			break
-		}
-	}
-	mu.Lock()
-	if pc != nil {
-		_ = pc.Close()
-	}
-	mu.Unlock()
-}
-
-// udpDownlink 把出站回包重新分帧([RSV2 FRAG ATYP src port][data])写回 mieru 隧道。
-func (h *Inbound) udpDownlink(pc link.PacketConn, tunnel net.PacketConn) {
-	for {
-		b := buf.New()
-		src, err := pc.ReadPacket(b)
-		if err != nil {
-			return
-		}
-		if _, err := tunnel.WriteTo(encodeSocks5UDP(src, b.Bytes()), nil); err != nil {
-			return
-		}
+		copy(b.ExtendTail(len(data)), data)
+		return target, nil
 	}
 }
+
+func (c *tunnelPacketConn) WritePacket(b *buf.Buffer, src addr.Socksaddr) error {
+	ipSrc, err := c.ips.resolve(src)
+	if err != nil { // 解析不出(极少:目标域名本机查不到而上游能通)→ 以 0.0.0.0 标注来源,不丢包
+		ipSrc = addr.FromIPPort(netip.AddrPortFrom(netip.IPv4Unspecified(), src.Port))
+	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	_, err = c.tunnel.WriteTo(encodeSocks5UDP(ipSrc, b.Bytes()), nil)
+	return err
+}
+
+func (c *tunnelPacketConn) Close() error                  { return c.conn.Close() }
+func (c *tunnelPacketConn) LocalAddr() net.Addr           { return c.conn.LocalAddr() }
+func (c *tunnelPacketConn) RemoteAddr() net.Addr          { return c.conn.RemoteAddr() }
+func (c *tunnelPacketConn) SetDeadline(t time.Time) error { return c.conn.SetReadDeadline(t) }
+func (c *tunnelPacketConn) Unwrap() any                   { return nil }
 
 // writeReply 回一条 socks5 应答(BindAddr 用 0.0.0.0:0,mieru 客户端不校验其值)。
 func writeReply(conn net.Conn, reply byte) {
