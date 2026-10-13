@@ -57,5 +57,5 @@ func newHandlerFromSession(in registry.SessionInbound) (endpoint.InboundHandler,
 	if err != nil {
 		return nil, err
 	}
-	return NewInbound(users, tlsConf, in.Out, in.Dispatch)
+	return NewInbound(users, tlsConf, in.Out, in.Dispatch, in.PacketDispatch)
 }

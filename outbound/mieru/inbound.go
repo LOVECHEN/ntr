@@ -22,6 +22,7 @@ import (
 	"github.com/LOVECHEN/ntr/core/endpoint"
 	"github.com/LOVECHEN/ntr/core/link"
 	"github.com/LOVECHEN/ntr/core/relay"
+	"github.com/LOVECHEN/ntr/internal/ipresolve"
 )
 
 // User 是 mieru 服务端用户(名 + 口令)。
@@ -174,7 +175,7 @@ type tunnelPacketConn struct {
 	tunnel net.PacketConn
 	wmu    sync.Mutex
 	rbuf   [64 * 1024]byte
-	ips    ipOnly // 回包头只许 IP(官方客户端拒 FQDN):目标以域名进来时回包来源须还原成 IP
+	ips    ipresolve.Cache // 回包头只许 IP(官方客户端拒 FQDN):目标以域名进来时回包来源须还原成 IP
 }
 
 var _ link.PacketConn = (*tunnelPacketConn)(nil)
@@ -195,7 +196,7 @@ func (c *tunnelPacketConn) ReadPacket(b *buf.Buffer) (addr.Socksaddr, error) {
 }
 
 func (c *tunnelPacketConn) WritePacket(b *buf.Buffer, src addr.Socksaddr) error {
-	ipSrc, err := c.ips.resolve(src)
+	ipSrc, err := c.ips.Resolve(src)
 	if err != nil { // 解析不出(极少:目标域名本机查不到而上游能通)→ 以 0.0.0.0 标注来源,不丢包
 		ipSrc = addr.FromIPPort(netip.AddrPortFrom(netip.IPv4Unspecified(), src.Port))
 	}

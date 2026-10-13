@@ -50,10 +50,11 @@ type Inbound struct {
 	users     map[string]string // name → password
 	out       endpoint.Outbound
 	dispatch  endpoint.StreamDispatch
+	packet    endpoint.PacketDispatch
 }
 
 // NewInbound 构造 TrustTunnel 入站(服务端证书 + Basic 用户 + 绑定出站)。
-func NewInbound(users []User, tlsConfig *cryptotls.Config, out endpoint.Outbound, dispatch endpoint.StreamDispatch) (*Inbound, error) {
+func NewInbound(users []User, tlsConfig *cryptotls.Config, out endpoint.Outbound, dispatch endpoint.StreamDispatch, packet endpoint.PacketDispatch) (*Inbound, error) {
 	m := make(map[string]string, len(users))
 	for _, u := range users {
 		if u.Name != "" {
@@ -64,7 +65,7 @@ func NewInbound(users []User, tlsConfig *cryptotls.Config, out endpoint.Outbound
 		return nil, errors.New("trusttunnel: 入站需至少一个 user{name,password}")
 	}
 	tlsConfig.NextProtos = []string{"h2"}
-	return &Inbound{tlsConfig: tlsConfig, users: m, out: out, dispatch: dispatch}, nil
+	return &Inbound{tlsConfig: tlsConfig, users: m, out: out, dispatch: dispatch, packet: packet}, nil
 }
 
 // HandleStream:对一条 TCP 连接做 TLS + H2 服务端,解复用其上的 CONNECT 流。阻塞至 H2 连接结束。
@@ -86,7 +87,7 @@ func (h *Inbound) HandlePacket(context.Context, link.PacketConn, *endpoint.Metad
 	return errors.New("trusttunnel: packet inbound not supported")
 }
 
-// serve 处理一条 H2 请求:必须是 CONNECT + Basic 认证通过;_check 心跳回 200;_udp2/_icmp 暂拒;
+// serve 处理一条 H2 请求:必须是 CONNECT + Basic 认证通过;_check 心跳回 200;_udp2 交 PacketDispatch;_icmp 暂拒;
 // 其余按 :authority 目标建流路由。handler 阻塞至 relay 收尾(保持 H2 流存活)。
 func (h *Inbound) serve(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodConnect {
@@ -107,8 +108,11 @@ func (h *Inbound) serve(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	case "_check": // 健康检查心跳
 		w.WriteHeader(http.StatusOK)
 		return
-	case "_udp2", "_icmp":
-		http.Error(w, "udp/icmp not implemented", http.StatusNotImplemented)
+	case udpMagic:
+		h.serveUDP(ctx, w, r)
+		return
+	case "_icmp":
+		http.Error(w, "icmp not implemented", http.StatusNotImplemented)
 		return
 	}
 	flusher, ok := w.(http.Flusher)
@@ -136,6 +140,20 @@ func (h *Inbound) serve(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		return
 	}
 	_ = relay.Relay(st, up) // 阻塞至收尾,保持 handler(H2 流)存活
+}
+
+// serveUDP 处理 _udp2:回 200 后把流上的长度前缀帧包成多目标 link.PacketConn 交 PacketDispatch
+// (运行时准入计量 + 按包目标路由;portal 口桥进隧道)。handler 阻塞至会话结束(保持 H2 流存活)。
+func (h *Inbound) serveUDP(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if h.packet == nil || !ok {
+		http.Error(w, "udp not enabled", http.StatusNotImplemented)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+	st := &h2Stream{r: r.Body, w: serverWriteFlusher{w: w, f: flusher}, closeFn: r.Body.Close, remote: remoteAddr(r.RemoteAddr)}
+	_ = h.packet(ctx, newFrameConn(st, false, remoteAddr(r.RemoteAddr)))
 }
 
 // authUser 校验 "Basic base64(user:pass)":解出用户查表,常量时间比对密码;成功返回命中的用户名。

@@ -1,9 +1,9 @@
 #!/bin/bash
-# 会话式协议当反连 portal:hy2 / tuic / anytls / hysteria1 / juicity / mieru / shadowquic / masque 各自 type + mode: portal,协议本身一行不改,
+# 会话式协议当反连 portal:hy2 / tuic / anytls / hysteria1 / juicity / mieru / shadowquic / masque / trusttunnel 各自 type + mode: portal,协议本身一行不改,
 # 只靠运行时注入的 StreamDispatch 把已握手流改派进隧道。每协议一组:
 #   portal(NTR,mode: portal)← bridge(NTR,bridges: 反连拨 portal)  usr(NTR socks → 同协议拨 portal)
 # 判据:usr 经 portal 打靶机 whoami,靶机看到的来源 IP == bridge 的 IP(流量确从 bridge 落地,而非 portal 直出)。
-# UDP(hy2/tuic/hy1/juicity/mieru/masque):usr 经 socks UDP 打「回报来源 IP」的 UDP 服务,回报 == bridge IP(UDP 会话整条桥进
+# UDP(hy2/tuic/hy1/juicity/mieru/masque/shadowquic/trusttunnel):usr 经 socks UDP 打「回报来源 IP」的 UDP 服务,回报 == bridge IP(UDP 会话整条桥进
 # 隧道,不在 portal 主机直出)。另测 mihomo 原生 hy1 客户端当 usr(它发完请求阻塞读应答才发载荷 —— portal 须先回 OK)。
 # 专属隔离:network=ixsp 容器前缀=ixsp-
 set -u
@@ -25,13 +25,13 @@ docker run -d --name ${PFX}usrc --network $NET -v $D/_sp_udpsrc.py:/s.py:ro pyth
 # $1=协议 type;入站用户行 / 出站凭据行按协议给
 users_of(){ case $1 in
   tuic|juicity) printf '      - uuid: "%s"\n        password: "%s"\n' "$UUID" "$PW" ;;
-  mieru)        printf '      - name: u\n        password: "%s"\n' "$PW" ;;
+  mieru|trusttunnel) printf '      - name: u\n        password: "%s"\n' "$PW" ;;
   shadowquic)   printf '      - username: u\n        password: "%s"\n' "$PW" ;;
   *)            printf '      - password: "%s"\n' "$PW" ;;
 esac; }
 cred_of(){ case $1 in
   tuic|juicity) printf '    uuid: "%s"\n    secret: "%s"\n' "$UUID" "$PW" ;;
-  mieru|shadowquic) printf '    user: u\n    secret: "%s"\n' "$PW" ;;
+  mieru|shadowquic|trusttunnel) printf '    user: u\n    secret: "%s"\n' "$PW" ;;
   *)            printf '    secret: "%s"\n' "$PW" ;;
 esac; }
 
@@ -56,7 +56,7 @@ one(){ local P=$1 p=${PFX}$1-
   done
   if [ -n "$RA" ] && [ "$RA" = "$BIP" ]; then echo "  ✅ $P 当反连 portal(靶机来源=$RA = bridge)"
   else echo "  ❌ $P 当反连 portal(靶机来源=${RA:-无} bridge=$BIP)"; docker logs ${p}portal 2>&1|tail -3; docker logs ${p}bridge 2>&1|tail -3; fi
-  case $P in hysteria2|tuic|hysteria1|juicity|mieru|masque)
+  case $P in hysteria2|tuic|hysteria1|juicity|mieru|masque|shadowquic|trusttunnel)
     local UA=""
     for i in 1 2 3 4 5; do
       UA=$(docker run --rm --network $NET -e CLI=${p}usr -e ECHO=${PFX}usrc -v $D/socksudp-cfg.py:/u.py:ro python:3-alpine python /u.py 2>&1 | sed -n "s/^GOT b'\([0-9.]*\)'.*/\1/p")
@@ -80,5 +80,5 @@ one(){ local P=$1 p=${PFX}$1-
 }
 
 echo "==== 会话式协议当反连 portal ===="
-for P in ${SP_PROTOS:-hysteria2 tuic anytls hysteria1 juicity mieru shadowquic masque}; do one $P; done  # SP_PROTOS 可只跑子集
+for P in ${SP_PROTOS:-hysteria2 tuic anytls hysteria1 juicity mieru shadowquic masque trusttunnel}; do one $P; done  # SP_PROTOS 可只跑子集
 cleanup; echo DONE

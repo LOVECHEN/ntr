@@ -1,4 +1,6 @@
-package mieru
+// Package ipresolve 给「UDP 包头只许 IP」的协议(mieru UDP-associate、TrustTunnel _udp2 …)把 FQDN 目标/来源
+// 还原成 IP:IP 字面量(socks5 客户端常以 ATYP=3 发 "1.2.3.4")直接解析,真域名查一次 DNS 后按会话缓存。
+package ipresolve
 
 import (
 	"context"
@@ -11,18 +13,16 @@ import (
 	"github.com/LOVECHEN/ntr/addr"
 )
 
-// ipOnly 保证 mieru UDP-associate 包头只出现 IP:官方 UDPAssociateWrapper 收到带 FQDN 的头直接报
-// 「peer used FQDN in UDP associate header, which is unsupported」丢包(线格式约束,两端皆然)。
-// mihomo 客户端发出前先解析,故与之交叉测不出;NTR 两端都要自守:IP 字面量(socks5 客户端常以
-// ATYP=3 发 "1.2.3.4")直接解析,真域名查一次 DNS 后按会话缓存。
-type ipOnly struct {
+// Cache 是按会话的域名 → IP 缓存(零值可用,并发安全)。
+type Cache struct {
 	mu sync.Mutex
 	m  map[string]netip.Addr
 }
 
-var errNoIP = errors.New("mieru: UDP 目标域名解析无结果")
+var errNoIP = errors.New("UDP 目标域名解析无结果")
 
-func (c *ipOnly) resolve(a addr.Socksaddr) (addr.Socksaddr, error) {
+// Resolve 返回 a 的 IP 形式(已是 IP 原样返回)。
+func (c *Cache) Resolve(a addr.Socksaddr) (addr.Socksaddr, error) {
 	if !a.IsFqdn() {
 		return a, nil
 	}

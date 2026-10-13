@@ -2,7 +2,7 @@
 //
 // TrustTunnel 是 AdGuard VPN 开源的抗审查 VPN 协议(github.com/TrustTunnel/TrustTunnel,
 // 公开 PROTOCOL.md):把 TCP/UDP/ICMP 封进加密的 HTTP/2 或 HTTP/3,流量与普通 HTTPS 不可区分。
-// 本实现按 spec 自写(H2 + TCP CONNECT MVP;h3 与 UDP/_udp2 后置),互通对端可用 mihomo 官方实现。
+// 本实现按 spec 自写(H2:TCP CONNECT + UDP _udp2 帧复用,见 udp.go;h3 后置),互通对端可用 mihomo 实现。
 //
 // 会话式:一条 TLS+H2 连接多路复用多条 CONNECT 流,故走 endpoint.Outbound(客户端开 CONNECT 流)
 // + InboundHandler(服务端 h2 CONNECT 解复用),不套 NTR 流式栈。TLS 自建(ALPN h2),认证 Basic。
@@ -69,15 +69,15 @@ func NewOutbound(o Options) (*Outbound, error) {
 
 // DialStream 在 H2 连接上开一条到 dst 的 CONNECT 流(收 200 后成裸双向字节流)。
 func (o *Outbound) DialStream(ctx context.Context, dst addr.Socksaddr) (link.Stream, error) {
-	st, err := o.connect(ctx, dst.String())
+	st, err := o.connect(ctx, dst.String(), "ntr trusttunnel")
 	if err != nil {
 		o.reset(nil)
-		st, err = o.connect(ctx, dst.String())
+		st, err = o.connect(ctx, dst.String(), "ntr trusttunnel")
 	}
 	return st, err
 }
 
-func (o *Outbound) connect(ctx context.Context, authority string) (link.Stream, error) {
+func (o *Outbound) connect(ctx context.Context, authority, userAgent string) (link.Stream, error) {
 	cc, err := o.getConn(ctx)
 	if err != nil {
 		return nil, err
@@ -89,7 +89,7 @@ func (o *Outbound) connect(ctx context.Context, authority string) (link.Stream, 
 		Host:   authority,
 		Header: http.Header{
 			"proxy-authorization": []string{o.authHeader},
-			"user-agent":          []string{"ntr trusttunnel"},
+			"user-agent":          []string{userAgent},
 		},
 		Body: pr,
 	}).WithContext(ctx)
@@ -106,9 +106,17 @@ func (o *Outbound) connect(ctx context.Context, authority string) (link.Stream, 
 	return &h2Stream{r: resp.Body, w: pw, closeFn: func() error { _ = pw.Close(); return resp.Body.Close() }}, nil
 }
 
-// DialPacket:TrustTunnel UDP(_udp2 帧复用)待接入。
-func (o *Outbound) DialPacket(context.Context, addr.Socksaddr) (link.PacketConn, error) {
-	return nil, errors.New("trusttunnel: UDP (_udp2) not implemented yet")
+// DialPacket 开一条 _udp2 复用流(CONNECT 到魔术 authority),返回多目标 link.PacketConn:dst 不绑定,
+// 每包按 WritePacket 的目标成帧(地址只许 IP,FQDN 先解析)。
+func (o *Outbound) DialPacket(ctx context.Context, _ addr.Socksaddr) (link.PacketConn, error) {
+	st, err := o.connect(ctx, udpMagic, udpUserAgent)
+	if err != nil {
+		o.reset(nil)
+		if st, err = o.connect(ctx, udpMagic, udpUserAgent); err != nil {
+			return nil, err
+		}
+	}
+	return newFrameConn(st, true, nil), nil
 }
 
 // getConn 返回复用的 H2 ClientConn,首次或不可用时惰性 TLS 建连。

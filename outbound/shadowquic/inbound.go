@@ -45,10 +45,12 @@ type Inbound struct {
 	quicConf *jlsquic.Config
 	out      endpoint.Outbound
 	dispatch endpoint.StreamDispatch
+	packet   endpoint.PacketDispatch
 }
 
 // NewInbound 构造 ShadowQUIC 入站(服务端随机证书 + JLS 用户 + 绑定出站)。sni 缺省取 dest host。
-func NewInbound(users []User, sni, dest string, alpn []string, out endpoint.Outbound, dispatch endpoint.StreamDispatch) (*Inbound, error) {
+// packet 接手 UDP 关联(运行时准入计量 + 路由;portal 口桥进隧道);nil = 拒 UDP 关联。
+func NewInbound(users []User, sni, dest string, alpn []string, out endpoint.Outbound, dispatch endpoint.StreamDispatch, packet endpoint.PacketDispatch) (*Inbound, error) {
 	if len(users) == 0 {
 		return nil, errors.New("shadowquic: 至少一个用户")
 	}
@@ -87,6 +89,7 @@ func NewInbound(users []User, sni, dest string, alpn []string, out endpoint.Outb
 		},
 		out:      out,
 		dispatch: dispatch,
+		packet:   packet,
 	}, nil
 }
 
@@ -125,23 +128,38 @@ func (h *Inbound) handleConn(ctx context.Context, conn *jlsquic.Conn) {
 	if name := conn.ConnectionState().TLS.JLS.User; name != "" {
 		ctx = withUser(ctx, name)
 	}
+	var cu *connUDP
+	if h.packet != nil { // UDP 状态随连接建(datagram/单向流接收环每连接唯一;控制与数据到达顺序不保证)
+		cu = newConnUDP(conn)
+	}
 	for {
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
 			return
 		}
-		go h.handleStream(ctx, conn, stream)
+		go h.handleStream(ctx, conn, cu, stream)
 	}
 }
 
-// handleStream 读一条流的首段 [cmd][socks5addr],CommandConnect 即路由到出站中继。
-func (h *Inbound) handleStream(ctx context.Context, conn *jlsquic.Conn, stream *jlsquic.Stream) {
+// handleStream 读一条流的首段 [cmd][socks5addr]:CONNECT 路由到出站中继;ASSOCIATE 起 UDP 关联交 PacketDispatch。
+func (h *Inbound) handleStream(ctx context.Context, conn *jlsquic.Conn, cu *connUDP, stream *jlsquic.Stream) {
 	var cmd [1]byte
 	if _, err := io.ReadFull(stream, cmd[:]); err != nil {
 		_ = stream.Close()
 		return
 	}
-	if cmd[0] != cmdConnect { // v1 仅 CONNECT(UDP associate 后续)
+	switch cmd[0] {
+	case cmdConnect:
+	case cmdAssociateDatagram, cmdAssociateStream:
+		if _, err := readSocksAddr(stream); err != nil || cu == nil { // 关联请求地址无意义(客户端写 0.0.0.0:0)
+			stream.CancelRead(0)
+			_ = stream.Close()
+			return
+		}
+		_ = h.packet(ctx, newAssoc(cu, stream, cmd[0], conn.RemoteAddr())) // 返回时关联已关
+		return
+	default:
+		stream.CancelRead(0)
 		_ = stream.Close()
 		return
 	}

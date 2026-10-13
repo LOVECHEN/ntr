@@ -6,7 +6,7 @@
 // CommandConnect=0x01 后即 TCP 中继。socks5.Addr = [atyp][addr][port BE],atyp 1=IPv4/3=域名/4=IPv6。
 // JLS 认证在 QUIC 的 TLS 握手层(jls-tls),故认证通过的对端与 mihomo 逐字节一致。
 //
-// v1:TCP CONNECT 路径 + 双向交叉验证。UDP(CommandAssociateDatagram/Stream)、Brutal 拥塞为后续增量。
+// TCP CONNECT 与 UDP 关联(0x03 datagram / 0x04 stream,见 udp.go)均已实现;Brutal 拥塞为后续增量。
 package shadowquic
 
 import (

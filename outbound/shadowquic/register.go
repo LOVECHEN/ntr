@@ -12,7 +12,8 @@ import (
 // 会话式协议插件自注册(registry.RegisterSession):运行时按 type: shadowquic 查表,本包自解字段。
 // 入站跑在 JLS-over-QUIC(UDP)上,自管监听(NewInbound → Runner)。
 //
-// 出站字段:server / user / secret(或 password)/ sni(JLS ServerName,缺省取 server host)。
+// 出站字段:server / user / secret(或 password)/ sni(JLS ServerName,缺省取 server host)/
+// udp-over-stream(UDP 用单向流而非 datagram,同 mihomo 键名)。
 // 入站:sni 取 tls 块的 sni(须与客户端 servername 一致);target 兜底推导 sni。用户 = JLS PSK 用户名 + 口令,
 // ★用户名 = 计量 tag(握手 ConnectionState().TLS.JLS.User 回读的正是它),故顶层 users 的 keys.shadowquic
 // 只写口令;口内 users 写 username/password。
@@ -31,10 +32,11 @@ func newOutboundFromNode(n *spec.Node) (endpoint.Outbound, error) {
 		pw = n.Get("secret").Str()
 	}
 	return NewOutbound(Options{
-		Server:   n.Get("server").Str(),
-		Username: n.Get("user").Str(),
-		Password: pw,
-		SNI:      n.Get("sni").Str(),
+		Server:        n.Get("server").Str(),
+		Username:      n.Get("user").Str(),
+		Password:      pw,
+		SNI:           n.Get("sni").Str(),
+		UDPOverStream: n.Get("udp-over-stream").Bool(),
 	})
 }
 
@@ -60,5 +62,5 @@ func newInboundFromSession(in registry.SessionInbound) (registry.Runner, error) 
 	if len(users) == 0 {
 		return nil, errors.New("shadowquic 入站需至少一个用户(顶层 users.keys.shadowquic{password} 或口内 user{username,password})")
 	}
-	return NewInbound(users, in.TLSNode.Get("sni").Str(), in.Node.Get("target").Str(), nil, in.Out, in.Dispatch)
+	return NewInbound(users, in.TLSNode.Get("sni").Str(), in.Node.Get("target").Str(), nil, in.Out, in.Dispatch, in.PacketDispatch)
 }

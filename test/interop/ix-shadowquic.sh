@@ -1,7 +1,7 @@
 #!/bin/bash
 # ShadowQUIC(JLS-over-QUIC 抗检测代理)交叉验证:NTR <-> mihomo(唯一另一实现;xray/sing-box 无)。
 # QUIC+JLS 核心桥 github.com/metacubex/jls-quic-go(NTR 与 mihomo 同源);协议帧([cmd][socks5addr])
-# NTR 自写、逐字节对齐 mihomo transport/shadowquic。v1 仅 TCP CONNECT(UDP/Brutal 后续)。
+# NTR 自写、逐字节对齐 mihomo transport/shadowquic。本脚本测 TCP CONNECT;UDP 关联见 ix-shadowquic-udp.sh。
 set -u
 NET=ix-sq; PFX=ixsq-; D=/tmp/ntr-interop; NTR=${NTR_BIN:-$D/ntr}
 U=squser; PW=sqpass
