@@ -420,6 +420,9 @@ func (in Inbound) authProto() string {
 	if sessionAuthProtos[in.Type] {
 		return in.Type
 	}
+	if sp, ok := registry.LookupSession(in.Type); ok && sp.NewInbound != nil { // 会话式插件:自注册即接入顶层 users
+		return in.Type
+	}
 	return ""
 }
 
@@ -996,6 +999,19 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 		if o.newFormat() { // 第4章新格式:type=协议名 + 层块,走流式栈(同 proxy 形态)
 			otyp = "proxy"
 		}
+		// 会话式协议插件出站(自注册):按 type 查表,字段合成 Node 交插件自解 —— config 不认协议名。
+		if sp, ok := registry.LookupSession(o.Type); ok && sp.NewOutbound != nil {
+			node, err := sessionOutboundNode(o)
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q(%s):%w", o.Name, o.Type, err)
+			}
+			up, err := sp.NewOutbound(node)
+			if err != nil {
+				return nil, fmt.Errorf("config: 出站 %q(%s):%w", o.Name, o.Type, err)
+			}
+			outs[o.Name] = up
+			continue
+		}
 		switch otyp {
 		case "select", "urltest", "fallback", "load-balance":
 			pendingGroups = append(pendingGroups, o) // 见出站 loop 后的第二趟
@@ -1260,6 +1276,17 @@ func (f *File) Build(ctx context.Context) ([]Instance, error) {
 			typ = "proxy"
 		}
 		binds := bindingsByInbound[in.inboundName()] // 该口的顶层 users 脱糖产物(普通口/portal 共用)
+		// 会话式协议插件(协议包 init 里 registry.RegisterSession 自注册):config 不认协议名,只按 type 查表,
+		// 把协议无关的输入(TLS / 用户 / 出站 / 派发 / 准入)交给插件 —— 加协议零 config diff。
+		if sp, ok := registry.LookupSession(in.Type); ok && sp.NewInbound != nil {
+			r, err := f.buildSessionPluginInbound(sp, in, out, binds, reg, globalGate, memGuard, metricReg != nil)
+			if err != nil {
+				return nil, fmt.Errorf("config: 入站 %s(%s):%w", in.Listen, in.Type, err)
+			}
+			listen := in.Listen
+			insts = append(insts, Instance{Listen: listen, Run: func(ctx context.Context) error { return r.Run(ctx, listen) }})
+			continue
+		}
 		var handler endpoint.InboundHandler
 		switch typ {
 		case "", "proxy":
@@ -2346,6 +2373,78 @@ func buildSessionAdmitter(in Inbound, reg *meter.Registry, globalGate *meter.Gat
 
 // sessionDispatch:反连 portal(mode=portal)保持原样(隧道载体不计量,不回归);否则用 service 的计量版
 // dispatch(身份回读 → Admit(闸+计量+mem-guard)→ wrap → relay)。
+// buildSessionPluginInbound 建【会话式协议插件】入站:把协议无关的输入打包交给插件,config 不认协议名。
+// 用户:顶层 users(binds 非空)→ tag=BillID + 结构化 keys(复合键)/标量 secret,经 UserFromContext 回读
+// 计量;无 binds 时退回口内 users 垫片(标量字段原样作 Fields,身份落 Ambient)。TCP 走 sessionDispatch
+// (计量/反连 portal),UDP 承载流过 SessionAdmit 计量、数据报交 SessionPacketDispatch(udpNAT)。
+func (f *File) buildSessionPluginInbound(sp registry.Session, in Inbound, out endpoint.Outbound, binds []principal.CredBinding, reg *meter.Registry, globalGate *meter.Gate, memGuard *meter.MemGuard, metering bool) (registry.Runner, error) {
+	tlsConfig, err := anytls.ServerTLSConfig(fileOrStr(in.TLS, "cert"), fileOrStr(in.TLS, "key"))
+	if err != nil {
+		return nil, err
+	}
+	adm, err := buildSessionAdmitter(in, reg, globalGate, memGuard, metering)
+	if err != nil {
+		return nil, err
+	}
+	var users []registry.SessionUser
+	var refs map[string]cred.ID
+	if len(binds) > 0 {
+		sus, r, err := sessionUsersFromBinds(in.inboundName(), binds, reg, metering)
+		if err != nil {
+			return nil, err
+		}
+		refs = r
+		for _, su := range sus {
+			users = append(users, registry.SessionUser{Tag: su.Tag, Secret: su.Secret, Fields: su.Fields})
+		}
+	} else {
+		for _, u := range in.Users {
+			fields := make(map[string]string, len(u))
+			for k, v := range u {
+				if s, ok := v.(string); ok {
+					fields[k] = s
+				}
+			}
+			users = append(users, registry.SessionUser{Tag: fields["name"], Secret: fields["password"], Fields: fields})
+		}
+	}
+	node, err := mapToNode(in.Extra, "")
+	if err != nil {
+		return nil, err
+	}
+	return sp.NewInbound(registry.SessionInbound{
+		Node:           node,
+		TLS:            tlsConfig,
+		Users:          users,
+		Out:            out,
+		Dispatch:       f.sessionDispatch(in, out, adm, refs, sp.UserFromContext),
+		Admit:          service.SessionAdmit(adm, refs, sp.UserFromContext),
+		PacketDispatch: service.SessionPacketDispatch(out),
+	})
+}
+
+// sessionOutboundNode 把会话式插件出站的配置合成一个 spec 映射节点交插件自解:口内未声明键(Extra)+ 通用
+// 具名字段(server/secret/uuid/sni/insecure/user/client-fingerprint;yaml 具名优先会把它们截胡出 Extra,
+// 这里非空即补回)。
+func sessionOutboundNode(o Outbound) (*spec.Node, error) {
+	m := make(map[string]any, len(o.Extra)+7)
+	for k, v := range o.Extra {
+		m[k] = v
+	}
+	for k, v := range map[string]string{
+		"server": o.Server, "secret": o.Secret, "uuid": o.UUID, "sni": o.SNI,
+		"user": o.User, "client-fingerprint": o.Fingerprint,
+	} {
+		if v != "" {
+			m[k] = v
+		}
+	}
+	if o.Insecure {
+		m["insecure"] = true
+	}
+	return mapToNode(m, "")
+}
+
 func (f *File) sessionDispatch(in Inbound, out endpoint.Outbound, adm *service.Admitter, refs map[string]cred.ID, readUser func(context.Context) (string, bool)) endpoint.StreamDispatch {
 	if in.isPortal() {
 		return sessionPortalDispatch(in)

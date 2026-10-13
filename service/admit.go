@@ -101,6 +101,16 @@ func SessionAdmit(adm *Admitter, refs map[string]cred.ID, readUser func(context.
 	}
 }
 
+// SessionPacketDispatch 建 endpoint.PacketDispatch:会话式入站解出的客户端侧数据报连接交 udpNAT,按包目标
+// 拆分、逐目标经 out 路由并回写来源(与流式入站 UDP 同一条 udpNAT 路径)。准入 + 计量不在此做:由协议侧对
+// 承载体(如 UDP over stream 的承载流)先过 SessionAdmit,UDP 字节随承载体计入用户。返回时 pc 已关。
+func SessionPacketDispatch(out endpoint.Outbound) endpoint.PacketDispatch {
+	return func(ctx context.Context, pc link.PacketConn) error {
+		defer pc.Close()
+		return udpNAT(ctx, pc, StaticOutbound{Out: out})
+	}
+}
+
 // SessionDispatch 建【会话式协议】的计量版 endpoint.StreamDispatch:每条库内解复用出的已握手流,先按
 // readUser 从 ctx 读身份 tag(命中 refs 得 cred.ID,缺省 Ambient)→ 过 Admitter(连接闸 + 按用户计量 +
 // mem-guard,与流式栈同一唯一入口)→ 包计量流 → 拨出站 relay。供 anytls/hy2/tuic… 这些"库内自管会话、

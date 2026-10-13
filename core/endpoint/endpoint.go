@@ -141,6 +141,12 @@ type StreamDispatch func(ctx context.Context, stream link.Stream, dst addr.Socks
 // 被拒(限额/停用/mem-guard)返回非 nil error 且已关 s;协议应据此放弃本流。
 type AdmitHook func(ctx context.Context, s link.Stream) (link.Stream, func(), error)
 
+// PacketDispatch 处理会话式协议解出的【客户端侧数据报连接】(每包自带逻辑目标,可多目标):由运行时
+// 按包目标拆分、逐目标路由到出站并回写来源(即 udpNAT)。与 StreamDispatch 对位的 UDP 契约 —— 让
+// 自管监听的会话式入站(UDP over stream / datagram)免 import service 即可把 UDP 交给内核分流。
+// 阻塞至 pc 结束;返回时 pc 已关。nil = 该入站不支持 UDP。
+type PacketDispatch func(ctx context.Context, pc link.PacketConn) error
+
 // Outbound 是出站:拨到 dst、给一个传输。它以本机身份出示凭据向上游认证,不进凭据树。
 type Outbound interface {
 	DialStream(ctx context.Context, dst addr.Socksaddr) (link.Stream, error)

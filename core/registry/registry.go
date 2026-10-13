@@ -140,6 +140,9 @@ func Register[C any](d Descriptor[C]) {
 	if _, dup := reg.m[e.Name()]; dup {
 		panic(fmt.Sprintf("registry: duplicate descriptor %q", e.Name()))
 	}
+	if _, dup := sessions[e.Name()]; dup {
+		panic(fmt.Sprintf("registry: descriptor %q 与已注册的会话式协议同名", e.Name()))
+	}
 	reg.m[e.Name()] = e
 }
 

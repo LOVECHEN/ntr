@@ -24,6 +24,7 @@ require (
 	github.com/metacubex/tls v0.1.7
 	github.com/oschwald/maxminddb-golang v1.13.1
 	github.com/refraction-networking/utls v1.8.2
+	github.com/sagernet/quic-go v0.61.0-sing-box-mod.1
 	github.com/sagernet/sing v0.8.5-0.20260411123740-2a8053daaf99
 	github.com/sagernet/sing-quic v0.6.4
 	github.com/sagernet/sing-shadowtls v0.2.1
@@ -65,7 +66,6 @@ require (
 	github.com/oasisprotocol/deoxysii v0.0.0-20220228165953-2091330c22b7 // indirect
 	github.com/pires/go-proxyproto v0.11.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/sagernet/quic-go v0.61.0-sing-box-mod.1 // indirect
 	github.com/sina-ghaderi/poly1305 v0.0.0-20220724002748-c5926b03988b // indirect
 	github.com/sina-ghaderi/rabaead v0.0.0-20220730151906-ab6e06b96e8c // indirect
 	github.com/sina-ghaderi/rabbitio v0.0.0-20220730151941-9ce26f4f872e // indirect
